@@ -23,6 +23,16 @@ import sys
 import time
 from pathlib import Path
 
+
+# ⚠ Windows 上 stdout 被重定向（CI 管道）时，Python 用系统代码页编码输出：
+#   英文 Windows 为 cp1252、中文为 cp936。打印 ✅/❌ 与中文会抛 UnicodeEncodeError
+#   并让整个测试套件以 exit=1 崩掉（CI 上实测过）。这里主动切到 UTF-8，
+#   使测试在任意机器、任意代码页下都能跑，不依赖外部环境变量。
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from app.core.log_util import ensure_utf8_console  # noqa: E402
+
+ensure_utf8_console()
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 

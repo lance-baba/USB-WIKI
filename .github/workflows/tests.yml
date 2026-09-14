@@ -54,9 +54,15 @@ jobs:
 
       - name: 启动冒烟（服务能否真正起来并响应）
         shell: bash
+        env:
+          PYTHONUTF8: "1"          # 内联脚本不导入应用模块，需自行保证输出编码
+          PYTHONIOENCODING: utf-8
         run: |
           python - <<'PY'
           import json, os, subprocess, sys, time, urllib.request
+          for _s in (sys.stdout, sys.stderr):
+              try: _s.reconfigure(encoding="utf-8", errors="replace")
+              except Exception: pass
           env = {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
           proc = subprocess.Popen(
               [sys.executable, "app/launcher.py", "--no-browser", "--port", "28901"],

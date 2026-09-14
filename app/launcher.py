@@ -20,6 +20,12 @@ if __package__ in (None, ""):  # 允许 `python app/launcher.py` 直接运行
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.core import config, db as db_mod, paths  # noqa: E402
+
+from app.core.log_util import ensure_utf8_console  # noqa: E402
+
+# 输出被重定向（管道/CI）时 Windows 会用系统代码页编码 stdout，打印中文会直接崩。
+# 在输出任何内容之前切到 UTF-8，不依赖调用方是否设置了 PYTHONUTF8。
+ensure_utf8_console()
 from app.core.context import get_ctx  # noqa: E402
 from app.core.log_util import get_logger, setup  # noqa: E402
 from app.server import Server  # noqa: E402

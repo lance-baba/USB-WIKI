@@ -30,6 +30,23 @@ class _SafeStreamHandler(logging.StreamHandler):
             self.handleError(record)
 
 
+def ensure_utf8_console() -> None:
+    """把 stdout / stderr 切到 UTF-8，使中文与符号在任意机器、任意代码页下都能输出。
+
+    为什么必须做：Windows 上当输出被**重定向**（管道 / CI / 写入文件）时，Python 会用
+    系统区域代码页编码 stdout —— 英文 Windows 是 cp1252、中文是 cp936。此时打印中文或
+    ``✅`` 会抛 ``UnicodeEncodeError`` 并**直接中断程序**（实测：不设 PYTHONUTF8 时
+    测试套件以 exit=1 崩掉）。真实控制台走 WindowsConsoleIO，本已是 UTF-8，不受影响。
+
+    因此不依赖调用方"记得设 PYTHONUTF8"，由代码自己保证。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError, OSError):
+            pass      # 流不支持重配置（如被替换为自定义对象）时静默跳过
+
+
 def setup(level: str = "INFO") -> logging.Logger:
     global _configured
     logger = logging.getLogger(_LOGGER_NAME)
