@@ -741,7 +741,14 @@ def main() -> int:
         FAIL.append(f"测试执行异常 :: {type(exc).__name__}: {exc}")
         print(f"\n  ❌ 测试执行异常: {type(exc).__name__}: {exc}")
         import traceback
+
+        tb = traceback.format_exc()
         traceback.print_exc()
+        if os.environ.get("GITHUB_ACTIONS"):
+            # 崩溃时走不到汇总，注解必须在这里发，否则 CI 只剩一句 "exit code 1"
+            last = [ln for ln in tb.strip().splitlines() if ln.strip()][-3:]
+            print(f"::error title=测试套件崩溃::{type(exc).__name__}: {exc} | "
+                  + " ⟵ ".join(x.strip() for x in last))
     finally:
         shutil.rmtree(tmp_root, ignore_errors=True)
 
@@ -762,6 +769,14 @@ def main() -> int:
         for f in FAIL:
             print("   ✗ " + f)
     print("=" * 74)
+
+    # 在 GitHub Actions 上把每条失败打成注解 —— 注解会直接显示在运行摘要与 PR 页面，
+    # 无需下载完整日志即可定位问题（公开仓库的日志下载需要鉴权）。
+    if os.environ.get("GITHUB_ACTIONS"):
+        for f in FAIL:
+            print(f"::error title=测试失败::{f}")
+        if not FAIL:
+            print(f"::notice::全部 {len(PASS)} 项通过")
     return 1 if FAIL else 0
 
 
