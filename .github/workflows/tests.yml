@@ -46,22 +46,34 @@ jobs:
           for mod in ("trafilatura", "lxml", "sqlite_vec", "yaml", "pdfminer", "pypdf"):
               print(f"  {mod:12} {'OK' if importlib.util.find_spec(mod) else 'MISSING'}")
           onnx = importlib.util.find_spec("onnxruntime") is not None
-          print(f"  onnxruntime  {'存在（非预期的 CI 环境）' if onnx else '缺失（预期：CI 不装它，用于验证降级链）'}")
+          print(f"  onnxruntime  {'存在（非预期）' if onnx else '缺失（预期：用于验证降级链）'}")
           PY
 
+      # 下面三步是一个整体：测试步骤不因失败中断 job，诊断步骤把输出尾部打成
+      # 注解（公开仓库的 Actions 日志下载需要鉴权，运行摘要页只给一句退出码），
+      # 最后一步才把 job 标记为失败。
       - name: 运行测试套件
+        id: tests
+        shell: bash
+        continue-on-error: true
+        run: |
+          python -u tests/test_suite.py > test-out.txt 2>&1
+          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+          cat test-out.txt
+
+      - name: 失败诊断（输出尾部）
+        if: steps.tests.outputs.exit_code != '0'
         shell: bash
         run: |
-          set +e
-          # -u 关闭缓冲：即使进程硬崩溃，也能拿到已产出的输出
-          python -u tests/test_suite.py 2>&1 | tee test-out.txt
-          rc=${PIPESTATUS[0]}
-          if [ "$rc" -ne 0 ]; then
-            # 公开仓库的日志下载需要鉴权。把尾部打成单行注解，运行摘要页即可直接读到。
-            tail_txt=$(tail -n 45 test-out.txt | tr '\n' '|' | tr -d '\r' | sed 's/%/%25/g')
-            echo "::error title=测试失败（输出尾部）::$tail_txt"
-          fi
-          exit $rc
+          tail_txt=$(tail -n 45 test-out.txt | tr '\n' '|' | tr -d '\r' | sed 's/%/%25/g')
+          echo "::error title=测试失败(exit ${{ steps.tests.outputs.exit_code }}) 输出尾部::$tail_txt"
+
+      - name: 标记测试结果
+        if: steps.tests.outputs.exit_code != '0'
+        shell: bash
+        run: |
+          echo "测试套件以 exit ${{ steps.tests.outputs.exit_code }} 结束"
+          exit 1
 
       - name: 启动冒烟（服务能否真正起来并响应）
         shell: bash
