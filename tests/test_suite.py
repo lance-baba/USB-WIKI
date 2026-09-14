@@ -630,9 +630,24 @@ def test_no_absolute_paths() -> None:
     else:
         pass
     check("源码未硬编码 U 盘盘符", True)
-    cfg = (ROOT / "config.ini").read_text(encoding="utf-8")
-    check("config.ini 明文明文模板已就位", "[AI]" in cfg and "[CRAWLER]" in cfg and "[GRAPH]" in cfg)
-    check("config.ini 含嵌入源与维度", "embedding_source" in cfg and "embedding_dim" in cfg)
+    # 断言配置的**权威来源**（代码内置模板），而不是 config.ini 本身 ——
+    # 后者含明文密钥、已被 gitignore，干净克隆里根本不存在（应用首次运行才生成）。
+    from app.core import config as config_mod
+
+    tmpl = config_mod.DEFAULT_TEMPLATE
+    check("内置配置模板含全部必需段",
+          all(sec in tmpl for sec in ("[AI]", "[CRAWLER]", "[GRAPH]")), tmpl[:120])
+    check("内置配置模板含嵌入源与维度",
+          "embedding_source" in tmpl and "embedding_dim" in tmpl)
+    check("config.ini 已 gitignore（含明文密钥，由首次运行生成）",
+          "config.ini" in (ROOT / ".gitignore").read_text(encoding="utf-8"))
+
+    # 验证「配置缺失时自动生成」这条自愈行为（路径已隔离到临时目录，不碰真实配置）
+    probe = paths.CONFIG_FILE
+    probe.unlink(missing_ok=True)
+    config_mod.load(probe, force=True)
+    check("配置缺失时能自动生成完整模板",
+          probe.exists() and "[AI]" in probe.read_text(encoding="utf-8"), str(probe))
 
 
 # ==========================================================================
@@ -652,6 +667,7 @@ def _isolate_data_dir() -> Path:
     paths.SHM_FILE = tmp / "cache.db-shm"
     paths.CHROME_PROFILE_DIR = tmp / "temp_chrome_profile"
     paths.LOG_FILE = tmp / "wiki-usb.log"
+    paths.CONFIG_FILE = tmp / "config.ini"   # 防止测试写用户真实的 config.ini
     for d in (paths.DATA_DIR, paths.NOTES_DIR, paths.SNAPSHOT_DIR):
         d.mkdir(parents=True, exist_ok=True)
     return tmp
