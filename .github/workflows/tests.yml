@@ -50,7 +50,18 @@ jobs:
           PY
 
       - name: 运行测试套件
-        run: python tests/test_suite.py
+        shell: bash
+        run: |
+          set +e
+          # -u 关闭缓冲：即使进程硬崩溃，也能拿到已产出的输出
+          python -u tests/test_suite.py 2>&1 | tee test-out.txt
+          rc=${PIPESTATUS[0]}
+          if [ "$rc" -ne 0 ]; then
+            # 公开仓库的日志下载需要鉴权。把尾部打成单行注解，运行摘要页即可直接读到。
+            tail_txt=$(tail -n 45 test-out.txt | tr '\n' '|' | tr -d '\r' | sed 's/%/%25/g')
+            echo "::error title=测试失败（输出尾部）::$tail_txt"
+          fi
+          exit $rc
 
       - name: 启动冒烟（服务能否真正起来并响应）
         shell: bash
