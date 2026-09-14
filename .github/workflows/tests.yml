@@ -78,6 +78,17 @@ jobs:
           echo "测试套件以 exit ${{ steps.tests.outputs.exit_code }} 结束"
           exit 1
 
+      # ── 临时：验证 Windows runner 的注解通道本身是否可用 ──────────
+      - name: 注解通道自检（临时）
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          echo "::error title=通道自检::如果你能在运行摘要页看到这行，说明 Windows 的注解通道是通的"
+          echo "::notice::probe: stdout_encoding 测试见下一步"
+          python -c "import sys,locale,platform;print('PROBE',sys.version.split()[0],platform.platform(),'enc=',sys.stdout.encoding,'pref=',locale.getpreferredencoding())"
+          echo "PROBE DONE"
+      # ─────────────────────────────────────────────────────────────
+
       # ── 临时诊断通道 ──────────────────────────────────────────────
       # 公开仓库的 Actions 日志下载需要鉴权；注解与运行摘要在本环境均拿不到。
       # issue 是**服务端渲染**的 HTML，无需登录即可读取 —— 这是对无 token 的
