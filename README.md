@@ -13,8 +13,6 @@
 [更新日志](CHANGELOG.md) ·
 [贡献指南](CONTRIBUTING.md) ·
 [行为准则](CODE_OF_CONDUCT.md) ·
-[行为准则](CODE_OF_CONDUCT.md) ·
-[行为准则](CODE_OF_CONDUCT.md) ·
 [安全策略](SECURITY.md)
 
 ---
