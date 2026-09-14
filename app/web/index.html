@@ -233,7 +233,7 @@
   .seg button:disabled{opacity:.4;cursor:not-allowed}
 
   /* 文档渲染区（把 Markdown 还原成可读版式，而不是一整块等宽文本） */
-  .doc-wrap{flex:1;min-height:0;overflow:auto;display:flex;flex-direction:column}
+  .doc-wrap{flex:1;min-height:0;min-width:0;overflow:auto;display:flex;flex-direction:column}
   .doc-md{font-size:13.5px;line-height:1.85;color:var(--text);padding:2px 3px 22px}
   .doc-md h1,.doc-md h2,.doc-md h3,.doc-md h4,.doc-md h5,.doc-md h6{margin:17px 0 8px;line-height:1.42}
   .doc-md h1{font-size:20px;border-bottom:1px solid var(--line);padding-bottom:7px}
@@ -264,14 +264,19 @@
      表现为「预览只有一小条 + 内外两根滚动条」。 */
   /* 原版视图：#noteView 必须自己填满 .doc-wrap，否则内部一切 height:100% 都解析不出来
      （.doc-wrap 是 flex 列容器，但 .doc-md 默认不是 flex:1 —— 这正是「预览只有一小条」的根因） */
-  .doc-md.doc-original{display:flex;flex-direction:column;flex:1;min-height:0;overflow:hidden;padding:0 3px 3px}
-  .doc-original .frame-wrap{flex:1;min-height:0;overflow:auto;border:1px solid var(--line);border-radius:9px;background:#fff}
-  .frame-wrap.fit{overflow:hidden}   /* 适应宽度时按精确比例缩放，不出现外层滚动条 */
-  .frame-wrap .doc-frame{display:block;width:100%;height:100%;border:0;border-radius:0;background:#fff}
+  .doc-md.doc-original{display:flex;flex-direction:column;flex:1;min-height:0;min-width:0;overflow:hidden;padding:0 3px 3px}
+  /* ⚠ iframe 必须绝对定位：适应宽度模式下它是 1280px 的「布局宽」，
+     transform:scale() 只改视觉、不改布局盒 —— 在流内会被 flex 的
+     min-width:auto 顶住无法收缩，一路把卡片/分栏/整页撑宽，
+     结果右侧的「源码」按钮被挤出屏幕。绝对定位使其完全不参与父级尺寸计算。 */
+  .frame-wrap{position:relative;min-width:0;min-height:0;flex:1;overflow:hidden;border:1px solid var(--line);border-radius:9px;background:#fff}
+  .frame-wrap .doc-frame{position:absolute;top:0;left:0;display:block;border:0;border-radius:0;background:#fff}
   .frame-tools{display:flex;gap:7px;align-items:center;font-size:11.5px;color:var(--faint);margin:0 0 7px;flex-wrap:wrap}
   .frame-tools button{font-size:11px;padding:2px 9px;border:1px solid var(--line-strong);border-radius:7px;background:#fff;color:var(--muted);cursor:pointer}
   .frame-tools button.on{color:#fff;background:var(--accent);border-color:var(--accent)}
-  .doc-frame{min-height:340px;width:100%;border:1px solid var(--line);border-radius:9px;background:#fff}
+  /* 兜底样式：正常路径下 .frame-wrap 给足高度，这里的 min-height 只是防呆。
+     注意别再写回 340px —— 那会与容器高度打架，表现为底部被裁。 */
+  .doc-frame{min-height:120px;width:100%;border:1px solid var(--line);border-radius:9px;background:#fff}
   .doc-meta{font-size:11.5px;color:var(--faint);margin-bottom:7px}
   .doc-dl{padding:14px;border:1px dashed var(--line-strong);border-radius:10px;text-align:center}
   #graphSvg{flex:1;min-height:0;width:100%;border:1px solid var(--line);border-radius:12px;background:radial-gradient(circle at 50% 40%,#fff, #f7f9fd)}

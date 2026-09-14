@@ -567,6 +567,44 @@ def find_original(rel_note_path: str) -> Path | None:
     return None
 
 
+_BASE_TAG_RE = re.compile(r"<base\b", re.I)
+_HEAD_OPEN_RE = re.compile(r"<head\b[^>]*>", re.I)
+_HTML_OPEN_RE = re.compile(r"<html\b[^>]*>", re.I)
+
+
+def source_url_of(rel_note_path: str) -> str:
+    """从笔记 frontmatter 读取 source_url（读不到返回空串）。"""
+    try:
+        text = (paths.DATA_DIR / rel_note_path).read_text(encoding="utf-8", errors="replace")
+    except (OSError, ValueError):
+        return ""
+    m = re.search(r'^source_url:\s*"?([^"\n]+?)"?\s*$', text[:2000], re.M)
+    return m.group(1).strip() if m else ""
+
+
+def inject_base_href(html_text: str, source_url: str) -> str:
+    """给剪藏的原网页注入 <base>，让相对路径按**原始站点**解析。
+
+    ⚠ 这是「原版预览」保真度的关键：抓下来的 HTML 大量使用根相对路径
+    （如 `/assets/css/common.css`、`/assets/img/logo.png`）。不注入 <base> 时，
+    这些 URL 会以本站（/api/notes/original…）为基准解析 → 全部 404 →
+    样式与图片尽失，页面渲染成一副裸 HTML，「原版」就名不副实了。
+
+    用**完整页面 URL** 作 base（而非仅站点根）：这样文档相对路径
+    （`assets/x.css`）与根相对路径（`/assets/x.css`）都能正确解析。
+    """
+    if not source_url or _BASE_TAG_RE.search(html_text):
+        return html_text
+    tag = '<base href="' + html_mod.escape(source_url, quote=True) + '">'
+    m = _HEAD_OPEN_RE.search(html_text)
+    if m:
+        return html_text[: m.end()] + tag + html_text[m.end():]
+    m2 = _HTML_OPEN_RE.search(html_text)
+    if m2:
+        return html_text[: m2.end()] + "<head>" + tag + "</head>" + html_text[m2.end():]
+    return tag + html_text
+
+
 def purge_orphan_originals(note_paths) -> list:
     """删除已无对应笔记的原件，返回被删文件名列表。
 

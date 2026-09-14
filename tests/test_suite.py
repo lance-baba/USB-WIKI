@@ -493,6 +493,35 @@ def test_alert_classification() -> None:
           all("ModuleNotFoundError" not in n for n in r1.notes), str(r1.notes))
 
 
+def test_original_base_injection() -> None:
+    """原版预览的保真度：必须给剪藏的 HTML 注入 <base>。
+
+    真实问题：抓下来的 HTML 大量使用根相对路径（`/assets/css/common.css`、
+    `/assets/img/logo.png`）。不注入 <base> 时这些 URL 会以本站
+    （`/api/notes/original?…`）为基准解析 → 全部 404 → 样式与图片尽失，
+    页面退化成裸 HTML，「原版」名不副实。
+    """
+    section("原版预览 · base 注入")
+
+    src = "https://example.com/dir/page/"
+    h = '<html><head><title>t</title></head><body><img src="/a.png"></body></html>'
+    out = crawler.inject_base_href(h, src)
+    check("base 标签注入到 head 之内",
+          out.index("<base") > out.index("<head") and out.index("<base") < out.index("</head>"))
+    check("base 指向原始页面 URL（完整路径，非仅站点根）",
+          f'<base href="{src}">' in out, out[:120])
+    check("已存在 base 时不重复注入",
+          crawler.inject_base_href(out, src).count("<base") == 1)
+    check("无 source_url 时不注入", crawler.inject_base_href(h, "") == h)
+    check("无 head 标签时也能注入", "<base" in crawler.inject_base_href("<p>x</p>", src))
+    check("HTML 实体被转义（防注入破坏属性）",
+          '&quot;' in crawler.inject_base_href(h, 'https://e.com/?a="b"'))
+
+    # source_url 必须能从真实笔记的 frontmatter 读出（服务端靠它决定 base）
+    url = crawler.source_url_of("notes/__no_such_note__.md")
+    check("笔记不存在时返回空串而非抛错", url == "", repr(url))
+
+
 def test_orphan_original_cleanup() -> None:
     """孤儿原件回收 —— 笔记删了，原件不能无限堆积在 U 盘上。
 
@@ -829,6 +858,7 @@ def main() -> int:
         test_gateway(ctx)
         test_graph(ctx)
         test_crawler(ctx)
+        test_original_base_injection()
         test_orphan_original_cleanup()
         test_html_encoding_detection()
         test_original_preview(ctx)

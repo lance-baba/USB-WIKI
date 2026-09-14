@@ -148,6 +148,20 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
 
+    def _send_buffer(self, data: bytes, ctype: str, inline: bool, filename: str) -> None:
+        """发送内存中的内容（用于需要就地改写的原件，如注入 <base> 的 HTML）。"""
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Disposition",
+                         self._content_disposition("inline" if inline else "attachment", filename))
+        self.end_headers()
+        try:
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
     def _read_json(self) -> dict:
         try:
             length = int(self.headers.get("Content-Length") or 0)
@@ -543,6 +557,17 @@ class Handler(BaseHTTPRequestHandler):
         if ctype.startswith("text/"):
             ctype += "; charset=utf-8"
         inline = (self.query_flag("download") != "1") and ext in self.INLINE_TYPES
+
+        # 剪藏的原网页：就地注入 <base href="原始 URL">，否则抓下来的根相对路径
+        # （/assets/…）会以本站为基准解析而全部 404，页面退化成裸 HTML。
+        if inline and ext in (".html", ".htm"):
+            try:
+                text = orig.read_text(encoding="utf-8", errors="replace")
+                text = crawler.inject_base_href(text, crawler.source_url_of(rel))
+                return self._send_buffer(text.encode("utf-8"), ctype, True, orig.name)
+            except OSError:
+                pass   # 读失败则退回按原样流式发送
+
         return self._send_file_range(orig, ctype, inline)
 
     def _serve_static(self, file: Path) -> None:
