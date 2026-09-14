@@ -739,24 +739,44 @@ def test_no_absolute_paths() -> None:
 
 # ==========================================================================
 def _isolate_data_dir() -> Path:
-    """把测试的数据根目录重定向到临时目录。
+    """把测试用到的**一切数据路径**重定向到临时目录，并断言没有漏网之鱼。
 
-    ⚠ 安全红线：`reset_workspace()` 会清空 notes/，若不隔离，跑一次测试就会
-    **删光用户真实知识库**。paths 下所有常量都是属性访问（无值导入），
-    因此运行时替换即全局生效，业务代码无需改动。
+    ⚠ 安全红线：`reset_workspace()` 会清空 notes/，原件回收会删 originals/ ——
+    只要有一条数据路径没被隔离，跑一次测试就会**删光用户真实知识库**。
+
+    **因此这里不手写清单**，而是自动重映射所有位于真实 `data/` 之下的路径常量。
+    手写清单一定会漏：`ORIGINALS_DIR` 就曾被漏掉，导致测试把用户剪藏留存的原件
+    全部当孤儿删掉（真实事故）。新增数据路径时必须不需要改这里。
+
+    paths 下所有常量都是属性访问（无值导入），运行时替换即全局生效。
     """
     tmp = Path(tempfile.mkdtemp(prefix="wikiusb_test_"))
-    paths.DATA_DIR = tmp
-    paths.NOTES_DIR = tmp / "notes"
-    paths.SNAPSHOT_DIR = tmp / "snapshots"
-    paths.CACHE_DB = tmp / "cache.db"
-    paths.WAL_FILE = tmp / "cache.db-wal"
-    paths.SHM_FILE = tmp / "cache.db-shm"
-    paths.CHROME_PROFILE_DIR = tmp / "temp_chrome_profile"
-    paths.LOG_FILE = tmp / "wiki-usb.log"
-    paths.CONFIG_FILE = tmp / "config.ini"   # 防止测试写用户真实的 config.ini
-    for d in (paths.DATA_DIR, paths.NOTES_DIR, paths.SNAPSHOT_DIR):
+    real_data = paths.DATA_DIR
+
+    for name, val in list(vars(paths).items()):
+        if not isinstance(val, Path):
+            continue
+        try:
+            rel = val.relative_to(real_data)
+        except ValueError:
+            continue                      # 不在 data/ 下（源码 / 运行时），保持原样
+        target = tmp if str(rel) == "." else tmp / rel
+        if val.is_dir():
+            target.mkdir(parents=True, exist_ok=True)
+        setattr(paths, name, target)
+
+    # config.ini 位于仓库根，不属于 data/，需单独处理
+    paths.CONFIG_FILE = tmp / "config.ini"
+    for d in (paths.DATA_DIR, paths.NOTES_DIR, paths.SNAPSHOT_DIR, paths.ORIGINALS_DIR):
         d.mkdir(parents=True, exist_ok=True)
+
+    # 守护断言：任何仍指向真实 data/ 的属性都说明隔离清单漏了项 —— 宁可当场失败
+    leaked = sorted(n for n, v in vars(paths).items()
+                    if isinstance(v, Path) and str(v).startswith(str(real_data)))
+    if leaked:
+        raise RuntimeError(
+            "测试隔离失败：以下路径仍指向真实数据目录，跑下去会删用户数据 —— " + ", ".join(leaked)
+        )
     return tmp
 
 

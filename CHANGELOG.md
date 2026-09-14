@@ -4,7 +4,16 @@
 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循
 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [未发布]
+
 ### 修复
+- **测试套件会删除用户真实留存的原件**（严重）：测试的数据目录隔离清单漏了
+  `ORIGINALS_DIR`。原件回收按「笔记集合」判定孤儿，而测试传入的是自己的临时笔记集合，
+  于是把用户真实 `data/originals/` 下的原件全部当孤儿删除。
+  现改为**自动重映射所有位于 `data/` 之下的路径常量**（不再手写清单，新增数据路径
+  无需改测试），并加守护断言：任何仍指向真实数据目录的路径都当场抛错。
+  已复现并验证：放一份原件 → 跑测试 → 原件消失；修复后不再发生。
+- 孤儿原件回收日志现在记录**被删文件名**，便于事后追溯。
 - **抓取的网页可能整页乱码**：对 `Content-Type` 未声明 `charset` 的响应（如
   docs.python.org），requests 会按 RFC 2616 默认成 `ISO-8859-1`，把中文与 em dash
   变成 `â\x80\x94` 这类乱码。原写法 `resp.encoding or resp.apparent_encoding` 里

@@ -599,7 +599,9 @@ def purge_orphan_originals(note_paths) -> list:
         except OSError as exc:
             log.warning("原件回收失败 %s: %s", f.name, exc)
     if removed:
-        log.info("孤儿原件回收 %d 份（笔记已不存在）", len(removed))
+        # 记录具体文件名：万一判断有误，事后还能从日志追溯被删了什么
+        log.info("孤儿原件回收 %d 份（笔记已不存在）: %s",
+                 len(removed), ", ".join(removed[:10]) + (" …" if len(removed) > 10 else ""))
     return removed
 
 
