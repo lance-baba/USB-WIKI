@@ -1,0 +1,88 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / Python ${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false          # 一个平台挂了也要看其它平台的结果
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.11", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # 环境自检：确认测试确实是在「干净环境」下跑的
+      # （无嵌入式 runtime、无 onnxruntime），否则「降级链」相关断言等于没测
+      - name: 环境自检
+        shell: bash
+        run: |
+          python - <<'PY'
+          import importlib.util, sys
+          print("Python:", sys.version.split()[0])
+          for mod in ("trafilatura", "lxml", "sqlite_vec", "yaml", "pdfminer", "pypdf"):
+              print(f"  {mod:12} {'OK' if importlib.util.find_spec(mod) else 'MISSING'}")
+          onnx = importlib.util.find_spec("onnxruntime") is not None
+          print(f"  onnxruntime  {'存在（非预期的 CI 环境）' if onnx else '缺失（预期：CI 不装它，用于验证降级链）'}")
+          PY
+
+      - name: 运行测试套件
+        run: python tests/test_suite.py
+
+      - name: 启动冒烟（服务能否真正起来并响应）
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json, os, subprocess, sys, time, urllib.request
+          env = {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
+          proc = subprocess.Popen(
+              [sys.executable, "app/launcher.py", "--no-browser", "--port", "28901"],
+              env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+          )
+          try:
+              ok = False
+              for _ in range(40):
+                  time.sleep(1)
+                  try:
+                      with urllib.request.urlopen("http://127.0.0.1:28901/healthz", timeout=3) as r:
+                          if json.loads(r.read()).get("ok"):
+                              ok = True
+                              break
+                  except Exception:
+                      pass
+              if not ok:
+                  raise SystemExit("服务未能在 40s 内就绪")
+              with urllib.request.urlopen("http://127.0.0.1:28901/api/import/formats", timeout=10) as r:
+                  caps = json.loads(r.read())["data"]
+              print("支持扩展名:", len(caps["exts"]), "| PDF 后端:", caps["pdf_backend"])
+              print("SMOKE OK")
+          finally:
+              proc.terminate()
+              try:
+                  proc.wait(timeout=15)
+              except subprocess.TimeoutExpired:
+                  proc.kill()
+          PY

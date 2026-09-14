@@ -1,0 +1,603 @@
+"""知识摄入管道 —— 网页抓取、正文清洗与透明降级（PRD 4.2）。
+
+承诺边界：**静态博客与科技文章优先**。动态 SPA / 强反爬页面不硬刚，
+转为保存原始快照 + 引导剪贴板录入的降级路径。
+"""
+from __future__ import annotations
+
+import html as html_mod
+import re
+import shutil
+import subprocess
+import time
+from dataclasses import dataclass
+from datetime import datetime
+from html.parser import HTMLParser
+from pathlib import Path
+from urllib.parse import urlparse
+
+from . import config, net_util, paths
+from .log_util import get_logger
+
+log = get_logger()
+
+_NAME_SAFE_RE = re.compile(r"[^\w\u4e00-\u9fff\-]+")
+_WS_RE = re.compile(r"[ \t\u00a0]+")
+_BLANKLINE_RE = re.compile(r"\n{3,}")
+_TITLE_TAG_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.DOTALL | re.IGNORECASE)
+_OG_TITLE_RE = re.compile(
+    r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\'](.*?)["\']', re.IGNORECASE
+)
+_META_RE = {
+    "author": re.compile(
+        r'<meta[^>]+name=["\'](?:author|article:author)["\'][^>]+content=["\'](.*?)["\']',
+        re.IGNORECASE,
+    ),
+    "date": re.compile(
+        r'<meta[^>]+(?:property|name)=["\'](?:article:published_time|date|pubdate)["\']'
+        r'[^>]+content=["\'](.*?)["\']',
+        re.IGNORECASE,
+    ),
+}
+
+
+@dataclass
+class CaptureResult:
+    ok: bool
+    status: str
+    title: str = ""
+    file_path: str = ""
+    abs_path: str = ""
+    char_count: int = 0
+    message: str = ""
+    snapshot_path: str = ""
+    original_path: str = ""
+    used: str = "trafilatura"
+
+    def to_dict(self) -> dict:
+        return {
+            "code": 200 if self.ok else 500,
+            "status": self.status,
+            "message": self.message,
+            "data": {
+                "title": self.title,
+                "file_path": self.file_path,
+                "char_count": self.char_count,
+                "snapshot_path": self.snapshot_path,
+                "original_path": self.original_path,
+                "extractor": self.used,
+            },
+        }
+
+
+# --------------------------------------------------------------------------
+class _TextExtractor(HTMLParser):
+    """标准库 html.parser 兜底正文抽取（无 lxml / 无 trafilatura 时的 bare mode）。"""
+
+    SKIP = {"script", "style", "noscript", "svg", "head", "template", "iframe"}
+    BLOCK = {
+        "p", "div", "section", "article", "br", "li", "tr", "h1", "h2", "h3",
+        "h4", "h5", "h6", "blockquote", "pre", "td", "figure", "header", "footer",
+    }
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self._skip_depth = 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag in self.SKIP:
+            self._skip_depth += 1
+        elif tag in self.BLOCK:
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag):
+        if tag in self.SKIP and self._skip_depth > 0:
+            self._skip_depth -= 1
+        elif tag in self.BLOCK:
+            self.parts.append("\n")
+
+    def handle_data(self, data):
+        if self._skip_depth == 0 and data:
+            self.parts.append(data)
+
+    def text(self) -> str:
+        raw = "".join(self.parts)
+        raw = _WS_RE.sub(" ", raw)
+        lines = [ln.strip() for ln in raw.split("\n")]
+        return _BLANKLINE_RE.sub("\n\n", "\n".join(ln for ln in lines if ln))
+
+
+def stdlib_extract(html_text: str) -> str:
+    p = _TextExtractor()
+    try:
+        p.feed(html_text)
+        p.close()
+    except Exception:  # noqa: BLE001 - 畸形 HTML 不应中断流程
+        pass
+    return p.text()
+
+
+def _meta_of(html_text: str) -> dict:
+    out: dict[str, str] = {}
+    m = _OG_TITLE_RE.search(html_text) or _TITLE_TAG_RE.search(html_text)
+    if m:
+        out["title"] = html_mod.unescape(m.group(1)).strip()
+    for key, rx in _META_RE.items():
+        mm = rx.search(html_text)
+        if mm:
+            out[key] = html_mod.unescape(mm.group(1)).strip()[:120]
+    return out
+
+
+# --------------------------------------------------------------------------
+def fetch_html(url: str, timeout: float | None = None) -> tuple[str, str]:
+    """抓取页面 HTML。返回 (html, error)。优先 requests（代理/UA 控制更好）。"""
+    timeout = timeout or config.get_float("CRAWLER", "request_timeout", 20.0)
+    headers = {
+        "User-Agent": net_util.DEFAULT_UA,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "Cache-Control": "no-cache",
+    }
+    try:
+        import requests  # type: ignore
+
+        session = requests.Session()
+        session.trust_env = True  # 自动读取 HTTP_PROXY / HTTPS_PROXY
+        resp = session.get(url, headers=headers, timeout=timeout, allow_redirects=True)
+        resp.encoding = resp.encoding or resp.apparent_encoding or "utf-8"
+        if resp.status_code >= 400:
+            return "", f"HTTP {resp.status_code}"
+        return resp.text, ""
+    except ImportError:
+        pass
+    except Exception as exc:  # noqa: BLE001
+        log.warning("requests 抓取失败，回退 urllib: %s", exc)
+
+    status, body, _ = net_util.http_get(url, headers=headers, timeout=timeout)
+    if status == 0:
+        return "", str(body)
+    if status >= 400:
+        return "", f"HTTP {status}"
+    charset = "utf-8"
+    if isinstance(body, str):  # pragma: no cover
+        return body, ""
+    return body.decode(charset, "replace"), ""
+
+
+def extract_body(html_text: str, url: str) -> tuple[str, dict, str]:
+    """返回 (正文markdown, 元数据, 使用的抽取器)。"""
+    meta = _meta_of(html_text)
+    # 1) trafilatura（lxml 加速）
+    try:
+        import trafilatura  # type: ignore
+
+        text = trafilatura.extract(
+            html_text,
+            url=url,
+            output_format="markdown",
+            include_comments=False,
+            include_tables=True,
+            include_links=False,
+            favor_precision=False,
+        )
+        if text and len(text.strip()) >= 1:
+            return text.strip(), meta, "trafilatura"
+        bare = trafilatura.bare_extraction(html_text, url=url)
+        if bare is not None:
+            body = getattr(bare, "text", None) or (
+                bare.get("text") if isinstance(bare, dict) else None
+            )
+            if body:
+                for k in ("title", "author", "date"):
+                    v = getattr(bare, k, None) or (
+                        bare.get(k) if isinstance(bare, dict) else None
+                    )
+                    if v and not meta.get(k):
+                        meta[k] = str(v)
+                return str(body).strip(), meta, "trafilatura-bare"
+    except ImportError:
+        log.warning("trafilatura 缺失，启用 html.parser bare mode")
+    except Exception as exc:  # noqa: BLE001
+        log.warning("trafilatura 抽取异常，降级 html.parser: %s", exc)
+
+    # 2) 标准库兜底（无 C 依赖模式）
+    text = stdlib_extract(html_text)
+    return text, meta, "html.parser"
+
+
+# --------------------------------------------------------------------------
+def chrome_executable() -> str | None:
+    import os
+
+    candidates = [
+        os.environ.get("CHROME_PATH", ""),
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
+        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/usr/bin/google-chrome",
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+    ]
+    for c in candidates:
+        if c and Path(c).exists():
+            return c
+    for name in ("google-chrome", "chromium", "chrome", "msedge"):
+        found = shutil.which(name)
+        if found:
+            return found
+    return None
+
+
+def fetch_with_chrome(url: str, timeout: float = 30.0) -> str:
+    """Headless Chrome 渲染抓取（沙箱隔离 + 强制清理临时 profile，PRD 4.2）。"""
+    exe = chrome_executable()
+    if not exe:
+        raise RuntimeError("未找到本机 Chrome/Edge 可执行文件")
+
+    profile = paths.CHROME_PROFILE_DIR
+    shutil.rmtree(profile, ignore_errors=True)
+    profile.mkdir(parents=True, exist_ok=True)
+
+    cmd = [
+        exe,
+        "--headless=new",
+        "--disable-gpu",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-extensions",
+        "--disable-background-networking",
+        f"--user-data-dir={profile}",
+        "--virtual-time-budget=8000",
+        "--dump-dom",
+        url,
+    ]
+    proc = None
+    try:
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            timeout=timeout, creationflags=_no_window_flag(),
+        )
+        out, _ = proc.communicate(timeout=timeout)
+        return (out or b"").decode("utf-8", "replace")
+    finally:
+        # 强制杀死 Chrome 进程树并递归删除临时目录，严禁残留侵占 U 盘
+        try:
+            if proc and proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            pass
+        time.sleep(0.2)
+        for attempt in range(3):
+            try:
+                shutil.rmtree(profile, ignore_errors=False)
+                break
+            except OSError:
+                time.sleep(0.3)
+        else:
+            shutil.rmtree(profile, ignore_errors=True)
+
+
+def _no_window_flag() -> int:
+    if hasattr(subprocess, "CREATE_NO_WINDOW"):
+        return subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
+    return 0
+
+
+# --------------------------------------------------------------------------
+def _safe_name(url: str, when: datetime) -> str:
+    stamp = when.strftime("%Y%m%d_%H%M%S")
+    try:
+        slug = _NAME_SAFE_RE.sub("-", (urlparse(url).path or "").strip("/").split("/")[-1])[:24]
+    except ValueError:
+        slug = ""
+    slug = slug.strip("-")
+    return f"web_{stamp}{('_' + slug) if slug else ''}.md"
+
+
+def _frontmatter(d: dict) -> str:
+    lines = ["---"]
+    for k, v in d.items():
+        if v is None or v == "":
+            continue
+        safe = str(v).replace('"', "'").replace("\n", " ").strip()
+        lines.append(f'{k}: "{safe}"')
+    lines.append("---")
+    return "\n".join(lines)
+
+
+def save_markdown(
+    title: str,
+    body: str,
+    url: str,
+    meta: dict,
+    status: str,
+    when: datetime | None = None,
+    html_text: str = "",
+) -> Path:
+    when = when or datetime.now()
+    paths.NOTES_DIR.mkdir(parents=True, exist_ok=True)
+    target = paths.NOTES_DIR / _safe_name(url, when)
+
+    fm = _frontmatter(
+        {
+            "title": title or url,
+            "source_url": url,
+            "author": meta.get("author", ""),
+            "published": meta.get("date", ""),
+            "captured_at": when.strftime("%Y-%m-%d %H:%M:%S"),
+            "status": status,
+            "doc_type": "web_capture",
+        }
+    )
+    content = f"{fm}\n\n# {title or url}\n\n{body.strip()}\n"
+    target.write_text(content, encoding="utf-8")
+
+    # 留存原始 HTML：让「原版预览」能用沙箱 iframe 还原网页原本的观感
+    if html_text:
+        save_original(target.stem, ".html", html_text.encode("utf-8", "replace"))
+    return target
+
+
+def save_snapshot(url: str, html_text: str, when: datetime | None = None) -> Path:
+    when = when or datetime.now()
+    paths.SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+    snap = paths.SNAPSHOT_DIR / _safe_name(url, when).replace(".md", ".html")
+    header = f"<!-- 原始快照 source_url={url} captured_at={when:%Y-%m-%d %H:%M:%S} -->\n"
+    try:
+        snap.write_text(header + html_text, encoding="utf-8")
+    except OSError as exc:
+        log.error("快照写入失败: %s", exc)
+    return snap
+
+
+# --------------------------------------------------------------------------
+def capture_url(url: str, db=None, embedder=None) -> CaptureResult:
+    """抓取 -> 清洗 -> 阈值判定 -> 落盘（成功/降级）-> 索引。"""
+    url = (url or "").strip()
+    if not re.match(r"^https?://", url, re.IGNORECASE):
+        return CaptureResult(False, "error", message="仅支持 http/https 开头的标准 URL")
+
+    min_chars = config.get_int("CRAWLER", "min_body_chars", 150)
+    snapshot_chars = config.get_int("CRAWLER", "snapshot_chars", 1000)
+    use_chrome = config.get_bool("CRAWLER", "enable_headless_chrome", False)
+
+    html_text, err = fetch_html(url)
+    used = "http"
+
+    if (not html_text or len(html_text) < 400) and use_chrome:
+        try:
+            html_text = fetch_with_chrome(url)
+            used = "headless-chrome"
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Headless Chrome 抓取失败: %s", exc)
+
+    if not html_text:
+        return CaptureResult(False, "error", message=f"页面抓取失败：{err or '空响应'}")
+
+    body, meta, extractor = extract_body(html_text, url)
+    used = f"{used}+{extractor}"
+    title = str(meta.get("title") or "").strip()
+
+    # ---- 成功分支 ----
+    if len(body) >= min_chars:
+        target = save_markdown(title, body, url, meta, "success", html_text=html_text)
+        result = CaptureResult(
+            True, "success", title=title or url,
+            file_path=paths.rel_to_data(target), abs_path=str(target),
+            char_count=len(body), message="抓取成功", used=used,
+        )
+    # ---- 降级分支 ----
+    else:
+        snap = save_snapshot(url, html_text)
+        excerpt = body[:snapshot_chars] if body else "（该页面未提供可抽取的静态正文）"
+        degraded = (
+            f"> ⚠️ 该页面为前端动态渲染，仅保留快照，建议通过复制粘贴方式记录重要内容。\n\n"
+            f"> 原始快照：`{paths.rel_to_data(snap)}`\n\n{excerpt}"
+        )
+        target = save_markdown(title, degraded, url, meta, "partial_fallback", html_text=html_text)
+        result = CaptureResult(
+            True, "partial_fallback", title=title or url,
+            file_path=paths.rel_to_data(target), abs_path=str(target),
+            char_count=len(body), snapshot_path=paths.rel_to_data(snap),
+            message="该页面为前端动态渲染，仅保留快照，建议通过复制粘贴方式记录重要内容",
+            used=used,
+        )
+
+    # 记录原件路径（供界面「原版预览」）
+    _orig = find_original(result.file_path)
+    if _orig is not None:
+        result.original_path = paths.rel_to_data(_orig)
+
+    # ---- 立即索引 ----
+    if db is not None and result.abs_path:
+        try:
+            from . import indexer  # 局部导入避免循环依赖
+
+            r = indexer.index_file(db, Path(result.abs_path), embedder)
+            if not r.get("ok"):
+                result.message += f"（索引写入失败：{r.get('error')}）"
+        except Exception as exc:  # noqa: BLE001
+            log.error("抓取后索引失败: %s", exc)
+            result.message += f"（索引异常：{exc}）"
+
+    log.info("剪藏 [%s] %s -> %s (%d 字)", result.status, url, result.file_path, result.char_count)
+    return result
+
+
+def save_manual_note(title: str, body: str, db=None, embedder=None, source: str = "manual") -> CaptureResult:
+    """剪贴板/手工录入通道（降级引导的落点）。"""
+    title = (title or "").strip() or "未命名笔记"
+    body = (body or "").strip()
+    if not body:
+        return CaptureResult(False, "error", message="内容为空，未保存")
+
+    when = datetime.now()
+    paths.NOTES_DIR.mkdir(parents=True, exist_ok=True)
+    slug = _NAME_SAFE_RE.sub("-", title)[:32].strip("-") or "note"
+    target = paths.NOTES_DIR / f"note_{when:%Y%m%d_%H%M%S}_{slug}.md"
+    fm = _frontmatter(
+        {
+            "title": title,
+            "source_url": "",
+            "captured_at": when.strftime("%Y-%m-%d %H:%M:%S"),
+            "status": "success",
+            "doc_type": source,
+        }
+    )
+    target.write_text(f"{fm}\n\n# {title}\n\n{body}\n", encoding="utf-8")
+
+    result = CaptureResult(
+        True, "success", title=title, file_path=paths.rel_to_data(target),
+        abs_path=str(target), char_count=len(body), message="笔记已保存",
+        used="manual",
+    )
+    if db is not None:
+        try:
+            from . import indexer  # noqa: PLC0415
+
+            indexer.index_file(db, target, embedder)
+        except Exception as exc:  # noqa: BLE001
+            result.message += f"（索引异常：{exc}）"
+    return result
+
+
+MAX_ORIGINAL_BYTES = 50 * 1024 * 1024      # 原文件留存上限，防异常大文件塞爆 U 盘
+
+# 这些格式本身就是 Markdown/纯文本，笔记即原件，不必重复留存
+_SELF_STORED_KINDS = {"markdown", "text"}
+
+
+def save_original(stem: str, ext: str, data: bytes) -> str:
+    """把导入文件的**原件**留存到 data/originals/，供界面「原版预览」使用。
+
+    返回相对 data/ 的路径；未留存时返回空串。
+    """
+    if not data or len(data) > MAX_ORIGINAL_BYTES:
+        return ""
+    ext = (ext or "").lower()
+    if not ext.startswith("."):
+        ext = "." + ext
+    if len(ext) > 12 or not re.fullmatch(r"\.[A-Za-z0-9]+", ext):
+        return ""
+    try:
+        paths.ORIGINALS_DIR.mkdir(parents=True, exist_ok=True)
+        target = paths.ORIGINALS_DIR / f"{stem}{ext}"
+        target.write_bytes(data)
+        return f"originals/{target.name}"
+    except OSError as exc:
+        log.warning("原文件留存失败 %s%s: %s", stem, ext, exc)
+        return ""
+
+
+def find_original(rel_note_path: str) -> Path | None:
+    """按笔记路径反查原件（同 stem 任意扩展名）。
+
+    允许笔记被重命名后仍能找到原件；找不到时返回 None。
+    """
+    try:
+        stem = Path(rel_note_path).stem
+    except (TypeError, ValueError):
+        return None
+    if not stem:
+        return None
+    if not paths.ORIGINALS_DIR.exists():
+        return None
+    for p in sorted(paths.ORIGINALS_DIR.iterdir()):
+        if p.is_file() and p.stem == stem:
+            return p
+    return None
+
+
+def import_document(
+    filename: str,
+    data: bytes,
+    db=None,
+    embedder=None,
+    overwrite: bool = False,
+) -> CaptureResult:
+    """导入任意受支持格式的文件：先转成 Markdown，再落盘建索引。
+
+    转换能力见 ``core/converters.py``（docx/pptx/xlsx/epub 用标准库 zipfile+XML 解，
+    html/邮件复用 trafilatura，pdf 需 pypdf）。
+    """
+    raw_name = str(filename or "").strip().replace("\\", "/").split("/")[-1]
+    if not raw_name:
+        return CaptureResult(False, "error", message="缺少文件名")
+    if raw_name.startswith("."):
+        return CaptureResult(False, "error", message=f"{raw_name}：不支持隐藏文件")
+
+    from . import converters  # 惰性导入，避免循环依赖
+
+    conv = converters.convert(data, raw_name)
+    if not conv.ok:
+        return CaptureResult(False, "error", message=conv.error)
+
+    stem = Path(raw_name).stem.strip() or "imported"
+    safe_stem = _NAME_SAFE_RE.sub("-", stem)[:60].strip("-") or "imported"
+    paths.NOTES_DIR.mkdir(parents=True, exist_ok=True)
+    target = paths.NOTES_DIR / f"{safe_stem}.md"
+    if target.exists() and not overwrite:
+        target = paths.NOTES_DIR / f"{safe_stem}_{datetime.now():%Y%m%d_%H%M%S}.md"
+
+    body = conv.markdown.strip()
+    if body.lstrip().startswith("---"):
+        text = body + "\n"                      # 转换结果自带 frontmatter（如 .md 原样导入）
+    else:
+        when = datetime.now()
+        fm = _frontmatter(
+            {
+                "title": conv.title or stem,
+                "source_file": raw_name,
+                "source_type": conv.kind,
+                "imported_at": when.strftime("%Y-%m-%d %H:%M:%S"),
+                "status": "success",
+                "doc_type": "imported",
+            }
+        )
+        text = f"{fm}\n\n{body}\n"
+
+    try:
+        target.write_text(text, encoding="utf-8")
+    except OSError as exc:
+        return CaptureResult(False, "error", message=f"写入失败：{exc}")
+
+    note = f"（{conv.kind} → Markdown）" if conv.kind not in ("markdown",) else ""
+    # 留存原件：界面「原版预览」用它还原原始观感（PDF 用浏览器原生查看器）
+    original_rel = ""
+    if conv.kind not in _SELF_STORED_KINDS:
+        original_rel = save_original(target.stem, Path(raw_name).suffix, data)
+
+    result = CaptureResult(
+        True, "success", title=conv.title or stem,
+        file_path=paths.rel_to_data(target), abs_path=str(target),
+        char_count=conv.char_count,
+        message=f"已导入 {raw_name}{note}",
+        used=f"import:{conv.kind}",
+    )
+    result.original_path = original_rel
+    if conv.warnings:
+        result.message += "；" + "；".join(conv.warnings[:2])
+
+    if db is not None:
+        try:
+            from . import indexer  # noqa: PLC0415
+
+            r = indexer.index_file(db, target, embedder)
+            if not r.get("ok"):
+                result.message += f"（索引写入失败：{r.get('error')}）"
+        except Exception as exc:  # noqa: BLE001
+            result.message += f"（索引异常：{exc}）"
+    log.info("导入 [%s] %s (%d 字)", result.status, result.file_path, result.char_count)
+    return result
+
+
+def import_markdown(filename: str, content: str, db=None, embedder=None, overwrite: bool = False) -> CaptureResult:
+    """纯文本 / Markdown 便捷入口（内部走统一的 import_document）。"""
+    data = (content or "").encode("utf-8")
+    return import_document(filename, data, db=db, embedder=embedder, overwrite=overwrite)

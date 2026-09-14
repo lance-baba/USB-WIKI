@@ -1,0 +1,32 @@
+# ---- 用户数据资产（绝不入库）----
+data/notes/
+data/snapshots/
+data/originals/
+data/cache.db
+data/cache.db-wal
+data/cache.db-shm
+data/wiki-usb.log
+data/temp_chrome_profile/
+
+# ---- 平台相关二进制（体积大，用 setup_runtime_windows.py 重建）----
+runtime/
+
+# ---- 含明文密钥的本地配置 ----
+config.ini
+
+# ---- 个人记忆与交付产物 ----
+.workbuddy/
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini

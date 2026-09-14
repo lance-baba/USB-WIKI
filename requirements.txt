@@ -1,0 +1,51 @@
+# =============================================================================
+#  Wiki-USB 依赖清单 —— 全项目**唯一**依赖来源
+# =============================================================================
+#  所有安装入口（Windows 的 setup_runtime_windows.py、Linux/macOS 启动脚本、
+#  CI）都从这里读取，避免多份清单互相漂移。
+#
+#  这里只列**直接依赖**；babel / courlan / dateparser / jusText 等由 trafilatura
+#  传递引入，不重复声明。
+#
+#  安装：pip install -r requirements.txt
+# =============================================================================
+
+# --- 正文抽取与解析 ---
+trafilatura>=1.9.0      # 网页正文抽取引擎（非 Windows 可 bare mode 降级）
+lxml>=5.0               # C 扩展加速解析器（无 C 编译环境时降级 html.parser）
+
+# --- 检索 ---
+sqlite-vec>=0.1.6       # SQLite 向量检索扩展（官方预编译 wheel）
+
+# --- 数据与网络 ---
+PyYAML>=6.0             # Markdown frontmatter 解析
+requests>=2.31          # HTTP 抓取
+certifi>=2024.0         # CA 证书包
+xxhash>=3.4             # exFAT 等长编辑快速哈希（缺失时自动回退 sha256/md5）
+
+# --- PDF 正文抽取（双后端，自动择优，合计约 +26MB）---
+# pdfminer.six：主用。自带 149 个东亚 CMap 映射表，**保留段落空行**，
+#   使 Parent-Child 切片能按段落断开而不是在句子中间硬切。
+#   它硬性依赖 cryptography（另 +11MB），不可裁剪。
+# pypdf：纯 Python 轻量后备（约 4MB）。只想省 22MB 时可删掉 pdfminer.six，
+#   转换器会自动降级，功能可用但会丢失段落结构。
+pdfminer.six>=20231228
+pypdf>=4.0
+
+# 说明：.docx/.pptx/.xlsx/.epub/.html/.csv/.json 等格式由标准库 zipfile+xml 解析，
+#       无需任何额外依赖。扫描件 PDF / 图片 / 音视频需要 OCR/ASR 模型，本项目不含该能力。
+
+# -----------------------------------------------------------------------------
+#  可选依赖（不随默认安装）
+# -----------------------------------------------------------------------------
+# 本地 ONNX 嵌入引擎：约 +120MB，且**缺少模型文件时不提供任何能力**，
+# 却会让发布包体积翻倍。因此默认安装（含 Windows 发布版）都不包含它。
+#
+# 不装也能正常使用——嵌入源会自动降级：
+#   local_onnx → ollama → api → 纯 FTS5 词法检索
+#
+# 需要时二选一：
+#   python setup_runtime_windows.py --with-onnx     # Windows，含模型下载
+#   pip install "onnxruntime>=1.17"                 # 其它平台
+#
+# onnxruntime>=1.17
