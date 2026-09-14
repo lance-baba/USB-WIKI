@@ -33,6 +33,16 @@ python tests/test_suite.py
 CI 会在 **Linux + Windows × Python 3.11 + 3.13** 四个组合上跑同一套测试，
 并且**故意不安装 `onnxruntime`** —— 用来验证嵌入源的降级链在缺依赖时依然正确。
 
+CI 会在 **Linux + Windows × Python 3.11 + 3.13** 四个组合上跑同一套测试，
+并且**故意不安装 `onnxruntime`** —— 用来验证嵌入源的降级链在缺依赖时依然正确。
+
+> ⚠️ **已知问题**：Windows job 在 GitHub runner 上存在尚未定位的失败
+> （本地 Windows 双环境 189/189 通过，Linux runner 亦全绿），
+> 故该 job 标记为 `continue-on-error`，不会阻塞徽章。
+> 若你是 Windows 用户且 CI 失败，欢迎把该 job 的「运行测试套件」步骤日志尾部贴到 issue。
+> 欢迎提供能稳定复现的环境信息（OS 版本 / Python 版本 / 代码页）。
+
+
 新增功能请一并补测试。测试素材尽量**由代码现场合成**（参见 `tests/test_converters.py`
 里手写 xref 的 PDF、以及用 `zipfile` 现造的 OOXML），不要提交二进制样本文件。
 
