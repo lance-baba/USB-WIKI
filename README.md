@@ -29,8 +29,9 @@
 ```
 浏览器会自动打开 `http://127.0.0.1:28765`。关闭控制台窗口或点击界面右上角「安全退出」即可安全拔盘。
 
-> **发布包体积**：核心运行时实测 **122MB**（初始预估 ~65MB，差额来自初始评估未计入的传递依赖与 PDF 解析库 ——
-> 其中 `babel` 32MB 是 `courlan → trafilatura` 的 import 期硬依赖，实测不可删）。
+> **发布包体积**：核心运行时 **122MB**（自包含 Python 解释器与全部依赖）。
+> 最重的一项 `babel`（32MB）来自 `trafilatura` 依赖链上游的 `courlan` ——
+> 它在 import 期就硬引用 `babel.Locale`，实测移除即崩，无法裁剪。
 > 可选能力 `onnxruntime`（+约 120MB）已改为按需安装：`python setup_runtime_windows.py --with-onnx`。
 > 未启用时嵌入源按 `local_onnx → ollama → api → local_hash` 逐级降级。
 
@@ -78,8 +79,9 @@ chmod +x 启动-macOS.command 启动-Linux.sh
 | RTF | `.rtf` | 有损提取可见文字 |
 
 > **明确不支持**：旧版二进制 Office（`.doc` `.ppt` `.xls`）、图片、音视频 ——
-> 这些需要 OCR / 语音转写模型（OmniParse 走的就是这条路），单是模型就让发布包从 122MB 涨到 GB 级，
+> 这些都需要 OCR / 语音转写**模型**，单是模型就会让发布包从 122MB 涨到 GB 级，
 > 与本项目「U 盘便携、零安装」的定位冲突。请先用 Office/WPS 另存为新格式。
+> 完整的方案取舍（哪些格式必须用模型、哪些用标准库就能解）见[设计与实现](docs/设计与实现.md)。
 
 ### 原版预览（笔记页三种视图）
 
