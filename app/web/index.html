@@ -259,7 +259,19 @@
   .doc-md a{color:var(--accent)}
   .doc-md img{max-width:100%;border-radius:8px}
   .doc-md .empty{color:var(--faint)}
-  .doc-frame{flex:1;min-height:340px;width:100%;border:1px solid var(--line);border-radius:9px;background:#fff}
+  /* 原版预览容器：必须自己撑满预览区。注意 #noteView 不是 flex 容器，
+     早年给 .doc-frame 写 flex:1 是无效的，iframe 只剩 min-height:340px，
+     表现为「预览只有一小条 + 内外两根滚动条」。 */
+  /* 原版视图：#noteView 必须自己填满 .doc-wrap，否则内部一切 height:100% 都解析不出来
+     （.doc-wrap 是 flex 列容器，但 .doc-md 默认不是 flex:1 —— 这正是「预览只有一小条」的根因） */
+  .doc-md.doc-original{display:flex;flex-direction:column;flex:1;min-height:0;overflow:hidden;padding:0 3px 3px}
+  .doc-original .frame-wrap{flex:1;min-height:0;overflow:auto;border:1px solid var(--line);border-radius:9px;background:#fff}
+  .frame-wrap.fit{overflow:hidden}   /* 适应宽度时按精确比例缩放，不出现外层滚动条 */
+  .frame-wrap .doc-frame{display:block;width:100%;height:100%;border:0;border-radius:0;background:#fff}
+  .frame-tools{display:flex;gap:7px;align-items:center;font-size:11.5px;color:var(--faint);margin:0 0 7px;flex-wrap:wrap}
+  .frame-tools button{font-size:11px;padding:2px 9px;border:1px solid var(--line-strong);border-radius:7px;background:#fff;color:var(--muted);cursor:pointer}
+  .frame-tools button.on{color:#fff;background:var(--accent);border-color:var(--accent)}
+  .doc-frame{min-height:340px;width:100%;border:1px solid var(--line);border-radius:9px;background:#fff}
   .doc-meta{font-size:11.5px;color:var(--faint);margin-bottom:7px}
   .doc-dl{padding:14px;border:1px dashed var(--line-strong);border-radius:10px;text-align:center}
   #graphSvg{flex:1;min-height:0;width:100%;border:1px solid var(--line);border-radius:12px;background:radial-gradient(circle at 50% 40%,#fff, #f7f9fd)}
@@ -989,20 +1001,74 @@ function setNoteView(view) {
     const url = "/api/notes/original?path=" + encodeURIComponent(d.path);
     const meta = '<div class="doc-meta">原版：' + esc(orig.name) + "（" + fmtSize(orig.size) + "）" +
       '　<a href="' + url + '?download=1" download>下载原件</a></div>';
-    if (orig.ext === ".pdf") {
+    const isWeb = orig.ext === ".html" || orig.ext === ".htm";
+    const isPdf = orig.ext === ".pdf";
+
+    // 剪藏页加宽度切换；PDF 用浏览器自带查看器（自带缩放），无需切换
+    const tools = isWeb
+      ? '<div class="frame-tools">宽度：'
+        + '<button type="button" data-m="fit" class="on">适应宽度</button>'
+        + '<button type="button" data-m="raw">实际大小</button>'
+        + '<span>剪藏页已禁用脚本，需登录/展开等交互时请用「下载原件」在浏览器打开</span></div>'
+      : "";
+
+    box.className = "doc-md doc-original";   // 让 #noteView 成为填满面板的 flex 列
+    box.innerHTML = meta + tools +
+      '<div class="frame-wrap fit"><iframe class="doc-frame" title="原版预览"></iframe></div>';
+    const wrap = box.querySelector(".frame-wrap");
+    const frame = wrap.querySelector("iframe");
+
+    if (isPdf) {
       // 浏览器内置 PDF 查看器 —— 与直接打开 PDF 完全一致的观感
-      box.innerHTML = meta + '<iframe class="doc-frame" src="' + url + '#toolbar=1&view=FitH" title="PDF 预览"></iframe>';
-    } else if (orig.ext === ".html" || orig.ext === ".htm") {
+      frame.src = url + "#toolbar=1&view=FitH";
+    } else if (isWeb) {
       // 剪藏的原网页：沙箱 iframe 还原版式。sandbox="" 屏蔽脚本/表单/弹窗，
-      // 因为抓来的第三方 HTML 属于不可信内容
-      box.innerHTML = meta +
-        '<iframe class="doc-frame" sandbox="" referrerpolicy="no-referrer" src="' + url + '" title="网页预览"></iframe>';
+      // 因为抓来的第三方 HTML 属于不可信内容 —— 这条安全底线不能放宽
+      frame.setAttribute("sandbox", "");
+      frame.setAttribute("referrerpolicy", "no-referrer");
+      frame.src = url;
     } else if (/^\.(png|jpe?g|gif|webp|bmp|svg)$/.test(orig.ext)) {
-      box.innerHTML = meta + '<img src="' + url + '" alt="' + esc(orig.name) + '">';
+      wrap.outerHTML = '<img src="' + url + '" alt="' + esc(orig.name) + '" style="max-width:100%;border-radius:9px">';
+      return;
     } else {
-      box.innerHTML = meta + '<div class="doc-dl">该格式无法内嵌预览。<br><br>' +
+      wrap.outerHTML = '<div class="doc-dl">该格式无法内嵌预览。<br><br>' +
         '<a class="btn" href="' + url + '?download=1" download>下载原件</a></div>';
+      return;
     }
+
+    // 剪藏页适配：X / 微博这类站点是桌面固定宽度布局，塞进窄面板必被横向裁半。
+    // 方案：按 1280px 的桌面宽度渲染，再等比缩放到面板宽 —— 整页横向永远完整可见。
+    // 沙箱（无 allow-same-origin）拿不到内容高度，因此高度按「缩放后恰好填满」反推，
+    // 页面更长时由 iframe 自己出滚动条，全程只有一根滚动条。
+    const VIRTUAL_W = 1280;
+    let mode = "fit";
+    const layout = () => {
+      const w = wrap.clientWidth, h = wrap.clientHeight;
+      if (!w || !h) return;
+      if (mode === "fit") {
+        const k = w / VIRTUAL_W;
+        frame.style.width = VIRTUAL_W + "px";
+        frame.style.height = Math.max(400, Math.floor(h / k)) + "px";
+        frame.style.transformOrigin = "0 0";
+        frame.style.transform = "scale(" + k + ")";
+      } else {
+        frame.style.width = "100%";
+        frame.style.height = "100%";
+        frame.style.transform = "none";
+      }
+    };
+    layout();
+    if (window.__frameRO) window.__frameRO.disconnect();
+    window.__frameRO = new ResizeObserver(layout);
+    window.__frameRO.observe(wrap);
+    box.querySelectorAll(".frame-tools button").forEach(b =>
+      b.addEventListener("click", () => {
+        mode = b.dataset.m;
+        box.querySelectorAll(".frame-tools button").forEach(x => x.classList.toggle("on", x === b));
+        wrap.classList.toggle("fit", mode === "fit");
+        wrap.classList.toggle("raw", mode !== "fit");
+        layout();
+      }));
     return;
   }
 
