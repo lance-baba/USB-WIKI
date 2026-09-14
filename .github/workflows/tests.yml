@@ -75,6 +75,72 @@ jobs:
           echo "测试套件以 exit ${{ steps.tests.outputs.exit_code }} 结束"
           exit 1
 
+      # 无论成败都把诊断写进运行摘要 —— 公开仓库的 Actions 日志下载需要鉴权，
+      # 而摘要页无需登录即可查看，是唯一可靠的排查通道（对无 token 的排查者亦然）。
+      - name: 诊断写入运行摘要
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "### 测试诊断 · ${{ matrix.os }} / Python ${{ matrix.python }}"
+            echo ""
+            echo "- 测试退出码：\`${{ steps.tests.outputs.exit_code }}\`"
+            echo ""
+            echo '```text'
+            tail -n 60 test-out.txt 2>/dev/null || echo "(test-out.txt 不存在)"
+            echo '```'
+
+            # 输出为空说明进程在导入阶段就死了（那时还没进入 main 的异常兜底）
+            if [ ! -s test-out.txt ]; then
+              echo ""
+              echo "#### 输出为空 —— 执行导入探针"
+              echo ""
+              echo '```text'
+              python - <<'PROBE' 2>&1
+              import sys, traceback
+              try:
+                  sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+              except Exception:
+                  pass
+              mods = ["app.core.paths", "app.core.log_util", "app.core.config", "app.core.net_util",
+                      "app.core.db", "app.core.embedder", "app.core.chunker", "app.core.search",
+                      "app.core.crawler", "app.core.llm", "app.core.indexer", "app.core.sync",
+                      "app.core.graph", "app.core.converters"]
+              for m in mods:
+                  try:
+                      __import__(m)
+                      print("OK  ", m)
+                  except BaseException as e:
+                      print("FAIL", m, "->", type(e).__name__, e)
+                      traceback.print_exc()
+                      break
+              import sqlite3
+              print("sqlite3", sqlite3.sqlite_version, "fts5:",
+                    bool(sqlite3.connect(":memory:").execute(
+                        "select 1 from pragma_compile_options where compile_options like '%FTS5%'").fetchone()))
+              try:
+                  import sqlite_vec
+                  c = sqlite3.connect(":memory:")
+                  c.enable_load_extension(True)
+                  sqlite_vec.load(c)
+                  print("sqlite_vec load OK")
+              except BaseException as e:
+                  print("sqlite_vec FAIL ->", type(e).__name__, e)
+                  traceback.print_exc()
+              PROBE
+              echo '```'
+            fi
+
+            echo ""
+            echo "<details><summary>环境</summary>"
+            echo ""
+            echo '```text'
+            python -c "import sys,locale,platform;print('python',sys.version);print('platform',platform.platform());print('preferred_encoding',locale.getpreferredencoding());print('stdout_encoding',sys.stdout.encoding);print('fs_encoding',sys.getfilesystemencoding())" 2>&1 || true
+            echo '```'
+            echo ""
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: 启动冒烟（服务能否真正起来并响应）
         shell: bash
         env:
