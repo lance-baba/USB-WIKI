@@ -131,6 +131,51 @@ def _meta_of(html_text: str) -> dict:
 
 
 # --------------------------------------------------------------------------
+_META_CHARSET_RE = re.compile(
+    rb"""<meta[^>]+charset\s*=\s*["']?\s*([\w-]+)""", re.I
+)
+
+
+def resolve_html_encoding(raw: bytes, content_type: str = "", apparent: str = "") -> str:
+    """判定 HTML 字节流的真实编码。
+
+    ⚠ 不能依赖 requests 的 `resp.encoding`：对 `text/*` 且**未声明 charset** 的响应，
+    requests 会按 RFC 2616 默认成 ISO-8859-1。这个默认值在今天几乎总是错的
+    （页面普遍是 UTF-8），会把中文与 em dash 变成 `â\x80\x94` 这类乱码。
+    更隐蔽的是 `resp.encoding or resp.apparent_encoding` ——
+    `ISO-8859-1` 是**真值**，`or` 直接短路，内容嗅探结果永远取不到。
+
+    优先级：HTTP 头 charset → BOM → <meta charset> → 字节嗅探 → 启发式。
+    """
+    m = re.search(r"charset\s*=\s*[\"']?([\w-]+)", content_type or "", re.I)
+    if m:
+        return m.group(1)
+
+    if raw.startswith(b"\xef\xbb\xbf"):
+        return "utf-8-sig"
+    if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        return "utf-16"
+
+    # 页面自述的 charset 优先，但要先验证它真能解开，否则视为说谎、落到嗅探
+    mm = _META_CHARSET_RE.search(raw[:4096])
+    if mm:
+        try:
+            cand = mm.group(1).decode("ascii").strip().lower()
+            if cand:
+                raw[:8192].decode(cand)
+                return cand
+        except (UnicodeDecodeError, LookupError):
+            pass
+
+    for enc in ("utf-8", "gb18030", "big5"):
+        try:
+            raw.decode(enc)
+            return enc
+        except UnicodeDecodeError:
+            continue
+    return apparent or "utf-8"
+
+
 def fetch_html(url: str, timeout: float | None = None) -> tuple[str, str]:
     """抓取页面 HTML。返回 (html, error)。优先 requests（代理/UA 控制更好）。"""
     timeout = timeout or config.get_float("CRAWLER", "request_timeout", 20.0)
@@ -146,24 +191,32 @@ def fetch_html(url: str, timeout: float | None = None) -> tuple[str, str]:
         session = requests.Session()
         session.trust_env = True  # 自动读取 HTTP_PROXY / HTTPS_PROXY
         resp = session.get(url, headers=headers, timeout=timeout, allow_redirects=True)
-        resp.encoding = resp.encoding or resp.apparent_encoding or "utf-8"
         if resp.status_code >= 400:
             return "", f"HTTP {resp.status_code}"
-        return resp.text, ""
+        raw = resp.content
+        enc = resolve_html_encoding(
+            raw, resp.headers.get("Content-Type", ""), resp.apparent_encoding or ""
+        )
+        return raw.decode(enc, "replace"), ""
     except ImportError:
         pass
     except Exception as exc:  # noqa: BLE001
         log.warning("requests 抓取失败，回退 urllib: %s", exc)
 
-    status, body, _ = net_util.http_get(url, headers=headers, timeout=timeout)
+    status, body, resp_headers = net_util.http_get(url, headers=headers, timeout=timeout)
     if status == 0:
         return "", str(body)
     if status >= 400:
         return "", f"HTTP {status}"
-    charset = "utf-8"
     if isinstance(body, str):  # pragma: no cover
         return body, ""
-    return body.decode(charset, "replace"), ""
+    # 响应头键名大小写因实现而异，统一按小写匹配
+    ctype = ""
+    for k, v in (resp_headers or {}).items():
+        if k.lower() == "content-type":
+            ctype = v
+            break
+    return body.decode(resolve_html_encoding(body, ctype), "replace"), ""
 
 
 def extract_body(html_text: str, url: str) -> tuple[str, dict, str]:
@@ -512,6 +565,42 @@ def find_original(rel_note_path: str) -> Path | None:
         if p.is_file() and p.stem == stem:
             return p
     return None
+
+
+def purge_orphan_originals(note_paths) -> list:
+    """删除已无对应笔记的原件，返回被删文件名列表。
+
+    入参是**笔记路径**（`notes/x.md` 或绝对路径都可以），函数内部按文件名
+    去扩展名取 stem 再与原件比对。刻意不让调用方传 stem ——
+    踩过的坑：调用方传了 `notes/x.md` 这种相对路径，却拿去和原件的 stem `x`
+    比对，永远不匹配，结果把**全部原件都误删了**。
+
+    安全阀：若当前一份笔记都没有却存在原件，说明可能是笔记目录读取异常
+    （而不是用户真的清空了），此时拒绝删除并留下日志，交给人来判断。
+    """
+    stems = {Path(str(x)).stem for x in (note_paths or ())}
+    if not paths.ORIGINALS_DIR.exists():
+        return []
+    victims = [f for f in paths.ORIGINALS_DIR.iterdir()
+               if f.is_file() and f.stem not in stems]
+    if not victims:
+        return []
+    if not stems:
+        log.warning(
+            "原件目录有 %d 份文件，却未发现任何笔记 —— 疑似笔记目录异常，跳过回收以防误删",
+            len(victims),
+        )
+        return []
+    removed = []
+    for f in victims:
+        try:
+            f.unlink()
+            removed.append(f.name)
+        except OSError as exc:
+            log.warning("原件回收失败 %s: %s", f.name, exc)
+    if removed:
+        log.info("孤儿原件回收 %d 份（笔记已不存在）", len(removed))
+    return removed
 
 
 def import_document(

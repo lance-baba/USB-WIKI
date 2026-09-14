@@ -181,6 +181,15 @@ class NoteSyncer:
         except Exception as exc:  # noqa: BLE001
             report["errors"].append(f"orphan-sweep: {exc}")
 
+        # 孤儿原件回收：笔记没了，导入时留存的原件也就没有存在意义（可达数十 MB）
+        try:
+            from . import crawler as crawler_mod  # noqa: PLC0415
+
+            for name in crawler_mod.purge_orphan_originals(set(disk.keys())):
+                report["removed"].append({"path": f"originals/{name}", "chunks": 0})
+        except Exception as exc:  # noqa: BLE001
+            report["errors"].append(f"original-sweep: {exc}")
+
         self.stats["cycles"] += 1
         self.stats["indexed"] += report["indexed"]
         self.stats["updated"] += report["updated"]

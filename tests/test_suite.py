@@ -493,6 +493,83 @@ def test_alert_classification() -> None:
           all("ModuleNotFoundError" not in n for n in r1.notes), str(r1.notes))
 
 
+def test_orphan_original_cleanup() -> None:
+    """孤儿原件回收 —— 笔记删了，原件不能无限堆积在 U 盘上。
+
+    真实案例：测试期间反复剪藏又删笔记，data/originals/ 里堆了 28 份孤儿原件
+    共 13.48 MB（其中单份剪藏 HTML 就 1MB）。删除路径原本只清理孤儿切片，
+    没管原件。
+    """
+    section("孤儿原件回收")
+
+    keep = "__keep_stem__"
+    crawler.save_original(keep, ".pdf", b"%PDF-1.4 keep")
+    crawler.save_original("__orphan_stem__", ".pdf", b"%PDF-1.4 orphan")
+
+    # 刻意传「相对路径」而不是 stem —— 这正是踩过的坑：口径不一致会导致全部误删
+    gone = crawler.purge_orphan_originals({f"notes/{keep}.md"})
+    check("孤儿原件被回收", "__orphan_stem__.pdf" in gone, str(gone))
+    check("传相对路径也能正确保留有主的原件（口径一致性）",
+          (paths.ORIGINALS_DIR / f"{keep}.pdf").exists())
+    check("有对应笔记的原件被保留",
+          (paths.ORIGINALS_DIR / f"{keep}.pdf").exists())
+
+    # 安全阀：笔记集合为空时拒绝回收，避免笔记目录异常导致原件被清空
+    crawler.save_original("__orphan2__", ".pdf", b"%PDF-1.4 x")
+    check("笔记集合为空时拒绝回收（防误删）",
+          crawler.purge_orphan_originals(set()) == [])
+    check("安全阀触发后文件仍在",
+          (paths.ORIGINALS_DIR / "__orphan2__.pdf").exists())
+
+    for n in ("__keep_stem__.pdf", "__orphan2__.pdf"):
+        (paths.ORIGINALS_DIR / n).unlink(missing_ok=True)
+
+
+def test_html_encoding_detection() -> None:
+    """HTML 编码判定 —— 防止 requests 的 ISO-8859-1 默认值把内容变成乱码。
+
+    真实案例：docs.python.org 的响应头 `Content-Type: text/html` **不带 charset**，
+    requests 按 RFC 2616 默认成 ISO-8859-1，于是 `sqlite3 — DB-API...` 里的
+    em dash 变成 `â\x80\x94`。更隐蔽的是原代码写的
+    ``resp.encoding or resp.apparent_encoding`` —— `ISO-8859-1` 是真值，
+    `or` 直接短路，内容嗅探结果永远取不到。
+    """
+    section("HTML 编码判定（防 ISO-8859-1 默认值致乱码）")
+
+    zh = '<html><head><meta charset="utf-8"><title>中文标题 — 破折号</title></head></html>'
+    raw = zh.encode("utf-8")
+
+    # A. 响应头没有 charset —— 必须以 meta/BOM/嗅探为准，不能落到 latin-1
+    enc = crawler.resolve_html_encoding(raw, "text/html; charset=")
+    check("响应头无 charset 时识别为 utf-8", enc.lower() in ("utf-8", "utf-8-sig"), enc)
+    decoded = raw.decode(enc, "replace")
+    check("按判定结果解码无乱码", "â" not in decoded and "�" not in decoded, decoded[:60])
+    check("破折号被正确还原", "—" in decoded, decoded[:60])
+
+    # B. 响应头显式声明优先级最高
+    check("响应头 charset 优先", crawler.resolve_html_encoding(raw, "text/html; charset=UTF-8").lower() == "utf-8")
+
+    # C. BOM 优先于一切（除响应头）
+    check("UTF-8 BOM 被识别", crawler.resolve_html_encoding(b"\xef\xbb\xbf" + raw) == "utf-8-sig")
+
+    # D. 无 meta 时靠字节嗅探（GBK 中文页）
+    gbk = "<html><head><title>中文标题</title></head><body>这是 GBK 编码的页面内容</body></html>".encode("gb18030")
+    enc = crawler.resolve_html_encoding(gbk, "text/html")
+    check("无声明的中文页不误判为 latin-1", enc.lower() not in ("iso-8859-1", "latin-1"), enc)
+    check("中文页解码无替换符", "�" not in gbk.decode(enc, "replace"), enc)
+
+    # E. 页面自述 charset 与实际不符时，不能被它带偏
+    lying = '<meta charset="utf-8">' + "中文".encode("gb18030").decode("gb18030")
+    enc = crawler.resolve_html_encoding("中文内容测试".encode("gb18030"), "text/html")
+    check("声明无效时回落字节嗅探", enc.lower() not in ("iso-8859-1", "latin-1"), enc)
+
+    # F. 关键回归：这行是原 bug 的写法，必须永远不再产生乱码
+    wrong = raw.decode("iso-8859-1", "replace")          # 旧行为
+    right = raw.decode(crawler.resolve_html_encoding(raw, "text/html"), "replace")
+    check("旧写法确实会产生乱码（说明测试有效）", "\u00e2" in wrong, wrong[:50])
+    check("新判定结果不再产生乱码", "\u00e2" not in right and "—" in right, right[:50])
+
+
 def test_original_preview(ctx) -> None:
     """原件留存 + 原版预览（含中文文件名响应头编码陷阱）。"""
     section("原件留存与原版预览")
@@ -732,6 +809,8 @@ def main() -> int:
         test_gateway(ctx)
         test_graph(ctx)
         test_crawler(ctx)
+        test_orphan_original_cleanup()
+        test_html_encoding_detection()
         test_original_preview(ctx)
         test_hidden_detail_1_equal_length_edit(ctx)
         test_hard_05_rename_and_orphans(ctx)

@@ -33,7 +33,7 @@
 > 可选能力 `onnxruntime`（+约 120MB）已改为按需安装：`python setup_runtime_windows.py --with-onnx`。
 > 未启用时嵌入源按 `local_onnx → ollama → api → local_hash` 逐级降级。
 
-> **已实测**：`runtime/python-3.11-embed/python.exe tests/test_suite.py` → **172/172 通过**
+> **已实测**：`runtime/python-3.11-embed/python.exe tests/test_suite.py` → **189/189 通过**
 > （Python 3.11.9 + SQLite 3.45.1 + FTS5 + sqlite-vec 全部在自包含运行时内就绪）。
 
 ### macOS / Linux（极简环境引导）
@@ -140,7 +140,7 @@ Wiki-USB/
 │   ├── snapshots/              # 降级页面的原始 HTML 快照
 │   └── cache.db                # 衍生索引（可全量重建）
 └── tests/
-    ├── test_suite.py           # 172 项自动化测试（数据根目录隔离到临时目录）
+    ├── test_suite.py           # 189 项自动化测试（数据根目录隔离到临时目录）
     └── smoke_core.py           # 核心链路冒烟
 ```
 
@@ -184,7 +184,7 @@ embedding_dim = 512
 ## 6. 测试
 
 ```bash
-python tests/test_suite.py     # 172 项：切片/检索/网关/星图/破坏性/三项隐蔽细节/数据安全
+python tests/test_suite.py     # 189 项：切片/检索/网关/星图/破坏性/三项隐蔽细节/数据安全
 python tests/smoke_core.py     # 核心链路冒烟（4 组查询）
 python setup_runtime_windows.py --check    # 发布前运行时体检
 ```

@@ -4,9 +4,17 @@
 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循
 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [未发布]
-
 ### 修复
+- **抓取的网页可能整页乱码**：对 `Content-Type` 未声明 `charset` 的响应（如
+  docs.python.org），requests 会按 RFC 2616 默认成 `ISO-8859-1`，把中文与 em dash
+  变成 `â\x80\x94` 这类乱码。原写法 `resp.encoding or resp.apparent_encoding` 里
+  `ISO-8859-1` 是真值，`or` 直接短路，内容嗅探结果永远取不到。
+  现改为自行判定编码：HTTP 头 charset → BOM → `<meta charset>` → 字节嗅探，
+  且会先验证页面自述的 charset 真能解开，否则视为说谎并回落嗅探。
+  影响面：Markdown 笔记与留存的原件 HTML 都会被污染，检索与预览同时受损。
+- **删除笔记后原件不会回收**：导入时留存的原件（PDF / Office / 剪藏 HTML）可达数十 MB，
+  笔记删除后它们成为孤儿，在 U 盘上无声堆积。现随同步周期自动回收，
+  并保留安全阀 —— 若一份笔记都没有却存在原件，判定为笔记目录异常，拒绝删除。
 - 依赖清单收敛为单一来源：`setup_runtime_windows.py` 改为读取 `requirements.txt`，
   不再各自维护一份（此前两份列表已经出现漂移——`onnxruntime` 在 txt 里是硬依赖，
   在安装脚本里却是可选，照 txt 装会无条件多出约 120MB）。
