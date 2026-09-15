@@ -120,9 +120,10 @@
   .bubble blockquote{margin:.5em 0;padding:.3em .9em;border-left:3px solid var(--line-strong);color:var(--muted)}
   .cite{
     display:inline-grid;place-items:center;min-width:17px;height:17px;padding:0 4px;margin:0 2px;
-    font-size:10.5px;font-weight:700;color:#fff;border-radius:6px;cursor:help;
+    font-size:10.5px;font-weight:700;color:#fff;border-radius:6px;cursor:pointer;
     background:linear-gradient(135deg,var(--accent),var(--accent2));vertical-align:1px;position:relative
   }
+  .cite:hover,.ref:hover{filter:brightness(1.12);text-decoration:underline}
   .cite:hover{transform:translateY(-1px)}
   .cite[data-tip]:hover::after{
     content:attr(data-tip);position:absolute;bottom:135%;left:50%;transform:translateX(-50%);
@@ -735,7 +736,8 @@ async function send() {
 
 function refsHtml(refs) {
   return '<div class="refs">' + refs.map(r =>
-    '<span class="ref" title="' + esc(r.path + "\n" + (r.snippet || "")) + '">[' + r.id + "] " + esc(r.title) + "</span>"
+    '<span class="ref" data-ref="' + r.id + '" title="' +
+      esc(r.path + "\n" + (r.snippet || "点击跳转到该笔记")) + '">[' + r.id + "] " + esc(r.title) + "</span>"
   ).join("") + "</div>";
 }
 
@@ -956,7 +958,11 @@ function renderNoteList() {
       "<span>" + (n.chunks || 0) + " 切片</span></div>" +
     "</div>").join("") || '<div class="hint">暂无文档，去「剪藏」页录入一篇吧。</div>';
 
-  $$("#noteList .list-item").forEach(el => el.onclick = async () => {
+  $$("#noteList .list-item").forEach(el => el.onclick = () => openNoteItem(el));
+}
+
+/* 打开一条笔记（列表项已渲染时使用）。抽成具名函数，供问答引用跳转复用。 */
+async function openNoteItem(el) {
     $$("#noteList .list-item").forEach(x => x.classList.remove("active"));
     el.classList.add("active");
     $("#noteTitleBar").textContent = el.querySelector(".t").textContent;
@@ -977,7 +983,23 @@ function renderNoteList() {
       : "该笔记没有留存原件（纯 Markdown / 纯文本导入）";
     NOTE.view = orig ? "original" : "rendered";
     setNoteView(NOTE.view);
-  });
+}
+
+/* 按路径打开笔记：供问答内文角标 / 底部来源 chips 跳转使用 */
+async function openNoteByPath(path) {
+  if (!path) return;
+  switchTab("notes");
+  await loadNotes();                    // 列表异步渲染，必须等它出来
+  const find = () => $$("#noteList .list-item").find(x => x.dataset.path === path);
+  let el = find();
+  if (!el && $("#noteFilter") && $("#noteFilter").value) {
+    $("#noteFilter").value = "";        // 可能被过滤词挡住 → 清空后重试
+    await loadNotes();
+    el = find();
+  }
+  if (!el) { toast("找不到该笔记（可能已被删除）", 3200); return; }
+  el.scrollIntoView({ block: "center" });
+  openNoteItem(el);
 }
 
 /* -------- 笔记视图：渲染 / 原版 / 源码 -------- */
@@ -1524,6 +1546,16 @@ function switchTab(name) {
   if (name === "notes") loadNotes();
   if (name === "settings") { loadConfig(); pollStatus(false); }
 }
+
+/* 问答引用可跳转：内文角标 [^N] 与底部来源 chips 都点了能进对应笔记 */
+document.addEventListener("click", function (ev) {
+  const chip = ev.target && ev.target.closest ? ev.target.closest(".cite,.ref") : null;
+  if (!chip) return;
+  const id = chip.dataset.ref;
+  const ref = (S.refs || []).find(function (r) { return String(r.id) === String(id); });
+  if (!ref) { toast("该引用没有对应的笔记路径", 2600); return; }
+  openNoteByPath(ref.path);
+});
 
 /* ---------------------------- 绑定 ---------------------------- */
 $$(".tab").forEach(t => t.onclick = () => switchTab(t.dataset.tab));
