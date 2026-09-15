@@ -56,6 +56,32 @@ def _fmt_size(n) -> str:
     return ""
 
 
+def _query_window(text: str, query: str, limit: int) -> str:
+    """在 limit 字符内**优先给出与查询最相关的片段**，而不是无脑从头截。
+
+    章节开头常是过渡句，真正相关的往往在中间。这里用查询实词定位首次出现处，
+    取其前后窗口；一个词都没命中才退回开头。
+    """
+    t = " ".join((text or "").split())
+    if len(t) <= limit:
+        return t
+    terms = []
+    try:
+        terms = search_mod.content_terms(query)
+    except Exception:  # noqa: BLE001
+        terms = [w for w in (query or "").split() if len(w) >= 2]
+    pos = -1
+    for term in sorted(terms, key=len, reverse=True):
+        pos = t.find(term)
+        if pos >= 0:
+            break
+    if pos < 0:
+        return t[:limit] + "…"
+    start = max(0, pos - limit // 3)
+    out = t[start:start + limit]
+    return ("…" if start > 0 else "") + out + ("…" if start + limit < len(t) else "")
+
+
 class Gateway:
     def __init__(self, db: Database | None = None, embedder=None) -> None:
         self.db = db
@@ -286,12 +312,28 @@ class Gateway:
 
     @staticmethod
     def build_prompt(query: str, result: search_mod.SearchResult, history: list[dict] | None) -> str:
+        """构造提示词。**注入的知识片段必须有硬预算**。
+
+        为什么必须封顶：父块是「章节」粒度，实测单块可达 1200 字符；命中 5 块就是
+        5000+ 字符（≈7.5k tokens）。本地小模型的上下文窗口与注意力都有限，
+        不封顶要么溢出、要么被无关长文淹没 —— 而这恰恰是同级项目踩过并写进
+        说明的一条经验（单段封顶 + 总量封顶）。这里做同样的事，且比它更贴题：
+        每段**优先截取与查询词最接近的窗口**，而不是简单从头截。
+        """
+        per_limit = max(80, config.get_int("AI", "inject_per_parent_chars", 400))
+        total_budget = max(200, config.get_int("AI", "inject_total_chars", 1800))
+
         parts: list[str] = ["【知识片段】"]
         if result.parents:
+            used = 0
             for i, p in enumerate(result.parents, start=1):
-                parts.append(
-                    f"[^{i}] 来源：{p['title']}（{p['path']}）\n{p['content'].strip()}"
-                )
+                head = f"[^{i}] 来源：{p['title']}（{p['path']}）\n"
+                room = min(per_limit, total_budget - used - len(head))
+                if room < 80:
+                    break                     # 预算用尽：宁可少给，不要塞爆
+                body = _query_window(p.get("content") or "", query, room)
+                parts.append(head + body)
+                used += len(head) + len(body)
         else:
             parts.append("（检索无命中，知识库中暂无与该问题相关的切片）")
         parts.append("")

@@ -9,6 +9,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 
+from .db import SCHEMA_VERSION  # noqa: E402
 from . import config, db as db_mod, embedder as embedder_mod, indexer, llm, net_util, paths, sync
 from .log_util import get_logger
 
@@ -56,6 +57,9 @@ class AppContext:
             self.embedder_source = resolved.source
             self.warnings.extend(resolved.warnings)
             self.notes.extend(resolved.notes)
+
+        # 索引结构变更（如新增派生表）时，旧库不会自动补齐 —— 如实告知并可一键重建。
+        # 刻意不自动重建：大库重建耗时且会占 IO，应由用户决定时机（设置页有按钮）。
             self.gateway.embedder = self.embedder
 
             # 5) ⚠ 用真实维度建向量表。Ollama / API 的维度由模型决定（自动探测得到），

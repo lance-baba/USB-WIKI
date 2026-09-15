@@ -24,6 +24,11 @@ sync_interval = 15
 log_level = INFO
 
 [AI]
+# 注入给模型的「知识片段」预算。父块是章节粒度，实测单块可达 1200 字符；
+# 不封顶时命中 5 块就是 5000+ 字符（≈7.5k tokens），小模型要么溢出、
+# 要么被无关长文淹没。每段会优先截取**与查询词最接近的窗口**而非从头截。
+inject_per_parent_chars = 400
+inject_total_chars = 1800
 # 模式选择: auto(自动探测) / ollama(本地优先) / api(云端优先) / offline(纯离线免AI)
 provider = auto
 

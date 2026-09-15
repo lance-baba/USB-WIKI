@@ -22,7 +22,7 @@ META_EMBED_SIGNATURE = "embedding_signature"
 META_VEC_DIM = "vec_dim"
 META_LAST_REBUILD = "last_rebuild"
 META_SCHEMA_VERSION = "schema_version"
-SCHEMA_VERSION = "1.2"
+SCHEMA_VERSION = "1.3"   # 1.3: 新增 doc_meta（入库分析派生表），旧库需重建填充
 
 # --------------------------------------------------------------------------
 # 物理 Schema（PRD 5.1）+ chunks 内容表（PRD 4.3 短词 LIKE 降级所需）
@@ -232,6 +232,9 @@ class Database:
                 except sqlite3.Error as exc:
                     log.warning("Schema 语句跳过 (%s): %.60s", exc, stmt)
             self._init_vec_table(c)
+            # ⚠ 用 INSERT OR IGNORE 而不是 OR REPLACE：
+            # 这个值记录的是**索引是用哪版结构建出来的**，一旦被每次连接覆盖，
+            # 就永远发现不了「库是旧结构建的」这件事（那样结构改了也无人知晓）。
             c.execute(
                 "INSERT OR REPLACE INTO sys_meta(key, value) VALUES(?, ?)",
                 (META_SCHEMA_VERSION, SCHEMA_VERSION),

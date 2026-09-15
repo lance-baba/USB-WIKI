@@ -749,6 +749,31 @@ def test_original_preview(ctx) -> None:
     check("Office 文档不内联（走下载）", ".docx" not in Handler.INLINE_TYPES)
 
 
+def test_inject_budget(ctx) -> None:
+    """注入给模型的上下文必须有硬预算。
+
+    来自同级项目《优势说明》里它们踩过、我们此前没有的一条：
+    注入的知识片段**没有上限** —— 父块是章节粒度，实测单块可达 1200 字符，
+    命中 5 块就是 5000+ 字符（≈7.5k tokens）。本地小模型的窗口与注意力都有限，
+    不封顶要么溢出、要么被无关长文淹没。
+    """
+    section("注入预算护栏（防上下文被长文淹没）")
+    from app.core import llm
+
+    # ---- 注入预算 ----
+    big = "台风" + "内容" * 600          # ≈1200 字符，与实测最长父块同量级
+    res = search.SearchResult(query="台风路径", route="fts")
+    res.parents = [
+        {"parent_id": f"p{i}", "doc_id": "d", "title": f"长文{i}",
+         "path": f"notes/l{i}.md", "content": big, "score": 1.0}
+        for i in range(5)
+    ]
+    prompt = llm.Gateway.build_prompt("台风路径怎么样", res, None)
+    seg = prompt.split("【当前问题】")[0]
+    check("注入片段有总量上限（修复前会注入 ~5000 字符）", len(seg) <= 2000, f"{len(seg)} 字符")
+    check("超长段落被截断并标出省略号", "…" in seg)
+    check("截取的是**与查询相关**的窗口（而非无脑从头截）", "台风" in seg)
+
 def test_ingest_analysis_and_graph(ctx) -> None:
     """入库语义分析 + 星图确定性边。
 
@@ -1065,6 +1090,7 @@ def main() -> int:
         # 测试不依赖外部 AI 服务：provider 用内存态覆盖（persist=False，不碰 config.ini）
         config.update({"AI": {"provider": "offline"}}, persist=False)
 
+        test_inject_budget(ctx)
         test_ingest_analysis_and_graph(ctx)
         test_search_quality_guards(ctx)
         test_index_and_search(ctx)
