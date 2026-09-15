@@ -15,7 +15,7 @@ import re
 import sqlite3
 from dataclasses import dataclass, field
 
-from . import chunker
+from . import chunker, config
 from .db import Database
 from .log_util import get_logger
 
@@ -66,18 +66,146 @@ def query_terms(query: str) -> list[str]:
     return [m.group(0) for m in _TERM_RE.finditer(query or "")]
 
 
-def should_use_like(query: str) -> bool:
-    """PRD 4.3 检索路由判定：True 表示必须走 LIKE 降级。"""
-    terms = query_terms(query)
+# --------------------------------------------------------------------------
+# 中文虚词 / 英文停用词：它们几乎出现在每篇文档里，一旦参与检索只会把无关文档
+# 拉进候选。同级项目实测过「黄仁勋说了什么」因虚词劫持返回一堆无关结果。
+_STOPWORDS = {
+    "的", "了", "是", "在", "有", "和", "与", "或", "及", "就", "也", "都", "而", "吗", "呢",
+    "我", "你", "他", "她", "它", "我们", "你们", "他们", "这", "那", "这个", "那个",
+    "什么", "怎么", "怎样", "如何", "为什么", "哪些", "哪个", "多少", "是否", "能否",
+    "吧", "啊", "呀", "么", "哦", "嗯", "说", "讲", "提到", "关于", "对于", "以及",
+    "还有", "可以", "一下", "一些", "有点", "比较", "非常", "很", "太", "更", "最",
+    "请", "帮", "帮我", "告诉", "介绍", "总结", "概括", "列出", "看看",
+    "a", "an", "the", "is", "are", "was", "were", "be", "been", "of", "to", "in", "on",
+    "at", "by", "for", "with", "from", "about", "as", "that", "this", "these", "those",
+    "what", "which", "who", "whom", "whose", "how", "why", "when", "where",
+    "do", "does", "did", "can", "could", "should", "would", "will", "may", "might",
+    "i", "you", "he", "she", "it", "we", "they", "me", "him", "her", "us", "them",
+    "and", "or", "not", "no", "yes", "please", "tell", "show", "list",
+}
+
+_CJK_RUN_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]+")
+
+# 问句的虚词几乎总是出现在两端（…吗 / …是什么 / …说了什么）。
+# 按长度降序，先长后短，避免「是什么」被「是」抢先切掉。
+_CJK_EDGE_STOPWORDS = (
+    "有什么", "是什么", "说了什么", "怎么样", "怎么用", "干什么",
+    "这个", "那个", "这些", "那些", "一些", "一下",
+    "怎么", "什么", "如何", "哪些", "哪个",
+    "吗", "呢", "吧", "啊", "呀", "么", "的", "了", "是", "有", "在", "和", "与", "及",
+)
+
+
+_CJK_SPLIT_CHARS = "的了吗呢吧啊呀么是在和与及有"
+
+
+def _is_usable_term(t: str) -> bool:
+    """剥离后剩下的东西必须还是个实词。
+
+    反例：「是什么」剥到只剩「什么」、「的了吗呢」剥到只剩「吗」——
+    这些本身就是虚词，拿去 LIKE 只会把无关文档全捞出来，必须丢弃。
+    """
+    return bool(t) and t not in _STOPWORDS and t.lower() not in _STOPWORDS
+
+
+def _has_content_chars(run: str) -> bool:
+    """整串是否含实词字（全是「的了吗呢」这种就属于无实词）。"""
+    return any(c not in _CJK_SPLIT_CHARS for c in run)
+
+
+def _split_cjk_run(run: str) -> list[str]:
+    """把一个 CJK 连续串切成实词片段。
+
+    两步：先剥两端虚词（「台风有吗」→「台风」），
+    再按**中间**的虚词字切段（「台风杜鹃的路径」→「台风杜鹃」+「路径」）。
+    两段用 AND 组合命中同一文档 —— 这比整串当子串可靠得多。
+    """
+    core = _strip_edges(run)
+    if not core:
+        return []
+    parts = re.split(f"[{_CJK_SPLIT_CHARS}]", core)
+    return [p for p in parts if _is_usable_term(p)]
+
+
+def query_terms(query: str) -> list[str]:
+    return [m.group(0) for m in _TERM_RE.finditer(query or "")]
+
+
+def _strip_edges(run: str) -> str:
+    """剥掉 CJK 串两端的虚词，返回中间的实词主体。
+
+    最多剥三层：既要处理「台风有吗 → 台风」（尾），
+    也要处理「这个台风是什么 → 台风」（首尾兼有），又不能无限剥下去把词切碎。
+    """
+    s = run
+    for _ in range(3):
+        before = s
+        for w in _CJK_EDGE_STOPWORDS:
+            if len(s) > len(w) and s.endswith(w):
+                s = s[: -len(w)]
+            if len(s) > len(w) and s.startswith(w):
+                s = s[len(w):]
+        if s == before:
+            break
+    return s
+
+
+def content_term_sets(query: str) -> list[list[str]]:
+    """给出**多套候选实词**（按优先级），供词法检索逐个尝试。
+
+    为什么需要多套：中文没有词边界，正则切不出「台风有吗」里的「台风」。
+    这里刻意不引入分词器（保持零依赖），而是：
+
+    1. 首选「剥掉两端虚词后的实词主体」—— 覆盖「台风有吗 / 台风是什么」这类问句；
+    2. 若首选零命中，再退回**未剥离的原串** —— 这样「有机食品」这种以虚词字
+       开头的真词不会被切坏（剥成「机食品」查不到，回退到原串就能查到）。
+
+    语料驱动的精确分词（用库内实际出现的词做最长匹配）留作后续升级项。
+    """
+    primary: list[str] = []
+    fallback: list[str] = []
+    for t in query_terms(query):
+        if _CJK_RUN_RE.fullmatch(t):
+            parts = _split_cjk_run(t)
+            if not parts:
+                # 整段都是虚词（如「是什么」「的了吗呢」）→ 丢弃。
+                # 若把它当实词留下，AND 组合里会出现一个永不命中的条件，
+                # 把整个查询的正确结果一起清零（「KrevixAi 是什么」就是这么被坑的）。
+                continue
+            if parts != [t]:
+                primary.extend(parts)
+                if _has_content_chars(t):
+                    fallback.append(t)
+                continue
+        if not _is_usable_term(t):
+            continue
+        primary.append(t)
+        fallback.append(t)
+
+    sets: list[list[str]] = []
+    if primary:
+        sets.append(primary)
+    if fallback and fallback != primary:
+        sets.append(fallback)
+    return sets
+
+
+def content_terms(query: str) -> list[str]:
+    """首选实词集合（多套候选的第一套）。"""
+    sets = content_term_sets(query)
+    return sets[0] if sets else []
+
+
+def should_use_like_terms(terms: list[str]) -> bool:
+    """trigram 索引最小可用粒度为 3 字符，更短的必须走 LIKE 降级通道。"""
     if not terms:
         return True
-    for t in terms:
-        if _CJK_RE.search(t):
-            if len(t) < 3:
-                return True
-        else:
-            if len(t) < 3:
-                return True
+    return any(len(t) < 3 for t in terms)
+
+
+def should_use_like(query: str) -> bool:
+    """检索路由判定：True 表示必须走 LIKE 降级（trigram 需 ≥3 字符）。"""
+    return should_use_like_terms(content_terms(query))
     return False
 
 
@@ -108,7 +236,13 @@ def _fts_terms(query: str) -> list[str]:
 
 
 def _match_expr(terms: list[str]) -> str:
-    return " OR ".join('"' + t.replace('"', '""') + '"' for t in terms)
+    """构造 FTS5 MATCH 表达式。
+
+    用 **AND 而非 OR**：OR 的语义是「任一词命中就召回」，一个虚词或一个泛词
+    就能把大量无关文档拉进候选（同级项目实测「黄仁勋说了什么」正是被这样劫持、
+    返回一堆无关结果的）。精确优先；召回不足时由 longest-term 与 LIKE 两级兜底。
+    """
+    return " AND ".join('"' + t.replace('"', '""') + '"' for t in terms)
 
 
 def _serialize_vector(vec: list[float]):
@@ -158,15 +292,27 @@ def _fts_search(db: Database, query: str, limit: int) -> tuple[list[str], str]:
     return _like_search(db, longest, limit)[0], "like"
 
 
-def _like_search(db: Database, keyword: str, limit: int = LIKE_LIMIT) -> tuple[list[str], str]:
-    """短词 / 特殊缩写降级通道（PRD 4.3 原样 SQL）。"""
-    kw = (keyword or "").strip()
-    if not kw:
+def _like_search(db: Database, terms, limit: int = LIKE_LIMIT) -> tuple[list[str], str]:
+    """短词 / 特殊缩写降级通道。
+
+    ⚠ 必须按**实词**做子串匹配，**不能拿整句去 LIKE**：自然语言问句
+    （如「台风有吗」）整句作为子串永远匹配不到 —— 那等于静默丢掉全部召回，
+    只能靠向量路兜底，也正是「引用来源与提问无关」的成因之一。
+
+    多个实词用 AND 组合（宁可少召回，也不要召回无关内容）；
+    实词过多时取最长的几个，避免条件爆炸。
+    """
+    if isinstance(terms, str):
+        terms = content_terms(terms)
+    items = [t for t in (terms or []) if t]
+    if not items:
         return [], "like"
+    items = sorted(items, key=len, reverse=True)[:4]
+    where = " AND ".join(["content LIKE '%' || ? || '%'"] * len(items))
     try:
         rows = db.query(
-            "SELECT chunk_id FROM chunks WHERE content LIKE '%' || ? || '%' LIMIT ?",
-            (kw, limit),
+            f"SELECT chunk_id FROM chunks WHERE {where} LIMIT ?",  # noqa: S608 - 占位符拼接，非用户输入
+            (*items, limit),
         )
         return [r["chunk_id"] for r in rows], "like"
     except sqlite3.Error as exc:
@@ -232,6 +378,85 @@ def _snippet(text: str, query: str, width: int = 140) -> str:
     return t[:width] + ("…" if len(t) > width else "")
 
 
+def _term_exists(db: Database, term: str, cache: dict[str, bool] | None = None) -> bool:
+    """语料中是否存在该串（用于「拿语料当词典」的切分）。"""
+    if cache is not None and term in cache:
+        return cache[term]
+    ok = False
+    try:
+        row = db.query_one(
+            "SELECT 1 AS x FROM chunks WHERE content LIKE '%' || ? || '%' LIMIT 1",
+            (term,),
+        )
+        ok = row is not None
+    except sqlite3.Error:
+        ok = False
+    if cache is not None:
+        cache[term] = ok
+    return ok
+
+
+def trim_term_to_corpus(db: Database, term: str, cache: dict[str, bool] | None = None) -> str:
+    """把实词修剪成**语料中真实存在**的最长片段。
+
+    中文没有词边界，正则切不出「位置编码有什么用」里的「位置编码」。
+    这里不引入分词器，而是**拿库内实际内容当词典**：从长到短试，命中即采用。
+
+    为什么这样反而比通用分词器更合适：个人知识库里的术语（产品名、人名、行话、
+    缩写）通用词典本来就不认识，而它们恰恰是检索时最有价值的词 —— 用自家语料
+    当词典，这些词天然被认识。代价是每次查询多几次存在性探测，用 LIMIT 1
+    加结果缓存把开销压到可忽略。
+
+    仅对 CJK 串修剪：ASCII 词（KrevixAi、FTS5）一旦截断就失去意义。
+    """
+    if len(term) < 2:
+        return term
+    if not _CJK_RUN_RE.fullmatch(term):
+        return term
+
+    # 先尾部修剪：问句虚词多在尾部（「…有什么用」「…怎么用」）
+    for cut in range(0, 6):
+        cand = term[: len(term) - cut] if cut else term
+        if len(cand) < 2:
+            break
+        if _term_exists(db, cand, cache):
+            return cand
+    # 再首部修剪：处理「请问台风」这类前缀缀语
+    for cut in range(1, 6):
+        cand = term[cut:]
+        if len(cand) < 2:
+            break
+        if _term_exists(db, cand, cache):
+            return cand
+    return ""
+
+
+def drop_noise_terms(terms: list[str]) -> list[str]:
+    """多词 AND 时丢弃单字 CJK 噪声。
+
+    「位置编码有什么用」经虚词切分后会剩下 位置编码 / 什 / 用 —— 单字的「什」
+    在库里几乎不可能出现，放进 AND 会把正确结果一起清零。
+    单个字独立成查询（如「注」）仍保留，那是合法的短查询，走 LIKE 通道。
+    """
+    if len(terms) <= 1:
+        return terms
+    return [t for t in terms if not (len(t) == 1 and _CJK_RUN_RE.fullmatch(t))] or terms
+
+
+def resolve_lexical_terms(db: Database, term_sets: list[list[str]]) -> list[str]:
+    """把候选实词集合落到**语料里真实存在的词**上。
+
+    逐套尝试，返回第一套能落地的词；都落不了地就返回空表 ——
+    调用方据此走「如实返回没找到」，而不是拿语义相近的无关文档硬凑。
+    """
+    cache: dict[str, bool] = {}
+    for terms in term_sets:
+        resolved = [t for t in (trim_term_to_corpus(db, t, cache) for t in terms) if t]
+        if resolved:
+            return resolved
+    return []
+
+
 def hybrid_search(
     db: Database,
     embedder,
@@ -245,11 +470,40 @@ def hybrid_search(
     if not query:
         return result
 
-    # 路 1：词法（含短词降级）
-    if should_use_like(query):
-        fts_ids, route = _like_search(db, query, candidates)
-    else:
-        fts_ids, route = _fts_search(db, query, candidates)
+    # 路 1：词法（含短词降级）—— 传**实词**，不传整句。
+    # 多套候选按优先级逐个尝试，第一套有命中即采用：
+    # 首选 = 剥掉虚词后的实词主体；回退 = 未剥离的原串（保护「有机食品」这类真词）。
+    term_sets = content_term_sets(query)
+    if not term_sets:
+        result.route = "empty"
+        result.counts = {"fts_candidates": 0, "vec_candidates": 0, "fused": 0, "parents": 0}
+        result.warnings.append("查询词均为虚词或语气词，请补充实词（人名 / 术语 / 关键词）后再试")
+        return result
+
+    # 落到「语料里真实存在的词」上，并**逐套候选试到命中为止**。
+    #
+    # 注意必须是「试到命中」而不是「试到能解析」：首选切分可能得到
+    # ['位置编码','什','用'] 这种含噪声词的组合（能解析、但永不命中），
+    # 只有真正搜出结果才算这一套成立，否则继续试下一套 ——
+    # 最终退到「整串修剪」（『位置编码有什么用』→『位置编码』）就能命中。
+    # 全部试完仍无命中 = 库里确实没有相关内容 → 如实返回空，绝不硬凑。
+    trim_cache: dict[str, bool] = {}
+    lex_terms: list[str] = []
+    fts_ids: list[str] = []
+    route = "like"
+    for terms in term_sets:
+        resolved = drop_noise_terms(
+            [t for t in (trim_term_to_corpus(db, t, trim_cache) for t in terms) if t]
+        )
+        if not resolved:
+            continue
+        if should_use_like_terms(resolved):
+            ids, r = _like_search(db, resolved, candidates)
+        else:
+            ids, r = _fts_search(db, " ".join(resolved), candidates)
+        if ids:
+            lex_terms, fts_ids, route = resolved, ids, r
+            break
     result.route = route
 
     # 路 2：向量
@@ -261,6 +515,28 @@ def hybrid_search(
         return result
 
     ordered = sorted(fused.items(), key=lambda kv: kv[1]["score"], reverse=True)
+
+    # ---- 引用必须有词法依据 ----
+    # 向量检索的天性就是「永远返回 k 个最近邻」，哪怕全都相距甚远。实测：
+    # 库里根本没有「杜苏芮」，它最近邻的距离（0.768）甚至比真正存在的
+    # 「台风」（0.804）还小 —— 距离阈值区分不了，于是无关文档被当成出处引用
+    # （用户截图里「问台风却引用基坑围护报告」就是这么来的）。
+    # 因此：没有词法命中的切片一律不进引用列表。宁可回答「没找到」，
+    # 也不用语义相近的无关内容冒充来源。
+    grounded = {cid for cid, info in fused.items() if info.get("rank_fts")}
+    if grounded:
+        ordered = [(cid, info) for cid, info in ordered if cid in grounded]
+    elif not config.get_bool("SEARCH", "allow_semantic_only", False):
+        result.route = f"{route}+no-lexical-hit"
+        result.counts = {
+            "fts_candidates": len(fts_ids), "vec_candidates": len(vec_ids),
+            "fused": len(fused), "parents": 0,
+        }
+        result.warnings.append(
+            "未找到字面匹配：知识库中没有出现查询实词的内容"
+            "（已避免用语义相近但无关的文档冒充引用来源）"
+        )
+        return result
 
     # chunk -> parent 聚合（父分块去重，保留最高分）
     chunk_ids = [cid for cid, _ in ordered]

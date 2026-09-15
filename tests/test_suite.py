@@ -749,6 +749,68 @@ def test_original_preview(ctx) -> None:
     check("Office 文档不内联（走下载）", ".docx" not in Handler.INLINE_TYPES)
 
 
+def test_search_quality_guards(ctx) -> None:
+    """检索质量三道闸：实词化、语料词典、引用必须有词法依据。
+
+    背景（全是实测踩出来的真实缺陷）：
+
+    1. `_like_search` 拿**整句**去做子串匹配 → 「台风有吗」整句永远匹配不到，
+       等于静默丢掉全部召回，只能靠向量路兜底；
+    2. 向量路**没有相关性下限**，天性就是「永远返回 k 个最近邻」。实测库里
+       根本没有「杜苏芮」，它的最近邻距离（0.768）甚至比真正存在的「台风」
+       （0.804）还小 —— 距离阈值区分不了，于是无关文档被当成出处引用
+       （用户截图里「问台风却引用基坑围护报告」就是这么来的）；
+    3. FTS 的 MATCH 用 OR 组合，一个虚词就能把大量无关文档拉进候选
+       （同级项目实测「黄仁勋说了什么」被虚词劫持）。
+    """
+    section("检索质量三道闸（实词化 / 语料词典 / 词法依据）")
+    db, emb = ctx.db, ctx.embedder
+    for name, body in NOTES.items():
+        p = paths.NOTES_DIR / name
+        p.write_text(body, encoding="utf-8")
+        indexer.index_file(db, p, emb)
+
+    # ---- 闸 1：虚词剥离，自然语言问句能落地到实词 ----
+    check("问句「位置编码有什么用」剥出实词",
+          search.content_term_sets("位置编码有什么用")[0][:1] == ["位置编码"]
+          or "位置编码" in search.content_term_sets("位置编码有什么用")[0],
+          str(search.content_term_sets("位置编码有什么用")))
+    check("纯虚词查询无实词可用", search.content_term_sets("的了吗呢") == [])
+    check("多词时丢弃单字噪声（否则 AND 永远不命中）",
+          "什" not in search.drop_noise_terms(["位置编码", "什", "用"]),
+          str(search.drop_noise_terms(["位置编码", "什", "用"])))
+
+    # ---- 闸 2：拿语料当词典修剪 ----
+    check("语料中存在的词原样保留",
+          search.trim_term_to_corpus(db, "位置编码") == "位置编码")
+    check("整串修剪到语料里真实存在的片段",
+          search.trim_term_to_corpus(db, "位置编码作用很大啊") == "位置编码",
+          search.trim_term_to_corpus(db, "位置编码作用很大啊"))
+    check("语料里不存在则修剪为空（不硬凑）",
+          search.trim_term_to_corpus(db, "量子纠缠态") == "",
+          search.trim_term_to_corpus(db, "量子纠缠态"))
+
+    # ---- 闸 3：引用必须有词法依据 ----
+    res = search.hybrid_search(db, emb, "位置编码有什么用", top_k_parents=3)
+    check("自然语言问句有召回", len(res.references) > 0, str(res.counts))
+    check("召回内容确实相关", "位置编码" in (res.parents[0]["content"] if res.parents else ""))
+
+    res2 = search.hybrid_search(db, emb, "量子计算机", top_k_parents=3)
+    check("库里没有的词：如实返回空（修复前会硬凑 top-k）",
+          len(res2.references) == 0, f"route={res2.route} refs={len(res2.references)}")
+    check("并给出「未找到字面匹配」的说明",
+          any("字面匹配" in w for w in res2.warnings), str(res2.warnings))
+    check("语义候选被挡在引用之外（vec 有候选但 parents 为 0）",
+          res2.counts.get("vec_candidates", 0) > 0 and res2.counts.get("parents", 0) == 0,
+          str(res2.counts))
+
+    res3 = search.hybrid_search(db, emb, "的了吗呢", top_k_parents=3)
+    check("纯虚词查询提示补实词", res3.route == "empty" and not res3.references, res3.route)
+
+    # ---- 闸 4：MATCH 用 AND，虚词不再劫持 ----
+    check("MATCH 表达式用 AND 组合（非 OR）",
+          " AND " in search._match_expr(["注意力", "机制"]))
+
 def test_port_probe() -> None:
     section("端口探测与避让（PRD 4.1）")
     import socket
@@ -947,6 +1009,7 @@ def main() -> int:
         # 测试不依赖外部 AI 服务：provider 用内存态覆盖（persist=False，不碰 config.ini）
         config.update({"AI": {"provider": "offline"}}, persist=False)
 
+        test_search_quality_guards(ctx)
         test_index_and_search(ctx)
         test_gateway(ctx)
         test_graph(ctx)

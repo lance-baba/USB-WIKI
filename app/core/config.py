@@ -45,6 +45,14 @@ embedding_model_name = bge-small-zh-q4
 top_k_parents = 5
 recall_candidates = 20
 
+[SEARCH]
+# 是否允许「仅语义相关（没有字面命中）」的内容进入引用来源。
+# 0 = 不允许（默认）：引用必须有词法依据，宁可回答「没找到」，
+#     也不用语义相近但无关的文档冒充出处 —— 这是实测踩过的坑：
+#     库里没有「杜苏芮」，它却因向量最近邻被当成台风问答的来源引用。
+# 1 = 允许：召回更多，但引用可能不相关，自行权衡。
+allow_semantic_only = 0
+
 [CRAWLER]
 # 正文提取字数降级门限
 min_body_chars = 150
