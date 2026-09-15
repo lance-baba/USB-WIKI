@@ -202,8 +202,17 @@ def extract_terms(text: str, title: str = "", limit: int = 40) -> dict[str, floa
         key = term if is_cjk else term.lower()
         scored[key] = max(scored.get(key, 0.0), weight)
 
-    top = dict(sorted(scored.items(), key=lambda kv: kv[1], reverse=True)[:limit])
-    return top
+    # 收尾去碎片：n-gram 会切出「化速率」这种跨词边界的碎片，它其实是
+    # 「变化速率」的一部分。按权重从高到低取，**若某词被已选中的更长词包含则丢弃**。
+    # 等频次下长词权重更高（weight 含 log 长度项），所以长词会先被选中。
+    picked: dict[str, float] = {}
+    for term, weight in sorted(scored.items(), key=lambda kv: kv[1], reverse=True):
+        if any(term != p and term in p for p in picked):
+            continue
+        picked[term] = weight
+        if len(picked) >= limit:
+            break
+    return picked
 
 
 def extract_entities(text: str) -> dict[str, list[str]]:

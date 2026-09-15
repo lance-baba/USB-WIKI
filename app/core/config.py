@@ -79,6 +79,9 @@ assets_budget_kb = 5120
 asset_max_kb = 512
 
 [GRAPH]
+# 术语重合边的阈值（关键词集合的 Jaccard 相似度）。这是星图的主力边，
+# 零模型、离线可用。调小 → 边更多但更弱；调大 → 只留高度相关的。
+term_threshold = 0.10
 # 知识星图语义相似度建连默认阈值
 semantic_threshold = 0.82
 """

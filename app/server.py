@@ -327,7 +327,16 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/graph":
             thr = float((q.get("threshold") or [str(config.get_float("GRAPH", "semantic_threshold", 0.82))])[0])
             thr = max(0.0, min(1.0, thr))
-            g = graph_mod.build_graph(self.ctx.db, threshold=thr)
+            term_thr = float(
+                (q.get("term_threshold") or [str(config.get_float("GRAPH", "term_threshold", 0.10))])[0]
+            )
+            term_thr = max(0.0, min(1.0, term_thr))
+            # 向量边默认关闭：它依赖嵌入源，且会引入「语义相近但无关」的噪声边。
+            # 需要时用 ?use_vectors=1 显式打开。
+            use_vec = (q.get("use_vectors") or ["0"])[0] == "1"
+            g = graph_mod.build_graph(
+                self.ctx.db, threshold=thr, term_threshold=term_thr, use_vectors=use_vec
+            )
             return self._send_json({"code": 200, "data": g})
 
         if path == "/api/search":

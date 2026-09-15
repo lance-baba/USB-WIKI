@@ -430,14 +430,16 @@
           <h3 style="margin:0">知识星图</h3>
           <div class="spacer"></div>
           <div class="legend">
-            <span><i class="swatch" style="background:#4f46e5"></i>双向链接</span>
-            <span><i class="swatch" style="background:#94a3b8"></i>语义弱关联</span>
+            <span><i class="swatch" style="background:#4f46e5"></i>手写链接</span>
+            <span><i class="swatch" style="background:#8b5cf6"></i>术语重合</span>
             <span><i class="swatch" style="background:#f59e0b"></i>待补笔记</span>
-            <span style="margin-left:6px">语义阈值
-              <input type="range" id="graphThr" min="0.70" max="0.95" step="0.01" value="0.82">
-              <b id="graphThrVal" style="color:var(--accent)">0.82</b>
+            <span style="margin-left:6px">术语阈值
+              <input type="range" id="graphThr" min="0.03" max="0.40" step="0.01" value="0.10">
+              <b id="graphThrVal" style="color:var(--accent)">0.10</b>
             </span>
-            <button class="btn ghost" id="btnGraphReload">重新布图</button>
+            <span><i class="swatch" style="background:#0ea5e9"></i>同源站点</span>
+              <button class="btn ghost" id="btnGraphLocal" title="只看选中笔记及其邻居">局部视图</button>
+              <button class="btn ghost" id="btnGraphReload">重新布图</button>
           </div>
         </div>
         <svg id="graphSvg"></svg>
@@ -1184,7 +1186,10 @@ function inline(s) {
 }
 
 /* ---------------------------- 星图 ---------------------------- */
-const GRAPH = { svg: null, sim: null, zoom: null, g: null, w: 0, h: 0 };
+const GRAPH = {
+  focusId: null,     // 局部视图的焦点笔记；null = 全局视图
+  lastData: null,    // 最近一次构图数据，供局部/全局切换复用
+ svg: null, sim: null, zoom: null, g: null, w: 0, h: 0 };
 
 function initGraphSvg() {
   const svg = d3.select("#graphSvg");
@@ -1201,14 +1206,32 @@ function initGraphSvg() {
 
   GRAPH.zoom = d3.zoom().scaleExtent([.25, 3.5]).on("zoom", e => GRAPH.g.attr("transform", e.transform));
   svg.call(GRAPH.zoom);
+  svg.on("click", () => {
+    if (GRAPH.focusId && GRAPH.lastData) { GRAPH.focusId = null; drawGraph(GRAPH.lastData); }
+  });
   GRAPH.g = svg.append("g");
   GRAPH.svg = svg;
 }
 
 function drawGraph(data) {
   initGraphSvg();
-  const nodes = (data.nodes || []).map(n => Object.assign({}, n));
-  const links = (data.links || []).map(l => Object.assign({}, l));
+  GRAPH.lastData = data;
+  let nodes = (data.nodes || []).map(n => Object.assign({}, n));
+  let links = (data.links || []).map(l => Object.assign({}, l));
+  // 局部视图：只保留焦点笔记及其一跳邻居。
+  // 全局视图到几十篇以上会变成一团毛线球 —— 真正用得起来的是局部图。
+  const ends = l => [typeof l.source === 'object' ? l.source.id : l.source,
+                     typeof l.target === 'object' ? l.target.id : l.target];
+  if (GRAPH.focusId) {
+    const keep = new Set([GRAPH.focusId]);
+    links.forEach(l => {
+      const e = ends(l);
+      if (e[0] === GRAPH.focusId || e[1] === GRAPH.focusId) { keep.add(e[0]); keep.add(e[1]); }
+    });
+    nodes = nodes.filter(x => keep.has(x.id));
+    const ids = new Set(nodes.map(x => x.id));
+    links = links.filter(l => { const e = ends(l); return ids.has(e[0]) && ids.has(e[1]); });
+  }
   const byId = {}; nodes.forEach(n => byId[n.id] = n);
 
   const defs = GRAPH.svg.select("defs");
@@ -1237,7 +1260,19 @@ function drawGraph(data) {
     .call(d3.drag()
       .on("start", (e, d) => { if (!e.active) GRAPH.sim.alphaTarget(.28).restart(); d.fx = d.x; d.fy = d.y; })
       .on("drag", (e, d) => { d.fx = e.x; d.fy = e.y; })
-      .on("end", (e, d) => { if (!e.active) GRAPH.sim.alphaTarget(0); d.fx = null; d.fy = null; }));
+      .on("end", (e, d) => { if (!e.active) GRAPH.sim.alphaTarget(0); d.fx = null; d.fy = null; }))
+      .on("click", (e, d) => {
+        e.stopPropagation();
+        GRAPH.focusId = (GRAPH.focusId === d.id) ? null : d.id;
+        if (GRAPH.lastData) drawGraph(GRAPH.lastData);
+      });
+
+    // 悬停显示关键词与摘要 —— 补上「这篇讲了什么」这一层，不用点进笔记也能扫一眼
+    node.append("title").text(d => {
+      const kw = (d.keywords && d.keywords.length) ? "\n关键词：" + d.keywords.slice(0, 6).join("、") : "";
+      const sm = d.summary ? "\n摘要：" + d.summary : "";
+      return (d.name || "") + "\n切片：" + (d.chunks || 0) + kw + sm + "\n（点击可只看它的邻居）";
+    });
 
   node.append("circle")
     .attr("r", d => 5 + Math.min(14, Math.sqrt(d.chunks || 0) * 4))
@@ -1271,14 +1306,14 @@ async function loadGraph() {
   const thr = parseFloat($("#graphThr").value);
   $("#graphStats").innerHTML = '<span class="spin"></span> 正在构建拓扑…';
   try {
-    const r = await api("/api/graph?threshold=" + thr);
+    const r = await api("/api/graph?term_threshold=" + thr);
     const d = r.data || {};
     drawGraph(d);
     const s = d.stats || {};
     $("#graphStats").textContent =
       "节点 " + (s.nodes || 0) + " · 连线 " + (s.links || 0) +
-      "（双向链接 " + (s.wikilinks || 0) + " / 语义弱关联 " + (s.semantic || 0) + "）" +
-      " · 参与语义计算的文档 " + (s.vec_docs || 0) + " · 阈值 " + thr;
+      "（手写链接 " + (s.wikilinks || 0) + " / 术语重合 " + (s.term || 0) + "）" +
+      " · 术语阈值 " + thr;
   } catch (e) {
     $("#graphStats").textContent = "布图失败：" + e.message;
   }
@@ -1580,6 +1615,11 @@ $("#btnCfgReload").onclick = loadConfig;
 $("#btnRebuild").onclick = () => rebuild(false);
 $("#btnRebuildVec").onclick = () => rebuild(true);
 $("#btnGraphReload").onclick = loadGraph;
+$("#btnGraphLocal").onclick = () => {
+  if (!GRAPH.focusId) { toast("先在图上点一篇笔记，再点这里只看它的邻居", 3200); return; }
+  GRAPH.focusId = null;                    // 退出局部视图，回到全局
+  if (GRAPH.lastData) drawGraph(GRAPH.lastData);
+};
 $("#graphThr").oninput = e => { $("#graphThrVal").textContent = parseFloat(e.target.value).toFixed(2); };
 $("#graphThr").onchange = loadGraph;
 $("#btnRefresh").onclick = async () => { await pollStatus(false); await loadNotes(); toast("状态已刷新"); };

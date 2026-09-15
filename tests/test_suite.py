@@ -936,7 +936,11 @@ def test_offline_assets() -> None:
     check("本地 d3 已 Vendor 化", (paths.VENDOR_DIR / "d3.v7.min.js").exists())
     check("d3 文件体积合理（>200KB）", (paths.VENDOR_DIR / "d3.v7.min.js").stat().st_size > 200_000)
     check("控制台包含未闭合角标缓冲实现", "splitHold" in html and "\\[\\^?" in html)
-    check("控制台包含语义阈值滑块 0.70~0.95", 'min="0.70"' in html and 'max="0.95"' in html)
+    # 阈值滑块已从「语义向量 0.70~0.95」改为「术语重合 Jaccard 0.03~0.40」
+    # —— 星图主力边换成了零模型的确定性词法边，滑块语义随之改变。
+    check("控制台包含术语阈值滑块 0.03~0.40", 'min="0.03"' in html and 'max="0.40"' in html)
+    check("控制台包含局部视图与边类型图例",
+          "btnGraphLocal" in html and "术语重合" in html and "同源站点" in html)
     check("控制台包含安全退出按钮", "/api/system/shutdown" in html)
 
 
