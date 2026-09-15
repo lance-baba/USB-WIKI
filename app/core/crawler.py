@@ -16,7 +16,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import urlparse
 
-from . import archiver, config, net_util, paths
+from . import analyzer, archiver, config, net_util, paths
 from .log_util import get_logger
 
 log = get_logger()
@@ -376,22 +376,27 @@ def save_markdown(
     status: str,
     when: datetime | None = None,
     html_text: str = "",
+    extra: dict | None = None,
 ) -> Path:
     when = when or datetime.now()
     paths.NOTES_DIR.mkdir(parents=True, exist_ok=True)
     target = paths.NOTES_DIR / _safe_name(url, when)
 
-    fm = _frontmatter(
-        {
-            "title": title or url,
-            "source_url": url,
-            "author": meta.get("author", ""),
-            "published": meta.get("date", ""),
-            "captured_at": when.strftime("%Y-%m-%d %H:%M:%S"),
-            "status": status,
-            "doc_type": "web_capture",
-        }
-    )
+    fields = {
+        "title": title or url,
+        "source_url": url,
+        "author": meta.get("author", ""),
+        "published": meta.get("date", ""),
+        "captured_at": when.strftime("%Y-%m-%d %H:%M:%S"),
+        "status": status,
+        "doc_type": "web_capture",
+    }
+    # 入库分析结果（关键词 / 摘要等）一并写进 frontmatter ——
+    # Markdown 是真相源，元数据必须跟它走，索引只是衍生。
+    for k, v in (extra or {}).items():
+        if v:
+            fields[k] = v
+    fm = _frontmatter(fields)
     content = f"{fm}\n\n# {title or url}\n\n{body.strip()}\n"
     target.write_text(content, encoding="utf-8")
 
@@ -454,9 +459,34 @@ def capture_url(url: str, db=None, embedder=None) -> CaptureResult:
         log.warning("资源本地化失败，本次按未本地化存档：%s", exc)
         loc_notes.append("资源本地化失败，该页离线时样式与图片可能不完整")
 
+    # 入库语义分析。确定性层（关键词/实体/语言）永远执行、零依赖；
+    # AI 摘要属增强层，模型不可用时静默跳过，绝不影响入库。
+    ana_extra: dict = {}
+    try:
+        ana = analyzer.analyze(body, title)
+        if ana.keywords:
+            ana_extra["keywords"] = ana.keywords
+        if ana.entities:
+            ana_extra["entities"] = {k: v[:3] for k, v in ana.entities.items()}
+        if ana.language:
+            ana_extra["language"] = ana.language
+        if config.get_bool("ANALYZE", "ai_summary", True):
+            try:
+                from . import llm as llm_mod  # noqa: PLC0415
+
+                gw = llm_mod.get_gateway(db) if db is not None else None
+                summary = analyzer.summarize(body, title, gw)
+                if summary:
+                    ana_extra["summary"] = summary
+            except Exception as exc:  # noqa: BLE001 - 摘要失败不影响入库
+                log.warning("AI 摘要生成失败（已跳过）: %s", exc)
+    except Exception as exc:  # noqa: BLE001 - 分析失败不影响入库
+        log.warning("入库分析失败（已跳过）: %s", exc)
+
     # ---- 成功分支 ----
     if len(body) >= min_chars:
-        target = save_markdown(title, body, url, meta, "success", html_text=html_text)
+        target = save_markdown(title, body, url, meta, "success", html_text=html_text,
+                              extra=ana_extra)
         result = CaptureResult(
             True, "success", title=title or url,
             file_path=paths.rel_to_data(target), abs_path=str(target),
@@ -471,7 +501,8 @@ def capture_url(url: str, db=None, embedder=None) -> CaptureResult:
             f"> ⚠️ 该页面为前端动态渲染，仅保留快照，建议通过复制粘贴方式记录重要内容。\n\n"
             f"> 原始快照：`{paths.rel_to_data(snap)}`\n\n{excerpt}"
         )
-        target = save_markdown(title, degraded, url, meta, "partial_fallback", html_text=html_text)
+        target = save_markdown(title, degraded, url, meta, "partial_fallback",
+                              html_text=html_text, extra=ana_extra)
         result = CaptureResult(
             True, "partial_fallback", title=title or url,
             file_path=paths.rel_to_data(target), abs_path=str(target),

@@ -490,6 +490,56 @@ class Gateway:
         }
 
     # ------------------------------------------------------------------
+    def complete(self, prompt: str, max_tokens: int = 200) -> str:
+        """直接补全（**不做检索**、不带知识库上下文）。
+
+        供入库摘要这类轻量增强使用。走与问答相同的降级链：本地 Ollama 优先、
+        云端 API 次之，都不可用就返回空串 —— 调用方必须把空串当作
+        「本次没做增强」而不是错误（入库绝不能因为模型不可用而失败）。
+        """
+        if not prompt:
+            return ""
+        try:
+            provider, _notes = self.resolve_provider()
+        except Exception:  # noqa: BLE001
+            return ""
+        if provider == "none":
+            return ""
+
+        messages = [{"role": "user", "content": prompt}]
+        try:
+            if provider == "ollama":
+                payload = {
+                    "model": self.ollama_model,
+                    "messages": messages,
+                    "stream": False,
+                    "options": {"num_predict": max_tokens, "temperature": 0.2},
+                }
+                status, body = net_util.http_post_json(
+                    net_util.join_url(self.ollama_host, "/api/chat"), payload,
+                    timeout=60.0, with_proxy=False,
+                )
+                if status != 200 or not isinstance(body, dict):
+                    return ""
+                return ((body.get("message") or {}).get("content") or "").strip()
+
+            payload = {
+                "model": self.api_model,
+                "messages": messages,
+                "max_tokens": max_tokens,
+                "temperature": 0.2,
+            }
+            status, body = net_util.http_post_json(
+                net_util.join_url(self.api_base, "/chat/completions"), payload,
+                headers={"Authorization": f"Bearer {self.api_key}"}, timeout=60.0,
+            )
+            if status != 200 or not isinstance(body, dict):
+                return ""
+            choice = (body.get("choices") or [{}])[0]
+            return ((choice.get("message") or {}).get("content") or "").strip()
+        except Exception:  # noqa: BLE001 - 补全失败一律静默降级
+            return ""
+
     def chat_once(self, query: str, history: list[dict] | None = None) -> dict:
         """非流式封装（供测试与 CLI 使用）。"""
         text_parts: list[str] = []

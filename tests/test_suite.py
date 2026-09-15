@@ -749,6 +749,58 @@ def test_original_preview(ctx) -> None:
     check("Office 文档不内联（走下载）", ".docx" not in Handler.INLINE_TYPES)
 
 
+def test_ingest_analysis_and_graph(ctx) -> None:
+    """入库语义分析 + 星图确定性边。
+
+    背景：此前入库只做「转 Markdown → 切片 → 索引」，没有任何语义理解，
+    于是星图只能靠手写 [[Wikilink]] 与高阈值向量建边 —— 两者在这个工作流里
+    几乎都不存在，实测 12 个节点只有 2 条边、8 个孤立节点。这里验证补上的
+    「确定性层」：零依赖、离线可用。
+    """
+    section("入库语义分析 + 星图确定性边")
+    from app.core import analyzer, graph
+
+    # ---- 分析器：关键信息必须真的被抽出来 ----
+    body = (
+        "# 台风杜鹃逼近\n\n"
+        "25号台风杜鹃已生成，中央气象台发布台风预警。"
+        "台风杜鹃将带来强降雨，华南沿海需防范台风带来的大风。"
+        "受台风影响，广东福建等地有暴雨，局地降雨量可达 250 毫米。\n\n"
+        "浙江省宁波市气象台 2026年9月15日 发布，详见 https://example.com/typhoon。"
+    )
+    a = analyzer.analyze(body, title="台风杜鹃逼近")
+    check("关键词抽到了主题词（中文 n-gram 生效）",
+          any(k in ("台风", "杜鹃", "降雨", "暴雨") for k in a.keywords), str(a.keywords))
+    check("frontmatter 不会被当正文分析（避免 captured_at 变成关键词）",
+          not any(k in a.keywords for k in ("captured_at", "source_url", "doc_type")),
+          str(a.keywords))
+    check("识别出中文", a.language == "zh", a.language)
+    check("抽到日期实体", bool(a.entities.get("日期")), str(a.entities))
+    check("抽到网址实体", bool(a.entities.get("网址")), str(a.entities))
+
+    # ---- doc_meta：索引时写入，供星图使用 ----
+    for name, body2 in NOTES.items():
+        p = paths.NOTES_DIR / name
+        p.write_text(body2, encoding="utf-8")
+        indexer.index_file(ctx.db, p, ctx.embedder)
+    rows = ctx.db.query("SELECT COUNT(*) AS c FROM doc_meta")
+    check("索引时写入 doc_meta", rows[0]["c"] >= 1, str(rows[0]["c"]))
+    kw_row = ctx.db.query_one("SELECT keywords FROM doc_meta LIMIT 1")
+    check("doc_meta 里有关键词（旧笔记走回退现算）",
+          bool(kw_row and kw_row["keywords"].strip()), str(kw_row["keywords"] if kw_row else ""))
+
+    # ---- 星图：边必须带得出手的理由 ----
+    g = graph.build_graph(ctx.db)
+    check("星图产出节点", len(g["nodes"]) >= 1, str(g["stats"]))
+    check("默认不启用向量边（依赖嵌入源，多数环境没有）",
+          g["stats"]["vectors_enabled"] is False and g["stats"]["semantic"] == 0,
+          str(g["stats"]))
+    check("每条边都带 type", all(lk.get("type") for lk in g["links"]),
+          str([lk.get("type") for lk in g["links"]]))
+    non_wiki = [lk for lk in g["links"] if lk["type"] != "wikilink"]
+    check("确定性边带「为什么相连」的说明",
+          all(lk.get("reason") for lk in non_wiki), str([lk.get("reason") for lk in non_wiki]))
+
 def test_search_quality_guards(ctx) -> None:
     """检索质量三道闸：实词化、语料词典、引用必须有词法依据。
 
@@ -1009,6 +1061,7 @@ def main() -> int:
         # 测试不依赖外部 AI 服务：provider 用内存态覆盖（persist=False，不碰 config.ini）
         config.update({"AI": {"provider": "offline"}}, persist=False)
 
+        test_ingest_analysis_and_graph(ctx)
         test_search_quality_guards(ctx)
         test_index_and_search(ctx)
         test_gateway(ctx)

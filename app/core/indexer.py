@@ -9,6 +9,7 @@ import json
 import sqlite3
 import time
 from pathlib import Path
+from urllib.parse import urlparse
 
 from . import chunker, paths
 from .db import Database
@@ -145,6 +146,43 @@ def index_parsed(
                     parsed.title, parsed.status, prefix_hash or None, time.time(),
                 ),
             )
+            # 入库分析元数据（frontmatter -> doc_meta），供星图与界面使用
+            _m = parsed.meta or {}
+            _kws = _m.get("keywords")
+            _kw_text = " ".join(str(x) for x in _kws) if isinstance(_kws, (list, tuple)) else str(_kws or "")
+            if not _kw_text.strip():
+                # 回退：frontmatter 里没有关键词（本次功能上线前入库的旧笔记）时
+                # **就地现算**并存进 doc_meta。刻意不回头改用户的 .md 文件 ——
+                # doc_meta 是衍生物，随索引重建即可再生；动源文件则是越权。
+                try:
+                    from . import analyzer as _ana  # noqa: PLC0415
+
+                    _body = "\n".join(c.content for c in parsed.children)
+                    _kw_text = " ".join(_ana.extract_terms(_body, parsed.title, limit=12).keys())
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("关键词回退计算失败 %s: %s", parsed.rel_path, exc)
+            _host = ""
+            _src = str(_m.get("source_url") or "")
+            if _src:
+                try:
+                    _host = (urlparse(_src).hostname or "").lower()
+                except ValueError:
+                    _host = ""
+            try:
+                conn.execute(
+                    """INSERT OR REPLACE INTO doc_meta
+                       (doc_id, keywords, host, language, summary, entities)
+                       VALUES (?,?,?,?,?,?)""",
+                    (
+                        parsed.doc_id, _kw_text[:600], _host,
+                        str(_m.get("language") or "")[:16],
+                        str(_m.get("summary") or "")[:300],
+                        json.dumps(_m.get("entities") or {}, ensure_ascii=False)[:900],
+                    ),
+                )
+            except sqlite3.Error as exc:  # 元数据写入失败不该影响索引
+                log.warning("doc_meta 写入失败 %s: %s", parsed.rel_path, exc)
+
             conn.executemany(
                 "INSERT OR REPLACE INTO parent_blocks(parent_id, doc_id, content, ord) VALUES (?,?,?,?)",
                 [(p.parent_id, p.doc_id, p.content, p.ord) for p in parsed.parents],

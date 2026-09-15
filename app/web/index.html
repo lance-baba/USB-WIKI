@@ -1218,10 +1218,18 @@ function drawGraph(data) {
 
   const link = GRAPH.g.append("g").attr("stroke-linecap", "round")
     .selectAll("line").data(links).join("line")
-    .attr("stroke", d => d.type === "wikilink" ? "url(#gEdge)" : "#94a3b8")
-    .attr("stroke-width", d => d.type === "wikilink" ? 1.5 : Math.max(.6, (d.weight - .7) * 14))
-    .attr("stroke-dasharray", d => d.type === "semantic" ? "4 4" : null)
-    .attr("stroke-opacity", d => d.type === "wikilink" ? .95 : .5);
+    .attr("stroke", d => d.type === "wikilink" ? "url(#gEdge)"
+                      : (d.type === "term" ? "#8b5cf6" : (d.type === "same_source" ? "#0ea5e9" : "#94a3b8")))
+    .attr("stroke-width", d => d.type === "wikilink" ? 1.6 : Math.max(.8, (d.weight || .3) * 7))
+    .attr("stroke-dasharray", d => d.type === "same_source" ? "3 3" : (d.type === "semantic" ? "4 4" : null))
+    .attr("stroke-opacity", d => d.type === "wikilink" ? .95 : .7);
+
+  // 悬停即可看到「为什么相连」—— 此前最让人困惑的正是这点：
+  // 有连线，却看不出两篇笔记到底什么关系。
+  link.append("title").text(d => {
+    const label = { wikilink: "手写链接", term: "术语重合", same_source: "同源", semantic: "语义相近" };
+    return (label[d.type] || d.type) + "\n" + (d.reason || "（无说明）");
+  });
 
   const color = d => d.kind === "missing" ? "#f59e0b" : (d.status === "partial_fallback" ? "#f97316" : "#4f46e5");
 

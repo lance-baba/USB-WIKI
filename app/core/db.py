@@ -71,6 +71,18 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         content,
         tokenize = 'trigram'
     );""",
+    # 入库分析的元数据：关键词 / 来源域名 / 语言 / 摘要 / 实体
+    # 由 indexer 在索引时从 frontmatter 抄写过来 —— 星图据此建「术语重合」与
+    # 「同源」边，不必逐文件读 frontmatter；关键词顺带可用于检索与界面展示。
+    """CREATE TABLE IF NOT EXISTS doc_meta (
+        doc_id    TEXT PRIMARY KEY,
+        keywords  TEXT DEFAULT '',
+        host      TEXT DEFAULT '',
+        language  TEXT DEFAULT '',
+        summary   TEXT DEFAULT '',
+        entities  TEXT DEFAULT ''
+    );""",
+    """CREATE INDEX IF NOT EXISTS idx_doc_meta_host ON doc_meta(host);""",
     # 索引加速
     "CREATE INDEX IF NOT EXISTS idx_chunk_meta_doc ON chunk_metadata(doc_id);",
     "CREATE INDEX IF NOT EXISTS idx_parent_doc ON parent_blocks(doc_id);",

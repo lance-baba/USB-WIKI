@@ -97,13 +97,30 @@ def build_graph(
     db: Database,
     threshold: float = 0.82,
     max_weak_edges_per_node: int = 6,
+    term_threshold: float = 0.10,
+    use_vectors: bool = False,
 ) -> dict:
-    """产出 {nodes, links, stats} 供 D3 渲染。"""
+    """产出 {nodes, links, stats} 供 D3 渲染。
+
+    连线策略（**确定性优先**）：
+
+    * ``wikilink``    —— 手写 ``[[链接]]``，最强但要求人工维护；
+    * ``term``        —— 入库分析抽出的关键词集合的 Jaccard 重合度：**零模型、
+      离线可用**，是本项目在无嵌入源时唯一可靠的「内容相近」信号；
+    * ``same_source`` —— 同一来源站点（剪藏自同一域名）；
+    * ``semantic``    —— 文档级向量余弦，**默认关闭**：它依赖嵌入源（实测多数
+      环境下没有），阈值 0.82 时 12 个节点只连出 1 条边，还会引入
+      「语义相近但无关」的噪声边。需要时由调用方显式打开。
+    """
     try:
         docs = db.query(
             """SELECT d.doc_id, d.rel_path, d.title, d.status,
-                      (SELECT COUNT(*) FROM chunks c WHERE c.doc_id = d.doc_id) AS chunks
-               FROM documents d"""
+                      (SELECT COUNT(*) FROM chunks c WHERE c.doc_id = d.doc_id) AS chunks,
+                      COALESCE(m.keywords, '') AS keywords,
+                      COALESCE(m.host, '')     AS host,
+                      COALESCE(m.summary, '')  AS summary
+               FROM documents d
+               LEFT JOIN doc_meta m ON m.doc_id = d.doc_id"""
         )
     except Exception as exc:  # noqa: BLE001
         log.error("图谱节点查询失败: %s", exc)
@@ -127,6 +144,9 @@ def build_graph(
             "status": r["status"] or "success",
             "chunks": int(r["chunks"] or 0),
             "kind": "doc",
+            "keywords": [k for k in (r["keywords"] or "").split() if k],
+            "host": r["host"] or "",
+            "summary": r["summary"] or "",
         }
         nodes.append(node)
         by_doc[r["doc_id"]] = node
@@ -182,9 +202,68 @@ def build_graph(
             link_seen.add(key)
             links.append({"source": node["id"], "target": tid, "type": "wikilink", "weight": 1.0})
 
-    # ---- 弱连线：文档级向量余弦 ----
+    # ---- 确定性边 1：术语重合（Jaccard）----
+    # 用入库分析的关键词集合衡量「内容相近」。零模型、离线可用，
+    # 且天然贴合用户自己的术语 —— 这是本图的主力边。
+    term_edges = 0
+    kw_map = {n["id"]: set(n.get("keywords") or []) for n in nodes}
+    pairs: list[tuple[float, str, str, list[str]]] = []
+    ids_with_kw = [n["id"] for n in nodes if kw_map.get(n["id"])]
+    for i in range(len(ids_with_kw)):
+        for j in range(i + 1, len(ids_with_kw)):
+            a, b = ids_with_kw[i], ids_with_kw[j]
+            sa, sb = kw_map[a], kw_map[b]
+            inter = sa & sb
+            if not inter:
+                continue
+            jac = len(inter) / len(sa | sb)
+            if jac >= term_threshold:
+                pairs.append((jac, a, b, sorted(inter)))
+    pairs.sort(reverse=True)
+
+    degree: dict[str, int] = defaultdict(int)
+    for weight, a, b, shared in pairs:
+        if degree[a] >= max_weak_edges_per_node or degree[b] >= max_weak_edges_per_node:
+            continue
+        key = tuple(sorted((a, b)))
+        if key in link_seen:
+            continue
+        link_seen.add(key)
+        degree[a] += 1
+        degree[b] += 1
+        links.append({
+            "source": a, "target": b, "type": "term", "weight": round(weight, 4),
+            "reason": "共有术语：" + "、".join(shared[:4]),
+        })
+        term_edges += 1
+
+    # ---- 确定性边 2：同源域名 ----
+    # 连成星形而非完全图：同站点剪藏十篇时，完全图会产生 45 条边把画面糊死。
+    same_source_edges = 0
+    host_groups: dict[str, list[str]] = defaultdict(list)
+    for n in nodes:
+        if n.get("host"):
+            host_groups[n["host"]].append(n["id"])
+    for host, members in host_groups.items():
+        if len(members) < 2:
+            continue
+        hub = max(members, key=lambda i: by_doc[i]["chunks"])
+        for other in members:
+            if other == hub:
+                continue
+            key = tuple(sorted((hub, other)))
+            if key in link_seen:
+                continue
+            link_seen.add(key)
+            links.append({
+                "source": hub, "target": other, "type": "same_source", "weight": 0.5,
+                "reason": f"同一来源站点：{host}",
+            })
+            same_source_edges += 1
+
+    # ---- 弱连线：文档级向量余弦（默认关闭，见函数说明）----
     weak_count = 0
-    vecs = _doc_vectors(db)
+    vecs = _doc_vectors(db) if use_vectors else {}
     if len(vecs) >= 2:
         ids = list(vecs.keys())
         candidates: list[tuple[float, str, str]] = []
@@ -215,8 +294,12 @@ def build_graph(
         "nodes": len(nodes),
         "links": len(links),
         "wikilinks": sum(1 for lk in links if lk["type"] == "wikilink"),
+        "term": term_edges,
+        "same_source": same_source_edges,
         "semantic": weak_count,
         "threshold": threshold,
+        "term_threshold": term_threshold,
+        "vectors_enabled": bool(use_vectors),
         "vec_docs": len(vecs),
     }
     return {"nodes": nodes, "links": links, "stats": stats}
