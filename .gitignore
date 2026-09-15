@@ -2,6 +2,7 @@
 data/notes/
 data/snapshots/
 data/originals/
+data/assets/
 data/cache.db
 data/cache.db-wal
 data/cache.db-shm

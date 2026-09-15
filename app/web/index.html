@@ -769,14 +769,18 @@ async function doCapture() {
   try {
     const r = await api("/api/capture/url", { method: "POST", body: JSON.stringify({ url }) });
     const d = r.data || {};
+    // 系统自愈 / 自动降级的过程信息：按项目约定不打扰用户，只在结果区作说明
+    const notesHtml = (d.notes && d.notes.length)
+      ? '<div class="hint" style="margin-top:6px">' + d.notes.map(function (n) { return "· " + esc(n); }).join("<br>") + "</div>"
+      : "";
     if (r.status === "partial_fallback") {
       box.innerHTML = '<div class="alert">⚠ ' + esc(r.message) + "</div>" +
-        '<div class="hint">已保存：' + esc(d.file_path) + " · 快照：" + esc(d.snapshot_path || "—") + "</div>";
+        '<div class="hint">已保存：' + esc(d.file_path) + " · 快照：" + esc(d.snapshot_path || "—") + "</div>" + notesHtml;
       toast("该页面为前端动态渲染，仅保留快照", 4200);
     } else if (r.code === 200) {
       box.innerHTML = '<div class="alert info">✅ ' + esc(r.message || "抓取成功") + "</div>" +
         '<div class="hint">标题：' + esc(d.title) + " · 字数：" + d.char_count +
-        " · 文件：" + esc(d.file_path) + " · 抽取器：" + esc(d.extractor || "—") + "</div>";
+        " · 文件：" + esc(d.file_path) + " · 抽取器：" + esc(d.extractor || "—") + "</div>" + notesHtml;
       toast("已入库并建立索引");
     } else {
       box.innerHTML = '<div class="alert err">' + esc(r.message || "抓取失败") + "</div>";

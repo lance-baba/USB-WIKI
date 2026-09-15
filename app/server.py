@@ -17,7 +17,7 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from .core import config, crawler, graph as graph_mod, paths, search as search_mod
+from .core import archiver, config, crawler, graph as graph_mod, paths, search as search_mod
 from .core.context import AppContext, get_ctx
 from .core.log_util import get_logger
 
@@ -148,6 +148,33 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
 
+    def _serve_asset(self, name: str) -> None:
+        """服务网页存档的**本地资源池**（文件名是原始 URL 的哈希）。
+
+        这些资源是剪藏时就地抓下来的，因此「原版预览」在不联网时也能还原版式，
+        浏览过程不会向任何外部站点发请求。
+        """
+        if not archiver.ASSET_NAME_RE.match(name or ""):
+            return self._send_json({"code": 404, "message": "资源不存在"}, 404)
+        target = paths.ASSETS_DIR / name
+        try:
+            target.resolve().relative_to(paths.ASSETS_DIR.resolve())
+        except (ValueError, OSError):
+            return self._send_json({"code": 403, "message": "越权访问被拒绝"}, 403)
+        if not target.is_file():
+            return self._send_json({"code": 404, "message": "资源不存在"}, 404)
+        ctype = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
+        # 文件名按 URL 哈希寻址，同一 URL 重新抓取会覆盖内容 → 不做长缓存
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(target.stat().st_size))
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        try:
+            self.wfile.write(target.read_bytes())
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+
     def _send_buffer(self, data: bytes, ctype: str, inline: bool, filename: str) -> None:
         """发送内存中的内容（用于需要就地改写的原件，如注入 <base> 的 HTML）。"""
         self.send_response(200)
@@ -274,6 +301,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._serve_static(paths.VENDOR_DIR / posixpath.basename(path))
         if path.startswith("/static/"):
             return self._serve_static(paths.WEB_DIR / posixpath.basename(path))
+        if path.startswith(archiver.ASSET_URL_PREFIX):
+            return self._serve_asset(path[len(archiver.ASSET_URL_PREFIX):])
 
         if path == "/healthz":
             return self._send_json({"ok": True, "ts": time.time()})
@@ -558,12 +587,15 @@ class Handler(BaseHTTPRequestHandler):
             ctype += "; charset=utf-8"
         inline = (self.query_flag("download") != "1") and ext in self.INLINE_TYPES
 
-        # 剪藏的原网页：就地注入 <base href="原始 URL">，否则抓下来的根相对路径
-        # （/assets/…）会以本站为基准解析而全部 404，页面退化成裸 HTML。
+        # 剪藏的原网页：判定它是「离线存档」还是「旧存档」。
+        # - 已本地化（HTML 里引用了本地资源池）：**不注入 base** ——
+        #   根相对路径天然指向本服务，浏览时零外部请求，真正离线可用。
+        # - 未本地化（旧存档）：保持原有的联网行为，避免存量页面退化成裸 HTML。
         if inline and ext in (".html", ".htm"):
             try:
                 text = orig.read_text(encoding="utf-8", errors="replace")
-                text = crawler.inject_base_href(text, crawler.source_url_of(rel))
+                if archiver.ASSET_URL_PREFIX not in text:
+                    text = crawler.inject_base_href(text, crawler.source_url_of(rel))
                 return self._send_buffer(text.encode("utf-8"), ctype, True, orig.name)
             except OSError:
                 pass   # 读失败则退回按原样流式发送

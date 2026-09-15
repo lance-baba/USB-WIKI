@@ -32,6 +32,10 @@ SNAPSHOT_DIR: Path = DATA_DIR / "snapshots"
 # 原文件留存：导入的 PDF/Office 原件、剪藏的原始 HTML。
 # 让笔记界面能用浏览器原生查看器还原「原版」观感，而 Markdown 只承担可检索的职责。
 ORIGINALS_DIR: Path = DATA_DIR / "originals"
+# 网页存档的**共享资源池**：剪藏时把 CSS/图片/字体等子资源抓下来存这里，
+# 按 URL 哈希命名 → 同一站点的样式与 logo 被多篇文章共用时只存一份。
+# 这样「原版预览」才能在不联网的前提下还原版式（Local-First / 零外发）。
+ASSETS_DIR: Path = DATA_DIR / "assets"
 CACHE_DB: Path = DATA_DIR / "cache.db"
 WAL_FILE: Path = DATA_DIR / "cache.db-wal"
 SHM_FILE: Path = DATA_DIR / "cache.db-shm"
@@ -50,7 +54,7 @@ NOTES_REL_PREFIX = "notes"
 
 def ensure_dirs() -> None:
     """确保运行期必需的目录存在（含曾被清理过的 data 树）。"""
-    for d in (DATA_DIR, NOTES_DIR, SNAPSHOT_DIR, ORIGINALS_DIR, RUNTIME_DIR, EMBED_MODELS_DIR):
+    for d in (DATA_DIR, NOTES_DIR, SNAPSHOT_DIR, ORIGINALS_DIR, ASSETS_DIR, RUNTIME_DIR, EMBED_MODELS_DIR):
         d.mkdir(parents=True, exist_ok=True)
 
 

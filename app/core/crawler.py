@@ -10,13 +10,13 @@ import re
 import shutil
 import subprocess
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import urlparse
 
-from . import config, net_util, paths
+from . import archiver, config, net_util, paths
 from .log_util import get_logger
 
 log = get_logger()
@@ -53,6 +53,9 @@ class CaptureResult:
     snapshot_path: str = ""
     original_path: str = ""
     used: str = "trafilatura"
+    # 系统自愈 / 自动降级的过程信息（按项目约定：这类信息不打扰用户，
+    # 只作为说明随结果返回，不进顶部告警条）
+    notes: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -66,6 +69,7 @@ class CaptureResult:
                 "snapshot_path": self.snapshot_path,
                 "original_path": self.original_path,
                 "extractor": self.used,
+                "notes": self.notes,
             },
         }
 
@@ -437,6 +441,19 @@ def capture_url(url: str, db=None, embedder=None) -> CaptureResult:
     used = f"{used}+{extractor}"
     title = str(meta.get("title") or "").strip()
 
+    # 正文已经提取完毕（Markdown 里保留的是**原始**链接），此刻再把 HTML 存档的
+    # 子资源落进本地资源池 —— 之后浏览「原版」就不再需要网络。
+    # 顺序不能反：先本地化会让 Markdown 里混进 /api/assets 本地路径。
+    loc_notes: list[str] = []
+    try:
+        html_text, _loc = archiver.localize(html_text, url)
+        loc_notes = list(_loc.notes)
+        if _loc.assets:
+            used = f"{used}+assets{_loc.assets}"
+    except Exception as exc:  # noqa: BLE001 - 本地化失败不应让抓取失败
+        log.warning("资源本地化失败，本次按未本地化存档：%s", exc)
+        loc_notes.append("资源本地化失败，该页离线时样式与图片可能不完整")
+
     # ---- 成功分支 ----
     if len(body) >= min_chars:
         target = save_markdown(title, body, url, meta, "success", html_text=html_text)
@@ -444,6 +461,7 @@ def capture_url(url: str, db=None, embedder=None) -> CaptureResult:
             True, "success", title=title or url,
             file_path=paths.rel_to_data(target), abs_path=str(target),
             char_count=len(body), message="抓取成功", used=used,
+            notes=loc_notes,
         )
     # ---- 降级分支 ----
     else:
@@ -460,6 +478,7 @@ def capture_url(url: str, db=None, embedder=None) -> CaptureResult:
             char_count=len(body), snapshot_path=paths.rel_to_data(snap),
             message="该页面为前端动态渲染，仅保留快照，建议通过复制粘贴方式记录重要内容",
             used=used,
+            notes=loc_notes,
         )
 
     # 记录原件路径（供界面「原版预览」）

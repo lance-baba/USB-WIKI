@@ -493,6 +493,99 @@ def test_alert_classification() -> None:
           all("ModuleNotFoundError" not in n for n in r1.notes), str(r1.notes))
 
 
+def test_archive_localization() -> None:
+    """网页存档的资源本地化：必须**真正离线**且**零外部请求**。
+
+    这是项目立身之本（U 盘便携 / Local-First）的直接体现：抓取时把 CSS、图片、
+    字体存进本地资源池，浏览「原版」时不再碰网络。
+
+    测试用桩替换网络层，因此不依赖外网、结果确定。
+    """
+    section("网页存档 · 资源本地化（离线 + 零外发）")
+    import re
+
+    from app.core import archiver
+
+    page = "https://site.com/dir/page/"
+    png = b"\x89PNG\r\n\x1a\n" + b"x" * 64
+    css = b"body{background:url(/img/bg.png)} h1{color:url('f.woff2')}"
+
+    class FakeFetcher:
+        """只认得下面几个 URL，其余一律失败 —— 模拟真实抓取的部分失败。"""
+
+        TABLE = {
+            "https://site.com/assets/s.css": (css, "text/css"),
+            "https://site.com/img/bg.png": (png, "image/png"),
+            "https://site.com/img/ok.png": (png, "image/png"),
+            "https://site.com/f.woff2": (b"w" * 32, "font/woff2"),
+        }
+
+        def __init__(self, timeout=None):
+            pass
+
+        def get(self, url):
+            if url in self.TABLE:
+                return self.TABLE[url]
+            raise OSError("unreachable")
+
+        def close(self):
+            pass
+
+    sample = (
+        '<html><head>'
+        '<link rel="stylesheet" href="/assets/s.css">'
+        '<link rel="preconnect" href="https://fonts.gstatic.com">'
+        '<script src="/jq.js"></script>'
+        '</head><body>'
+        '<img src="/img/ok.png" width="10" height="10">'
+        '<img src="/img/missing.png" width="20" height="20">'
+        '<img srcset="/img/ok.png 1x, /img/missing.png 2x">'
+        '<video><source src="/media/clip.mp4"></video>'
+        '<a href="/other/page">link</a>'
+        '</body></html>'
+    )
+
+    saved = archiver._Fetcher
+    archiver._Fetcher = FakeFetcher
+    try:
+        out, st = archiver.localize(sample, page)
+    finally:
+        archiver._Fetcher = saved
+
+    check("资源池目录已被测试隔离（不碰真实 data/assets）",
+          str(paths.ASSETS_DIR).startswith(str(paths.DATA_DIR)), str(paths.ASSETS_DIR))
+    check("抓到的资源已落盘", st.assets >= 3, f"assets={st.assets}")
+    check("样式表 href 重写为本地资源池路径",
+          f'href="{archiver.ASSET_URL_PREFIX}' in out, out[:200])
+    check("图片 src 重写为本地资源池路径",
+          f'src="{archiver.ASSET_URL_PREFIX}' in out)
+    check("srcset 内的 URL 也被重写",
+          archiver.ASSET_URL_PREFIX in out.split("<img srcset=")[1][:200] if "<img srcset=" in out else False)
+
+    # 核心不变量：抓不到的资源一律占位，**绝不能留外部 URL**
+    external_sub = re.findall(
+        r'<(?:img|script|iframe|source|video|audio|embed|link|input)[^>]*?'
+        r'(?:src|href|srcset)\s*=\s*["\']https?://', out, re.I)
+    check("没有任何会自动请求的外部子资源（零外发）", not external_sub, str(external_sub[:3]))
+    check("抓不到的图片用占位符代替", "data:image/gif;base64" in out)
+    check("超类型（mp4）也用占位，不留外部地址", "clip.mp4" not in out, "视频地址仍在")
+
+    check("外部脚本被省略并留注释（沙箱禁脚本，存了无用）",
+          "<script" not in out.lower() and "已省略外部脚本" in out, out[:120])
+    check("preconnect 等资源提示被删除（避免无谓外部请求）",
+          "fonts.gstatic.com" not in out)
+    check("<a> 链接被绝对化，仍可点击跳转",
+          'href="https://site.com/other/page"' in out)
+
+    check("生成了给用户看的过程说明", len(st.notes) >= 2, str(st.notes))
+
+    # 清理本次产生的资源池文件，避免污染后续断言
+    for f in paths.ASSETS_DIR.glob("*"):
+        try:
+            f.unlink()
+        except OSError:
+            pass
+
 def test_original_base_injection() -> None:
     """原版预览的保真度：必须给剪藏的 HTML 注入 <base>。
 
@@ -858,6 +951,7 @@ def main() -> int:
         test_gateway(ctx)
         test_graph(ctx)
         test_crawler(ctx)
+        test_archive_localization()
         test_original_base_injection()
         test_orphan_original_cleanup()
         test_html_encoding_detection()
