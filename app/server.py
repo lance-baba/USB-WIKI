@@ -17,7 +17,8 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from .core import archiver, config, crawler, graph as graph_mod, paths, search as search_mod
+from .core import (archiver, config, crawler, graph as graph_mod, paths,
+                   search as search_mod, topics as topics_mod)
 from .core.context import AppContext, get_ctx
 from .core.log_util import get_logger
 
@@ -323,6 +324,14 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/notes/original":
             rel = (q.get("path") or [""])[0]
             return self._note_original(rel)
+
+        if path == "/api/topics":
+            try:
+                min_docs = int((q.get("min_docs") or ["2"])[0])
+            except ValueError:
+                min_docs = 2
+            data = topics_mod.build_topics(self.ctx.db, min_docs=max(1, min(20, min_docs)))
+            return self._send_json({"code": 200, "data": data})
 
         if path == "/api/graph":
             thr = float((q.get("threshold") or [str(config.get_float("GRAPH", "semantic_threshold", 0.82))])[0])

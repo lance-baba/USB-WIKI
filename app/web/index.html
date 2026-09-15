@@ -322,7 +322,7 @@
     <button class="tab active" data-tab="chat">问答</button>
     <button class="tab" data-tab="capture">剪藏</button>
     <button class="tab" data-tab="notes">笔记</button>
-    <button class="tab" data-tab="graph">星图</button>
+    <button class="tab" data-tab="graph">主题</button>
     <button class="tab" data-tab="settings">设置</button>
   </nav>
 
@@ -425,27 +425,23 @@
 
     <!-- ============ 星图 ============ -->
     <section class="panel" id="panel-graph">
-      <div class="card grow">
-        <div class="row" style="margin-bottom:10px">
-          <h3 style="margin:0">知识星图</h3>
-          <div class="spacer"></div>
-          <div class="legend">
-            <span><i class="swatch" style="background:#4f46e5"></i>手写链接</span>
-            <span><i class="swatch" style="background:#8b5cf6"></i>术语重合</span>
-            <span><i class="swatch" style="background:#f59e0b"></i>待补笔记</span>
-            <span style="margin-left:6px">术语阈值
-              <input type="range" id="graphThr" min="0.03" max="0.40" step="0.01" value="0.10">
-              <b id="graphThrVal" style="color:var(--accent)">0.10</b>
-            </span>
-            <span><i class="swatch" style="background:#0ea5e9"></i>同源站点</span>
-              <button class="btn ghost" id="btnGraphLocal" title="只看选中笔记及其邻居">局部视图</button>
-              <button class="btn ghost" id="btnGraphReload">重新布图</button>
+        <div class="card grow">
+          <div class="row" style="margin-bottom:10px">
+            <h3 style="margin:0">主题分组</h3>
+            <div class="spacer"></div>
+            <div class="legend">
+              <span>按关键词自动归题 · 点标签或笔记可直接跳转</span>
+              <span style="margin-left:6px">仅显示 ≥
+                <input type="number" id="topicMin" min="1" max="20" value="2" style="width:52px">
+                篇的标签
+              </span>
+              <button class="btn ghost" id="btnGraphReload">重新分组</button>
+            </div>
           </div>
+          <div id="topicStats" class="hint" style="margin-bottom:8px"></div>
+          <div id="topicBox" style="flex:1;min-height:0;overflow-y:auto;padding-right:4px"></div>
         </div>
-        <svg id="graphSvg"></svg>
-        <div class="hint" id="graphStats" style="margin-top:8px">尚未加载。</div>
-      </div>
-    </section>
+      </section>
 
     <!-- ============ 设置 ============ -->
     <section class="panel" id="panel-settings">
@@ -1303,20 +1299,56 @@ function drawGraph(data) {
 }
 
 async function loadGraph() {
-  const thr = parseFloat($("#graphThr").value);
-  $("#graphStats").innerHTML = '<span class="spin"></span> 正在构建拓扑…';
+  const minDocs = Math.max(1, Math.min(20, parseInt($("#topicMin").value || "2", 10) || 2));
+  $("#topicStats").innerHTML = '<span class="spin"></span> 正在归类…';
   try {
-    const r = await api("/api/graph?term_threshold=" + thr);
-    const d = r.data || {};
-    drawGraph(d);
-    const s = d.stats || {};
-    $("#graphStats").textContent =
-      "节点 " + (s.nodes || 0) + " · 连线 " + (s.links || 0) +
-      "（手写链接 " + (s.wikilinks || 0) + " / 术语重合 " + (s.term || 0) + "）" +
-      " · 术语阈值 " + thr;
+    const r = await api("/api/topics?min_docs=" + minDocs);
+    renderTopics(r.data || {});
   } catch (e) {
-    $("#graphStats").textContent = "布图失败：" + e.message;
+    $("#topicStats").textContent = "归类失败：" + e.message;
+    $("#topicBox").innerHTML = "";
   }
+}
+
+/* 主题分组渲染。刻意不画节点图 —— 实测本项目语料是「剪藏一批互不相关页面」，
+   节点图必然是一堆孤岛（12 篇分成 9 个分量）；自动归题 + 按题浏览才贴合场景。 */
+function renderTopics(d) {
+  const topics = d.topics || [];
+  const st = d.stats || {};
+  const ungrouped = d.ungrouped || [];
+  $("#topicStats").textContent =
+    "笔记 " + (st.docs || 0) + " 篇 · 主题 " + (st.topics || 0) + " 个 · 已归题 " +
+    (st.grouped_docs || 0) + " 篇 · 尚未归题 " + (st.ungrouped_docs || 0) + " 篇";
+
+  let html = "";
+  if (!topics.length) {
+    html += '<div class="hint" style="padding:14px 4px">' +
+      "还没有出现'多篇笔记共有的关键词'——<b>主题分组要等你围绕同一主题积累若干篇笔记才会长出来</b>。" +
+      "<br><br>可在上方把阈值调成 <b>1</b>，先看每篇笔记各自的关键词（当作自动标签索引）。</div>";
+  }
+  topics.forEach(function (t) {
+    html += '<div style="margin-bottom:12px">' +
+      '<div style="font-weight:600;font-size:13px;margin-bottom:5px">' +
+      esc(t.term) + ' <span class="pill">' + t.count + ' 篇</span></div>' +
+      '<div style="display:flex;flex-wrap:wrap;gap:6px">' +
+      t.docs.map(function (x) {
+        return '<span class="ref" data-path="' + esc(x.path) + '" title="' + esc(x.path) + '">' +
+               esc(x.title.slice(0, 28)) + '</span>';
+      }).join("") + '</div></div>';
+  });
+  if (ungrouped.length) {
+    html += '<div style="margin-bottom:12px"><div style="font-weight:600;font-size:13px;margin-bottom:5px">' +
+      '尚未归题 <span class="pill">' + ungrouped.length + ' 篇</span></div>' +
+      '<div style="display:flex;flex-wrap:wrap;gap:6px">' +
+      ungrouped.map(function (x) {
+        return '<span class="ref" data-path="' + esc(x.path) + '" title="' + esc(x.path) + '">' +
+               esc(x.title.slice(0, 28)) + '</span>';
+      }).join("") + '</div></div>';
+  }
+  $("#topicBox").innerHTML = html;
+  $$("#topicBox .ref").forEach(function (el) {
+    el.onclick = function () { openNoteByPath(el.dataset.path); };
+  });
 }
 
 /* ---------------------------- 设置 ---------------------------- */
@@ -1615,13 +1647,7 @@ $("#btnCfgReload").onclick = loadConfig;
 $("#btnRebuild").onclick = () => rebuild(false);
 $("#btnRebuildVec").onclick = () => rebuild(true);
 $("#btnGraphReload").onclick = loadGraph;
-$("#btnGraphLocal").onclick = () => {
-  if (!GRAPH.focusId) { toast("先在图上点一篇笔记，再点这里只看它的邻居", 3200); return; }
-  GRAPH.focusId = null;                    // 退出局部视图，回到全局
-  if (GRAPH.lastData) drawGraph(GRAPH.lastData);
-};
-$("#graphThr").oninput = e => { $("#graphThrVal").textContent = parseFloat(e.target.value).toFixed(2); };
-$("#graphThr").onchange = loadGraph;
+$("#topicMin").onchange = loadGraph;
 $("#btnRefresh").onclick = async () => { await pollStatus(false); await loadNotes(); toast("状态已刷新"); };
 
 $("#btnShutdown").onclick = async () => {

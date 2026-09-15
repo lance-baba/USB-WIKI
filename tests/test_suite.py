@@ -961,11 +961,13 @@ def test_offline_assets() -> None:
     check("本地 d3 已 Vendor 化", (paths.VENDOR_DIR / "d3.v7.min.js").exists())
     check("d3 文件体积合理（>200KB）", (paths.VENDOR_DIR / "d3.v7.min.js").stat().st_size > 200_000)
     check("控制台包含未闭合角标缓冲实现", "splitHold" in html and "\\[\\^?" in html)
-    # 阈值滑块已从「语义向量 0.70~0.95」改为「术语重合 Jaccard 0.03~0.40」
-    # —— 星图主力边换成了零模型的确定性词法边，滑块语义随之改变。
-    check("控制台包含术语阈值滑块 0.03~0.40", 'min="0.03"' in html and 'max="0.40"' in html)
-    check("控制台包含局部视图与边类型图例",
-          "btnGraphLocal" in html and "术语重合" in html and "同源站点" in html)
+    # 节点图已被「主题分组」取代：实测本项目语料是「剪藏一批互不相关页面」，
+    # 12 篇分成 9 个连通分量，节点图必然是一堆孤岛（不匹配使用形态）。
+    check("控制台已把星图换为主题分组", "主题分组" in html and "topicBox" in html)
+    # 断言用户可见的性质：主题页里不再有节点图画布。
+    # （渲染函数 initGraphSvg/drawGraph 已成为死代码，属另一项清理，不在此断言。）
+    check("主题页不再有节点图画布", '<svg id="graphSvg">' not in html)
+    check("主题页有「共现若干篇才成主题」的阈值控件", 'id="topicMin"' in html)
     check("控制台包含安全退出按钮", "/api/system/shutdown" in html)
 
 
