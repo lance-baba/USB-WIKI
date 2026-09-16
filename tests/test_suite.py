@@ -3269,14 +3269,19 @@ def test_offline_assets() -> None:
 
     external = re.findall(r'(?:src|href)\s*=\s*["\'](https?://[^"\']+)', html)
     check("HTML 不含任何外链 CDN 资源", not external, str(external))
-    check("本地 d3 已 Vendor 化", (paths.VENDOR_DIR / "d3.v7.min.js").exists())
-    check("d3 文件体积合理（>200KB）", (paths.VENDOR_DIR / "d3.v7.min.js").stat().st_size > 200_000)
+    # 死代码清理（Commit A）：D3 力导图已被「主题分组」取代，前端不再引用 D3，vendor 文件已删除。
+    check("控制台不含任何 d3 引用",
+          "d3." not in html and "d3.v7" not in html and "/vendor/d3" not in html,
+          "仍引用 d3")
+    check("死代码 GRAPH/initGraphSvg/drawGraph/#graphSvg 已移除",
+          "initGraphSvg" not in html and "drawGraph" not in html
+          and "const GRAPH" not in html and "#graphSvg" not in html)
+    check("vendor/d3.v7.min.js 已删除", not (paths.VENDOR_DIR / "d3.v7.min.js").exists())
     check("控制台包含未闭合角标缓冲实现", "splitHold" in html and "\\[\\^?" in html)
     # 节点图已被「主题分组」取代：实测本项目语料是「剪藏一批互不相关页面」，
     # 12 篇分成 9 个连通分量，节点图必然是一堆孤岛（不匹配使用形态）。
     check("控制台已把星图换为主题分组", "主题分组" in html and "topicBox" in html)
-    # 断言用户可见的性质：主题页里不再有节点图画布。
-    # （渲染函数 initGraphSvg/drawGraph 已成为死代码，属另一项清理，不在此断言。）
+    # 用户可见性质：主题页里不再有节点图画布（SVG 元素从未在 DOM 中存在）。
     check("主题页不再有节点图画布", '<svg id="graphSvg">' not in html)
     check("主题页有「共现若干篇才成主题」的阈值控件", 'id="topicMin"' in html)
     check("控制台包含安全退出按钮", "/api/system/shutdown" in html)

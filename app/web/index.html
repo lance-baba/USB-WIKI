@@ -4,7 +4,6 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Wiki-USB · 随身第二大脑</title>
-<script src="/vendor/d3.v7.min.js"></script>
 <style>
   :root{
     --bg:#f4f6fb; --panel:rgba(255,255,255,.82); --panel-solid:#ffffff;
@@ -280,7 +279,6 @@
   .doc-frame{min-height:120px;width:100%;border:1px solid var(--line);border-radius:9px;background:#fff}
   .doc-meta{font-size:11.5px;color:var(--faint);margin-bottom:7px}
   .doc-dl{padding:14px;border:1px dashed var(--line-strong);border-radius:10px;text-align:center}
-  #graphSvg{flex:1;min-height:0;width:100%;border:1px solid var(--line);border-radius:12px;background:radial-gradient(circle at 50% 40%,#fff, #f7f9fd)}
   .legend{display:flex;gap:16px;flex-wrap:wrap;font-size:11.5px;color:var(--muted);align-items:center}
   .legend span{display:inline-flex;align-items:center;gap:6px}
   .swatch{width:14px;height:3px;border-radius:2px;display:inline-block}
@@ -504,7 +502,6 @@ const S = {
   holding: "",       // 未闭合角标滞留缓冲
   full: "",          // 收到的完整文本
   busy: false,
-  graph: null,
 };
 
 /* ---------------------------- 工具 ---------------------------- */
@@ -1236,123 +1233,6 @@ function inline(s) {
     .replace(/~~([^~\n]+)~~/g, "<s>$1</s>");
 }
 
-/* ---------------------------- 星图 ---------------------------- */
-const GRAPH = {
-  focusId: null,     // 局部视图的焦点笔记；null = 全局视图
-  lastData: null,    // 最近一次构图数据，供局部/全局切换复用
- svg: null, sim: null, zoom: null, g: null, w: 0, h: 0 };
-
-function initGraphSvg() {
-  const svg = d3.select("#graphSvg");
-  const node = svg.node();
-  const rect = node.getBoundingClientRect();
-  GRAPH.w = Math.max(420, rect.width); GRAPH.h = Math.max(320, rect.height);
-  svg.attr("viewBox", [0, 0, GRAPH.w, GRAPH.h]);
-  svg.selectAll("*").remove();
-
-  const defs = svg.append("defs");
-  const grad = defs.append("linearGradient").attr("id", "gEdge").attr("x1", 0).attr("x2", 1);
-  grad.append("stop").attr("offset", "0%").attr("stop-color", "#6366f1").attr("stop-opacity", .55);
-  grad.append("stop").attr("offset", "100%").attr("stop-color", "#06b6d4").attr("stop-opacity", .55);
-
-  GRAPH.zoom = d3.zoom().scaleExtent([.25, 3.5]).on("zoom", e => GRAPH.g.attr("transform", e.transform));
-  svg.call(GRAPH.zoom);
-  svg.on("click", () => {
-    if (GRAPH.focusId && GRAPH.lastData) { GRAPH.focusId = null; drawGraph(GRAPH.lastData); }
-  });
-  GRAPH.g = svg.append("g");
-  GRAPH.svg = svg;
-}
-
-function drawGraph(data) {
-  initGraphSvg();
-  GRAPH.lastData = data;
-  let nodes = (data.nodes || []).map(n => Object.assign({}, n));
-  let links = (data.links || []).map(l => Object.assign({}, l));
-  // 局部视图：只保留焦点笔记及其一跳邻居。
-  // 全局视图到几十篇以上会变成一团毛线球 —— 真正用得起来的是局部图。
-  const ends = l => [typeof l.source === 'object' ? l.source.id : l.source,
-                     typeof l.target === 'object' ? l.target.id : l.target];
-  if (GRAPH.focusId) {
-    const keep = new Set([GRAPH.focusId]);
-    links.forEach(l => {
-      const e = ends(l);
-      if (e[0] === GRAPH.focusId || e[1] === GRAPH.focusId) { keep.add(e[0]); keep.add(e[1]); }
-    });
-    nodes = nodes.filter(x => keep.has(x.id));
-    const ids = new Set(nodes.map(x => x.id));
-    links = links.filter(l => { const e = ends(l); return ids.has(e[0]) && ids.has(e[1]); });
-  }
-  const byId = {}; nodes.forEach(n => byId[n.id] = n);
-
-  const defs = GRAPH.svg.select("defs");
-  const glow = defs.append("filter").attr("id", "glow").attr("x", "-60%").attr("y", "-60%").attr("width", "220%").attr("height", "220%");
-  glow.append("feGaussianBlur").attr("stdDeviation", 3.4).attr("result", "b");
-  const fm = glow.append("feMerge"); fm.append("feMergeNode").attr("in", "b"); fm.append("feMergeNode").attr("in", "SourceGraphic");
-
-  const link = GRAPH.g.append("g").attr("stroke-linecap", "round")
-    .selectAll("line").data(links).join("line")
-    .attr("stroke", d => d.type === "wikilink" ? "url(#gEdge)"
-                      : (d.type === "term" ? "#8b5cf6" : (d.type === "same_source" ? "#0ea5e9" : "#94a3b8")))
-    .attr("stroke-width", d => d.type === "wikilink" ? 1.6 : Math.max(.8, (d.weight || .3) * 7))
-    .attr("stroke-dasharray", d => d.type === "same_source" ? "3 3" : (d.type === "semantic" ? "4 4" : null))
-    .attr("stroke-opacity", d => d.type === "wikilink" ? .95 : .7);
-
-  // 悬停即可看到「为什么相连」—— 此前最让人困惑的正是这点：
-  // 有连线，却看不出两篇笔记到底什么关系。
-  link.append("title").text(d => {
-    const label = { wikilink: "手写链接", term: "术语重合", same_source: "同源", semantic: "语义相近" };
-    return (label[d.type] || d.type) + "\n" + (d.reason || "（无说明）");
-  });
-
-  const color = d => d.kind === "missing" ? "#f59e0b" : (d.status === "partial_fallback" ? "#f97316" : "#4f46e5");
-
-  const node = GRAPH.g.append("g").selectAll("g").data(nodes).join("g").attr("cursor", "grab")
-    .call(d3.drag()
-      .on("start", (e, d) => { if (!e.active) GRAPH.sim.alphaTarget(.28).restart(); d.fx = d.x; d.fy = d.y; })
-      .on("drag", (e, d) => { d.fx = e.x; d.fy = e.y; })
-      .on("end", (e, d) => { if (!e.active) GRAPH.sim.alphaTarget(0); d.fx = null; d.fy = null; }))
-      .on("click", (e, d) => {
-        e.stopPropagation();
-        GRAPH.focusId = (GRAPH.focusId === d.id) ? null : d.id;
-        if (GRAPH.lastData) drawGraph(GRAPH.lastData);
-      });
-
-    // 悬停显示关键词与摘要 —— 补上「这篇讲了什么」这一层，不用点进笔记也能扫一眼
-    node.append("title").text(d => {
-      const kw = (d.keywords && d.keywords.length) ? "\n关键词：" + d.keywords.slice(0, 6).join("、") : "";
-      const sm = d.summary ? "\n摘要：" + d.summary : "";
-      return (d.name || "") + "\n切片：" + (d.chunks || 0) + kw + sm + "\n（点击可只看它的邻居）";
-    });
-
-  node.append("circle")
-    .attr("r", d => 5 + Math.min(14, Math.sqrt(d.chunks || 0) * 4))
-    .attr("fill", color).attr("fill-opacity", .92)
-    .attr("stroke", "#fff").attr("stroke-width", 1.6)
-    .attr("filter", "url(#glow)");
-
-  node.append("text")
-    .text(d => d.name.length > 14 ? d.name.slice(0, 13) + "…" : d.name)
-    .attr("x", 0).attr("y", d => 5 + Math.min(14, Math.sqrt(d.chunks || 0) * 4) + 12)
-    .attr("text-anchor", "middle").attr("font-size", 10.5)
-    .attr("fill", "#475569").attr("pointer-events", "none");
-
-  node.append("title").text(d => d.name + (d.path ? "\n" + d.path : "\n(尚未创建)") + "\n切片 " + (d.chunks || 0));
-
-  node.on("dblclick", (e, d) => { if (d.path) { switchTab("notes"); } });
-
-  GRAPH.sim = d3.forceSimulation(nodes)
-    .force("link", d3.forceLink(links).id(d => d.id).distance(d => d.type === "wikilink" ? 95 : 165).strength(d => d.type === "wikilink" ? .55 : .16))
-    .force("charge", d3.forceManyBody().strength(-260))
-    .force("center", d3.forceCenter(GRAPH.w / 2, GRAPH.h / 2))
-    .force("collide", d3.forceCollide().radius(d => 16 + Math.min(14, Math.sqrt(d.chunks || 0) * 4)))
-    .on("tick", () => {
-      link.attr("x1", d => d.source.x).attr("y1", d => d.source.y)
-          .attr("x2", d => d.target.x).attr("y2", d => d.target.y);
-      node.attr("transform", d => "translate(" + d.x + "," + d.y + ")");
-    });
-}
-
 async function loadGraph() {
   const minDocs = Math.max(1, Math.min(20, parseInt($("#topicMin").value || "2", 10) || 2));
   $("#topicStats").innerHTML = '<span class="spin"></span> 正在归类…';
@@ -1716,7 +1596,6 @@ $("#btnShutdown").onclick = async () => {
     setTimeout(() => window.close(), 1200);
   } catch (e) { toast("退出请求失败：" + e.message); }
 };
-window.addEventListener("resize", () => { if (S.graph) GRAPH.sim && GRAPH.sim.alpha(.12).restart(); });
 
 /* ---------------------------- 启动 ---------------------------- */
 initDropZone();
