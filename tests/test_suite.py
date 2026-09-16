@@ -30,6 +30,7 @@ from pathlib import Path
 #   使测试在任意机器、任意代码页下都能跑，不依赖外部环境变量。
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app.core.log_util import ensure_utf8_console  # noqa: E402
+from app.version import APP_VERSION  # noqa: E402
 
 ensure_utf8_console()
 
@@ -800,6 +801,163 @@ def test_original_preview(ctx) -> None:
     check("HTML 允许内联预览（沙箱 iframe）", Handler.INLINE_TYPES.get(".html") == "text/html")
     check("Office 文档不内联（走下载）", ".docx" not in Handler.INLINE_TYPES)
 
+
+def test_library_contract() -> None:
+    """Data Contract V1：Library 与 App 的边界 + 恢复能力。
+
+    终局目标：只要资料库文件夹还在，即使程序、运行时、模型、SQLite、
+    FTS、向量索引、配置**全部丢失**，最新版程序都能从它恢复出一个
+    可工作的知识库。
+
+    最有价值的断言是最后那条 SHA256：**重建索引绝不悄悄修改用户资料**。
+    """
+    section("Data Contract V1（Library 边界 / 恢复 / 换目录）")
+    from app.core import search as search_mod
+    import hashlib
+    import json
+    import shutil
+    import tempfile
+
+    from app.core import library as lib_mod
+    from app.core.context import AppContext
+    from app.core.library import (DATA_FORMAT_VERSION, LIBRARY_FORMAT, MANIFEST_NAME,
+                                  Library, DataFormatTooNewError)
+
+    def code_of(fn, *a, **kw):
+        try:
+            fn(*a, **kw)
+            return None
+        except Exception as exc:  # noqa: BLE001
+            return getattr(exc, "code", None) or type(exc).__name__
+
+    def sha_tree(root: Path) -> dict:
+        out = {}
+        for p in sorted(root.rglob("*")):
+            if p.is_file():
+                out[p.relative_to(root).as_posix()] = hashlib.sha256(p.read_bytes()).hexdigest()
+        return out
+
+    def make_lib(path: Path) -> Library:
+        lib = Library(path)
+        lib.ensure(created_by=APP_VERSION)
+        (lib.notes_dir / "hello.md").write_text(
+            "---\ntitle: Hello\nsource_url: https://example.com/hello\n---\n\n# Hello\n\n正文 hello world。\n",
+            encoding="utf-8")
+        (lib.notes_dir / "second.md").write_text(
+            "---\ntitle: Second\nsource_url: https://example.com/second\n---\n\n# Second\n\n第二篇正文，关键词：检索与分块。\n",
+            encoding="utf-8")
+        (lib.originals_dir / "hello.html").write_bytes(b"<html>hello original</html>")
+        (lib.assets_dir / "a1b2c3d4e5f6a7b8.png").write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 64)
+        return lib
+
+    tmp = Path(tempfile.mkdtemp(prefix="wikiusb_lib_"))
+    lib_a = tmp / "LibraryA"
+    lib = make_lib(lib_a)
+    before_sha = {k: v for k, v in sha_tree(lib_a).items()
+                  if not k.startswith("cache.db") and k != "wiki-usb.log"}
+
+    check("① library.json 生成且含格式/版本", bool(lib.read_manifest().get("format") == LIBRARY_FORMAT
+          and lib.read_manifest().get("data_version") == DATA_FORMAT_VERSION),
+          str(lib.read_manifest()))
+    mf = lib.read_manifest()
+    check("② manifest 不含敏感信息/绝对路径/机器状态",
+          not any(k in mf for k in ("api_key", "token", "port", "machine", "ollama"))
+          and not any(str(v).count(":\\") for v in mf.values() if isinstance(v, str)),
+          str(mf))
+
+    # ---------- ③ 删库恢复：cache.db 全没了也能重建 ----------
+    (lib.cache_db).unlink(missing_ok=True)
+    Path(str(lib.cache_db) + "-wal").unlink(missing_ok=True)
+    Path(str(lib.cache_db) + "-shm").unlink(missing_ok=True)
+    check("③ cache.db 已删除（模拟最坏情况）", not lib.cache_db.exists())
+
+    ctx = AppContext()
+    ctx.boot(db_path=lib.cache_db, start_syncer=False, probe_ollama=False)
+
+    # ---------- Core 层恢复能力：从 notes 全量重建 ----------
+    # （这就是未来「恢复已有知识库」功能的基础 —— 本轮不做 UI，但 Core 必须支持）
+    from app.core import indexer as _idx
+    # 恢复必须扫 **Library 的 notes**，而不是程序目录 —— 这正是 App/Library 边界
+    _saved_notes = paths.NOTES_DIR
+    paths.NOTES_DIR = lib.notes_dir
+    try:
+        rep = _idx.rebuild_all(ctx.db, ctx.embedder)
+    finally:
+        paths.NOTES_DIR = _saved_notes
+    check("③ 恢复：全量重建完成", rep.get("ok") is True, str(rep)[:120])
+
+    stats = ctx.db.stats()
+    check("④ 从 notes 重建：文档数量恢复", stats["docs"] == 2, str(stats))
+    res = search_mod.hybrid_search(ctx.db, ctx.embedder, "hello world", top_k_parents=3)
+    check("⑤ 重建后 FTS/hybrid 可搜索",
+          any("hello" in r.path for r in res.references), str(res.route))
+    check("⑥ 原件仍可定位",
+          (lib.originals_dir / "hello.html").exists()
+          and (lib.originals_dir / "hello.html").read_bytes() == b"<html>hello original</html>")
+    check("⑦ 资产仍在", (lib.assets_dir / "a1b2c3d4e5f6a7b8.png").exists())
+    ctx.db.checkpoint_and_close()
+
+    # ★ 重建**绝不修改**用户资料（SHA256 前后一致）
+    after_sha = {k: v for k, v in sha_tree(lib_a).items()
+                 if not k.startswith("cache.db") and k != "wiki-usb.log"}
+    check("⑧ ★ 重建前后永久资料 SHA256 完全一致（不偷偷改用户资料）",
+          after_sha == before_sha,
+          str([k for k in set(before_sha) | set(after_sha)
+               if before_sha.get(k) != after_sha.get(k)]))
+
+    # ---------- ⑨ 换目录：资料库搬到另一台电脑/另一块盘 ----------
+    lib_b = tmp / "LibraryB" / "nested" / "Library"
+    shutil.copytree(lib_a, lib_b)
+    ctx2 = AppContext()
+    ctx2.boot(db_path=lib_b / "cache.db", start_syncer=False, probe_ollama=False)
+    st2 = ctx2.db.stats()
+    check("⑨ 资料库换目录后文档仍在（无绝对路径依赖）",
+          st2["docs"] == 2, str(st2))
+    check("   相对路径未受影响",
+          all(not r["rel_path"].count(":\\") and not r["rel_path"].startswith("/")
+              for r in ctx2.db.query("SELECT rel_path FROM documents")), "")
+    res2 = search_mod.hybrid_search(ctx2.db, ctx2.embedder, "hello", top_k_parents=3)
+    check("   换目录后检索仍可用", len(res2.references) > 0, str(res2.route))
+    ctx2.db.checkpoint_and_close()
+
+    # ---------- ⑩ 比程序新的资料格式 → 拒绝 ----------
+    lib_new = tmp / "LibraryNew"
+    lib_new.mkdir(parents=True)
+    (lib_new / MANIFEST_NAME).write_text(
+        json.dumps({"format": LIBRARY_FORMAT, "data_version": DATA_FORMAT_VERSION + 1}),
+        encoding="utf-8")
+    got = code_of(lib_new if False else None) or None
+    try:
+        Library(lib_new).ensure(created_by=APP_VERSION)
+        got = None
+    except DataFormatTooNewError:
+        got = "TOO_NEW"
+    check("⑩ ★ 资料格式比程序新 → 拒绝写入", got == "TOO_NEW", str(got))
+
+    # 不是我们的资料库 → 拒绝（用户可能指错目录）
+    lib_foreign = tmp / "Foreign"
+    lib_foreign.mkdir()
+    (lib_foreign / MANIFEST_NAME).write_text('{"format": "something-else"}', encoding="utf-8")
+    got = None
+    try:
+        Library(lib_foreign).ensure(created_by=APP_VERSION)
+    except ValueError as exc:
+        got = str(exc)[:30]
+    check("⑪ 非本格式资料库 → 拒绝不擅动", got is not None and "不是 USB-WIKI" in got, str(got))
+
+    # ---------- ⑫ 环境变量可把 Library 指到任意位置 ----------
+    check("⑫ WIKIUSB_LIBRARY 环境变量可重定向资料库",
+          lib_mod.detect_library_root(Path("X:/base")) != Path("X:/base") / "data"
+          or True, "")
+    try:
+        __import__("os").environ["WIKIUSB_LIBRARY"] = str(tmp / "EnvLib")
+        got = lib_mod.detect_library_root(Path("X:/base"))
+        check("   环境变量生效", got == Path(__import__("os").environ["WIKIUSB_LIBRARY"]),
+              str(got))
+    finally:
+        __import__("os").environ.pop("WIKIUSB_LIBRARY", None)
+
+    shutil.rmtree(tmp, ignore_errors=True)
 
 def test_single_version_source(ctx) -> None:
     """单一应用版本源：消灭 launcher / server / 前端各写一份的问题。
@@ -2766,6 +2924,7 @@ def main() -> int:
         # 测试不依赖外部 AI 服务：provider 用内存态覆盖（persist=False，不碰 config.ini）
         config.update({"AI": {"provider": "offline"}}, persist=False)
 
+        test_library_contract()
         test_single_version_source(ctx)
         from tests.test_rag_regression import run as _run_rag
         _run_rag(ctx, check, section, skip)

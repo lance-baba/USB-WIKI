@@ -6,6 +6,7 @@ U 盘盘符在不同机器上会变化（E:\ F:\ G:\ ...），因此任何路径
 from __future__ import annotations
 
 import sys
+import os
 from pathlib import Path
 
 
@@ -26,7 +27,20 @@ CORE_DIR: Path = APP_DIR / "core"
 WEB_DIR: Path = APP_DIR / "web"
 VENDOR_DIR: Path = WEB_DIR / "vendor"
 
-DATA_DIR: Path = BASE_DIR / "data"
+def _detect_data_dir(base: Path) -> Path:
+    """资料库根的解析：环境变量优先，默认跟着程序目录。
+
+    ⚠ 这是 **App 与 Library 的边界**：环境变量 ``WIKIUSB_LIBRARY`` 可把资料库
+    指到任意位置（另一块盘 / 另一台电脑），程序目录即使整个删除，
+    资料库仍可被新程序接管。默认值保持向后兼容（不强行搬目录）。
+    """
+    env = (os.environ.get("WIKIUSB_LIBRARY") or "").strip()
+    if env:
+        return Path(env).expanduser().resolve()
+    return (base / "data").resolve()
+
+
+DATA_DIR: Path = _detect_data_dir(BASE_DIR)
 NOTES_DIR: Path = DATA_DIR / "notes"
 SNAPSHOT_DIR: Path = DATA_DIR / "snapshots"
 # 原文件留存：导入的 PDF/Office 原件、剪藏的原始 HTML。
