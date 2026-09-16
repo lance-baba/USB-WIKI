@@ -801,6 +801,142 @@ def test_original_preview(ctx) -> None:
     check("Office 文档不内联（走下载）", ".docx" not in Handler.INLINE_TYPES)
 
 
+def test_archive_ssrf() -> None:
+    """离线归档：资源下载必须与正文抓取受同一条安全闸门管控。
+
+    资源 URL 来自被抓页面（外部可控），与正文 URL 同级风险。
+    此前 archiver 用 ``requests.Session`` —— 既绕过全部检查，又默认自动跟随
+    redirect（与正文抓取那条路径犯过同一个错）。
+
+    产品原则（用户明确）：**单个资源被安全拦下不应让整篇文章抓取失败**。
+    正文成功 + 危险资源占位 + 一条脱敏说明，才是离线存档该有的行为。
+    """
+    section("离线归档 · 资源下载走 SSRF 闸门")
+    import http.server
+    import ipaddress
+    import threading
+    import time
+
+    from app.core import archiver, config, net_guard as G
+
+    public_ip = [ipaddress.ip_address("93.184.216.34")]
+    real_res = G._default_resolver
+    real_hop = G._one_hop
+    orig_allow = config.get_str("CRAWLER", "allow_private_network", "0")
+
+    def set_allow(v: str) -> None:
+        config.update({"CRAWLER": {"allow_private_network": v}}, persist=False)
+
+    try:
+        # 资源 URL 用真实 localhost（私网）→ 默认策略必须拒绝
+        set_allow("0")
+
+        html = (
+            '<html><body><p>正文在</p>'
+            '<img src="http://127.0.0.1:9/local.png">'
+            '<link rel="stylesheet" href="http://192.168.1.5/evil.css">'
+            '</body></html>'
+        )
+        out, st = archiver.localize(html, "https://example.com/page")
+        check("★ 单资源被拦不影响整页（localize 正常返回）", isinstance(out, str) and "正文在" in out)
+        check("★ 本地图片被拒并计入 skipped_blocked",
+              st.skipped_blocked >= 1, f"blocked={st.skipped_blocked} assets={st.assets}")
+        check("★ 私网 CSS 同样被拦", st.assets == 0, f"assets={st.assets}")
+        check("★ 正文照常保留", "正文在" in out)
+        check("★ 文档里不残留危险外链（已替换为占位）",
+              "127.0.0.1:9/local.png" not in out and "192.168.1.5/evil.css" not in out)
+        joined = " ".join(st.notes)
+        check("★ 有脱敏说明（含条数与原因，不含响应内容）",
+              "安全策略" in joined, joined[:120])
+        check("说明里不含响应体内容",
+              "PNG" not in joined and "<html" not in joined, joined[:120])
+
+        # ---------- 子资源 公网 --302--> localhost ----------
+        G._default_resolver = lambda h, p: list(public_ip)
+        G._one_hop = lambda v, *, headers, timeout, use_proxy: (
+            302, b"", {"Location": "http://127.0.0.1:9/redirected.png"}, v.url
+        )
+        html2 = '<html><body><p>正文2</p><img src="http://cdn.test/a.png"></body></html>'
+        out2, st2 = archiver.localize(html2, "https://example.com/p2")
+        check("★ 子资源 公网→302→localhost 被拦（逐跳校验在归档路径也生效）",
+              st2.skipped_blocked >= 1, f"blocked={st2.skipped_blocked} assets={st2.assets}")
+        check("第二篇正文仍成功", "正文2" in out2)
+
+        # ---------- CSS 递归引用的私网资源 ----------
+        css = b'body{background:url("http://127.0.0.1:9/inner.png")}'
+        G._one_hop = lambda v, *, headers, timeout, use_proxy: (200, css, {"Content-Type": "text/css"}, v.url)
+        html3 = ('<html><body><p>正文3</p>'
+                 '<link rel="stylesheet" href="http://cdn.test/s.css"></body></html>')
+        out3, st3 = archiver.localize(html3, "https://example.com/p3")
+        check("★ CSS 里继续引用的私网资源同样被拦",
+              st3.skipped_blocked >= 1, f"blocked={st3.skipped_blocked} assets={st3.assets}")
+
+        # ---------- data: 内联资源：本地处理，不发网络请求 ----------
+        G._one_hop = real_hop
+        G._default_resolver = real_res
+        html4 = ('<html><body><p>正文4</p>'
+                 '<img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7">'
+                 '</body></html>')
+        out4, st4 = archiver.localize(html4, "https://example.com/p4")
+        check("data: 内联资源原样保留（不当作网络 URL 发出）",
+              "data:image/gif;base64" in out4, out4[:160])
+        check("data: 不计入下载也不计入被拦",
+              st4.assets == 0 and st4.skipped_blocked == 0,
+              f"assets={st4.assets} blocked={st4.skipped_blocked}")
+
+        # ---------- 正常公网资源：允许归档（allow_private 不影响公网）----------
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802
+                b = b"\x89PNG\r\n\x1a\n" + b"0" * 64
+                self.send_response(200)
+                self.send_header("Content-Type", "image/png")
+                self.send_header("Content-Length", str(len(b)))
+                self.end_headers()
+                self.wfile.write(b)
+
+            def log_message(self, *a):
+                return
+
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        port = srv.server_address[1]
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        time.sleep(0.3)
+        try:
+            # 默认策略下，localhost 资源被拒（这就是「公网页面引用 localhost」）
+            html5 = f'<html><body><p>正文5</p><img src="http://127.0.0.1:{port}/ok.png"></body></html>'
+            out5, st5 = archiver.localize(html5, "https://example.com/p5")
+            check("★ 公网页面引用 localhost 图片 → 拒绝",
+                  st5.skipped_blocked >= 1 and st5.assets == 0,
+                  f"blocked={st5.skipped_blocked} assets={st5.assets}")
+
+            # 显式开启 allow_private_network → 按设计允许归档
+            set_allow("1")
+            out6, st6 = archiver.localize(html5, "https://example.com/p6")
+            check("★ allow_private_network=true → 私网资源按设计允许归档",
+                  st6.assets >= 1, f"assets={st6.assets} blocked={st6.skipped_blocked}")
+            check("归档后正文仍完整", "正文5" in out6)
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+        # ---------- 出口收敛（静态断言）----------
+        src = (paths.CORE_DIR / "archiver.py").read_text(encoding="utf-8")
+        import re as _re
+        code = _re.sub(r'""".*?"""', "", src, flags=_re.S)
+        code = "\n".join(ln for ln in code.splitlines() if not ln.strip().startswith("#"))
+        check("★ archiver 不再使用 requests.Session",
+              "requests.Session()" not in code, "仍有 requests.Session")
+        check("★ archiver 资源下载走 safe_fetch",
+              "safe_fetch(" in code, "未走 safe_fetch")
+        check("★ 不再使用会绕过闸门的 net_util.http_get 下载资源",
+              "net_util.http_get(" not in code, "仍在用 net_util.http_get")
+        check("★ 复用了同一份 allow_private_network 配置（未复制一套判断）",
+              'config.get_bool("CRAWLER", "allow_private_network"' in code)
+    finally:
+        G._default_resolver = real_res
+        G._one_hop = real_hop
+        set_allow(orig_allow)
+
 def test_ssrf_guard(ctx) -> None:
     """SSRF 防护：公网白名单 + 钉住 IP + 逐跳校验重定向。
 
@@ -2156,6 +2292,7 @@ def main() -> int:
         # 测试不依赖外部 AI 服务：provider 用内存态覆盖（persist=False，不碰 config.ini）
         config.update({"AI": {"provider": "offline"}}, persist=False)
 
+        test_archive_ssrf()
         test_ssrf_guard(ctx)
         test_lifecycle_shutdown()
         test_duplicate_url_detection(ctx)

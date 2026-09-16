@@ -46,7 +46,7 @@ from html import escape as html_escape
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
-from . import config, net_util, paths
+from . import config, net_guard as _net_guard, net_util, paths
 
 # 前端与服务器约定的本地资源路径前缀（根相对 → 指向本服务）
 ASSET_URL_PREFIX = "/api/assets/"
@@ -85,6 +85,19 @@ _WORKERS = 8
 _TIME_BUDGET_S = 45.0
 
 
+class AssetBlocked(OSError):
+    """资源被 SSRF 安全策略拒绝（与普通网络失败区分开）。
+
+    只携带 URL 与**原因码**，不携带任何响应内容 —— 日志与用户提示都不应
+    回显被抓内容。
+    """
+
+    def __init__(self, url: str, reason: str, message: str = "") -> None:
+        self.url = url
+        self.reason = reason
+        super().__init__(message or reason)
+
+
 @dataclass
 class LocalizeStats:
     """本地化统计（用于日志与界面 notes 说明）。"""
@@ -95,6 +108,7 @@ class LocalizeStats:
     skipped_large: int = 0
     skipped_budget: int = 0
     skipped_type: int = 0
+    skipped_blocked: int = 0      # 被 SSRF 安全策略拒绝
     failed: int = 0
     timed_out: int = 0
     sheets_dropped: int = 0
@@ -108,7 +122,8 @@ class LocalizeStats:
 
     @property
     def placeholder(self) -> int:
-        return self.skipped_large + self.skipped_budget + self.skipped_type + self.failed + self.timed_out
+        return (self.skipped_large + self.skipped_budget + self.skipped_type
+                + self.skipped_blocked + self.failed + self.timed_out)
 
 
 def _sha16(url: str) -> str:
@@ -141,50 +156,42 @@ class _Fetcher:
 
     def __init__(self, timeout: float) -> None:
         self.timeout = timeout
-        self._session = None
-        try:
-            import requests  # type: ignore
 
-            s = requests.Session()
-            s.trust_env = True
-            adapter = requests.adapters.HTTPAdapter(pool_connections=16, pool_maxsize=16)
-            s.mount("https://", adapter)
-            s.mount("http://", adapter)
-            s.headers.update({
-                "User-Agent": net_util.DEFAULT_UA,
+    def get(self, url: str) -> tuple[bytes, str]:
+        """返回 (字节, Content-Type)。
+
+        ⚠ 必须走 :func:`net_guard.safe_fetch` —— 资源 URL 来自被抓页面，
+        属于**外部可控输入**，与正文抓取受同一条安全闸门管控：同一份
+        ``allow_private_network`` 配置、同一套 scheme/DNS/IP 校验、
+        同样钉住 IP 连接、同样逐跳重校验 redirect。
+
+        此前这里用 ``requests.Session``：既绕过以上全部检查，又默认
+        ``allow_redirects=True``（与正文抓取那条路径犯过同一个错）。
+
+        安全拒绝抛 :class:`AssetBlocked`，与普通「网络失败」区分开 ——
+        前者要如实告知用户「有资源被安全策略拦住了」，后者只是没抓到。
+        """
+        res = _net_guard.safe_fetch(
+            url,
+            headers={
                 "Accept": "*/*",
                 "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
                 "Referer": "",          # 不外泄来源页
-            })
-            self._session = s
-        except Exception:  # noqa: BLE001
-            self._session = None
-
-    def get(self, url: str) -> tuple[bytes, str]:
-        """返回 (字节, Content-Type)。失败抛异常。"""
-        if self._session is not None:
-            r = self._session.get(url, timeout=self.timeout, allow_redirects=True)
-            if r.status_code >= 400:
-                raise OSError(f"HTTP {r.status_code}")
-            return r.content, (r.headers.get("Content-Type") or "")
-        status, body, headers = net_util.http_get(url, timeout=self.timeout, with_proxy=True)
-        if status == 0:
-            raise OSError(str(body))
-        if status >= 400:
-            raise OSError(f"HTTP {status}")
-        ctype = ""
-        for k, v in (headers or {}).items():
-            if k.lower() == "content-type":
-                ctype = v
-                break
-        return body, ctype
+            },
+            timeout=self.timeout,
+            allow_private_network=config.get_bool("CRAWLER", "allow_private_network", False),
+        )
+        if not res.ok:
+            if res.reason in _net_guard.SECURITY_REASONS:
+                raise AssetBlocked(url, res.reason, res.message)
+            raise OSError(res.message or "抓取失败")
+        if res.status >= 400:
+            raise OSError(f"HTTP {res.status}")
+        return res.body, (res.headers.get("Content-Type") or "")
 
     def close(self) -> None:
-        if self._session is not None:
-            try:
-                self._session.close()
-            except Exception:  # noqa: BLE001
-                pass
+        return None
+
 
 
 class _Pool:
@@ -197,7 +204,10 @@ class _Pool:
         self.fetcher = fetcher
         self.lock = threading.Lock()
         self.seen: dict[str, str] = {}      # URL → 本地路径
-        self.tried: dict[str, str] = {}     # URL → 上次判定（含失败，避免重复抓）
+        self.tried: dict[str, str] = {}
+        # 被安全策略拒绝的资源：(url, 原因码)。**只存这两个字段**，
+        # 不存任何响应内容 —— 日志与用户提示都不回显被抓内容。
+        self.blocked: list[tuple[str, str]] = []     # URL → 上次判定（含失败，避免重复抓）
         self.deadline = time.monotonic() + _TIME_BUDGET_S
 
     # ---- 查询 ----
@@ -258,8 +268,20 @@ class _Pool:
         if self.exhausted():
             return self._remember(url, "budget")
 
+        # data: / blob: 是**内联**资源，本就不需要联网。
+        # 直接原样保留（不替换成占位符），也绝不当成网络 URL 发出去。
+        scheme = urlparse(url).scheme.lower()
+        if scheme in ("data", "blob", "about"):
+            return url, "inline"
+
         try:
             data, ctype = self.fetcher.get(url)
+        except AssetBlocked as exc:
+            # 被安全策略拒绝：**不中断整页**，用占位符 + 记一条脱敏说明。
+            # 只记录 URL 与原因码，绝不记录响应内容。
+            with self.lock:
+                self.blocked.append((url, exc.reason))
+            return self._remember(url, "blocked")
         except Exception:  # noqa: BLE001 - 单个资源失败不应中断整页
             return self._remember(url, "failed")
 
@@ -275,6 +297,7 @@ class _Pool:
         key = {
             "type": "skipped_type", "large": "skipped_large",
             "budget": "skipped_budget", "failed": "failed", "timeout": "timed_out",
+            "blocked": "skipped_blocked",
         }[status]
         with self.lock:
             self.tried[url] = status
@@ -534,5 +557,12 @@ def localize(html_text: str, page_url: str) -> tuple[str, LocalizeStats]:
         stats.notes.append(f"{stats.sheets_dropped} 个样式表未能存档，该页版式可能不完整")
     if stats.scripts:
         stats.notes.append(f"已省略 {stats.scripts} 个外部脚本（预览沙箱禁用脚本，存档中不再保留）")
+    if stats.skipped_blocked:
+        # 只给 URL 与原因码：不记录响应内容，也不把外部 URL 留在文档里
+        sample = "、".join(u[:80] for u, _ in pool.blocked[:3]) if pool is not None else ""
+        stats.notes.append(
+            f"{stats.skipped_blocked} 个资源被安全策略拦下（非公网地址或非法协议），"
+            f"已用占位符替代{('：' + sample) if sample else ''}"
+        )
 
     return html_text, stats

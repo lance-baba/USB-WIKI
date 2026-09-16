@@ -100,6 +100,14 @@ REASON_TEXT = {
 }
 
 
+# 哪些原因码属于「安全策略拒绝」——调用方据此把「被安全拦住」与
+# 「网络失败」区分开：前者要记 warning 让用户知道，后者只是普通失败。
+SECURITY_REASONS = frozenset({
+    R_SCHEME, R_MALFORMED, R_USERINFO, R_PORT, R_NO_HOST,
+    R_NOT_PUBLIC, R_MIXED, R_TOO_MANY_REDIRECTS, R_REDIRECT_LOOP, R_NO_LOCATION,
+})
+
+
 class SSRFBlocked(Exception):
     """目标被安全策略拒绝。``reason`` 是稳定的机器可读码。"""
 
