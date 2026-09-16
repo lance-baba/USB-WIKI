@@ -131,3 +131,24 @@ Core 层已具备此能力（`_idx.rebuild_all`），本轮未做 UI。
 * ❌ library.json 里放 API key / 机器状态
 * ❌ 因为「转换成功」而删除原件
 * ❌ 静默覆盖同名文件（必须加唯一后缀）
+
+## 11. manifest 的三种入口状态（严格互斥，V1 收尾补充）
+
+| 状态 | 判定 | 行为 |
+| :--- | :--- | :--- |
+| **不存在 manifest + 空目录** | 无资料 | 新建 V1 |
+| **不存在 manifest + 已有资料**（notes/originals/assets/snapshots 任一非空） | **Legacy Data Format 0** | 安全接管为 V1：**只新增 library.json**，永久资料一字不动（幂等，library_id 一次生成后稳定） |
+| **manifest 存在但损坏**（JSON 解析失败 / 顶层非对象） | `MANIFEST_CORRUPTED` | **先于任何写操作抛错**；空目录也一样（有文件就不是新库）。恢复只能走显式 `repair_manifest()` |
+
+* `ensure()` **读取后绝不回写** manifest —— 未知字段/未来字段允许存在，不得被当前程序重写成简化格式（否则「旧程序 + 新 manifest」会静默降级）。
+* `write_manifest` 写回时**保留未知字段**；`repair_manifest` 是唯一可覆盖损坏 manifest 的入口，且**只能显式调用**。
+
+## 12. V1 冻结声明
+
+满足以下全部条件后，**Data Contract V1 Frozen**：此后任何功能改动都不得破坏 V1 兼容。
+
+```text
+App 可删除重装 / cache.db 可删除重建 / Library 可整体移动 /
+旧版无 manifest Library 可被接管 / manifest 损坏不伤害用户资料 /
+未来 Data Format 不会被旧程序降级 / 永久资料 SHA256 不变
+```
