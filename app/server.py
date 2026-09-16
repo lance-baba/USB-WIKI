@@ -358,6 +358,18 @@ class Handler(BaseHTTPRequestHandler):
             rel = (q.get("path") or [""])[0]
             return self._note_original(rel)
 
+        # 前端在抓取前先问一次「这个网页是不是已经存过」，
+        # 以便弹出「打开已有 / 更新已有 / 另存为新版本 / 取消」。
+        # 注意：后端在 capture 时**自己也会再查一次** —— 前端判断不可信。
+        if path == "/api/capture/duplicate":
+            target = (q.get("url") or [""])[0]
+            from .core import indexer as _indexer  # noqa: PLC0415
+
+            found = _indexer.find_by_normalized_url(self.ctx.db, target)
+            return self._send_json(
+                {"ok": True, "data": {"duplicate": bool(found), "existing": found or None}}
+            )
+
         if path == "/api/topics":
             try:
                 min_docs = int((q.get("min_docs") or ["2"])[0])
@@ -422,18 +434,6 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/chat/completions":
             return self._chat()
-
-        # 前端在抓取前先问一次「这个网页是不是已经存过」，
-        # 以便弹出「打开已有 / 更新已有 / 另存为新版本 / 取消」。
-        # 注意：后端在 capture 时**自己也会再查一次** —— 前端判断不可信。
-        if path == "/api/capture/duplicate":
-            target = (q.get("url") or [""])[0]
-            from .core import indexer as _indexer  # noqa: PLC0415
-
-            found = _indexer.find_by_normalized_url(self.ctx.db, target)
-            return self._send_json(
-                {"ok": True, "data": {"duplicate": bool(found), "existing": found or None}}
-            )
 
         if path == "/api/capture/url":
             body = self._read_json()

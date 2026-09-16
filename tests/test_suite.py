@@ -906,6 +906,34 @@ def test_duplicate_url_detection(ctx) -> None:
         srv_src = (paths.CORE_DIR.parent / "server.py").read_text(encoding="utf-8")
         check("★ 服务端自己做判重（同时提供 /api/capture/duplicate 预检）",
               '"/api/capture/duplicate"' in srv_src and "find_by_normalized_url" in srv_src)
+
+        # ---------- ⑥ 路由归属：GET 预检必须真的挂在 GET 路由上 ----------
+        # 这条来自一次真实事故：`/api/capture/duplicate` 被误插进 `_route_post`，
+        # 于是 GET 请求 404 —— 前端的预检**从来就不可能工作**。
+        # 静态断言「字符串存在」根本挡不住它，必须真发一次请求。
+        import http.client
+        import threading as _th
+        import time as _t
+
+        from app.server import Server
+
+        srv2 = Server(("127.0.0.1", 0), ctx, allow_lan=False)
+        port2 = srv2.server_address[1]
+        _th.Thread(target=srv2.serve_forever, daemon=True).start()
+        _t.sleep(0.4)
+        try:
+            c = http.client.HTTPConnection("127.0.0.1", port2, timeout=6)
+            c.request("GET", "/api/capture/duplicate?url=https%3A%2F%2Fexample.com%2Fx",
+                      headers={"Host": f"127.0.0.1:{port2}"})
+            resp = c.getresponse()
+            body = resp.read().decode("utf-8", "replace")
+            code = resp.status
+            c.close()
+            check("★ GET /api/capture/duplicate 真实可用（不是 404）", code == 200, f"HTTP {code}")
+            check("  返回体含 duplicate 字段", '"duplicate"' in body, body[:120])
+        finally:
+            srv2.shutdown()
+            srv2.server_close()
     finally:
         srv.shutdown()
         srv.server_close()
