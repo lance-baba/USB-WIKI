@@ -373,6 +373,12 @@ class Handler(BaseHTTPRequestHandler):
         # 前端在抓取前先问一次「这个网页是不是已经存过」，
         # 以便弹出「打开已有 / 更新已有 / 另存为新版本 / 取消」。
         # 注意：后端在 capture 时**自己也会再查一次** —— 前端判断不可信。
+        # 只读系统诊断：Core 层 collect() 的薄包装，不做任何修复动作
+        if path == "/api/diagnostics":
+            from .core import diagnostics  # noqa: PLC0415
+
+            return self._send_json({"code": 200, "data": diagnostics.collect()})
+
         if path == "/api/capture/duplicate":
             target = (q.get("url") or [""])[0]
             from .core import indexer as _indexer  # noqa: PLC0415

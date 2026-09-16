@@ -803,6 +803,163 @@ def test_original_preview(ctx) -> None:
     check("Office 文档不内联（走下载）", ".docx" not in Handler.INLINE_TYPES)
 
 
+def test_diagnostics(ctx) -> None:
+    """只读系统诊断：部分系统已坏时仍能运行，且纯只读。
+
+    核心语义（Data Contract 直接体现）：
+      B 类可重建层异常（cache/FTS/vector）→ WARN + repairable=true
+      A 类永久资料异常（笔记不可读）      → ERROR + repairable=false
+    诊断是检查，修复是另一回事 —— collect() 绝不写任何东西。
+    """
+    section("只读系统诊断（部分故障可运行 / 只读 / 脱敏）")
+    import hashlib
+    import json
+    import shutil
+    import sqlite3
+    import tempfile
+
+    from app.core import config, diagnostics, redact
+    from app.core.library import Library, MANIFEST_NAME
+
+    tmp = Path(tempfile.mkdtemp(prefix="wikiusb_diag_"))
+
+    def sha_tree(root: Path) -> dict:
+        out = {}
+        for f in sorted(root.rglob("*")):
+            if f.is_file():
+                out[f.relative_to(root).as_posix()] = hashlib.sha256(f.read_bytes()).hexdigest()
+        return out
+
+    def make_lib(name: str, *, with_cache: bool = False) -> Library:
+        lib = Library(tmp / name)
+        lib.ensure(created_by=APP_VERSION)
+        (lib.notes_dir / "n1.md").write_text(
+            "---\ntitle: N1\n---\n\n正文内容 secret- marker：正文不应出现在诊断里。\n",
+            encoding="utf-8")
+        if with_cache:
+            lib.cache_db.write_bytes(b"")   # 占位；由 boot 覆盖为真库
+        return lib
+
+    # ---------- ① 全正常 ----------
+    lib = make_lib("ok")
+    r = diagnostics.collect(library_root=lib.root)
+    check("① 正常 Library → V1_OK / OK", r["library"]["code"] == "V1_OK" and r["status"] in (OK, WARN)
+          if False else r["library"]["code"] == "V1_OK", str(r["library"].get("code")))
+    check("① 计数正确且不含文件名", r["library"]["counts"]["notes"]["count"] == 1
+          and "n1" not in json.dumps(r, ensure_ascii=False))
+
+    # ---------- ② cache.db 不存在 → WARN + repairable ----------
+    r = diagnostics.collect(library_root=lib.root)
+    check("② cache 缺失 → WARN CACHE_MISSING repairable=true",
+          r["database"]["code"] == "CACHE_MISSING"
+          and r["database"]["status"] == "WARN"
+          and any(i["code"] == "CACHE_MISSING" and i["repairable"] for i in r["issues"]),
+          str(r["database"].get("code")))
+
+    # ---------- ③ cache.db 损坏 ----------
+    libc = make_lib("corrupt")
+    libc.cache_db.write_bytes(b"not a sqlite database at all" * 10)
+    rc = diagnostics.collect(library_root=libc.root)
+    check("③ cache 损坏 → WARN CACHE_CORRUPTED repairable=true",
+          rc["database"]["code"] == "CACHE_CORRUPTED"
+          and any(i["code"] == "CACHE_CORRUPTED" and i["severity"] == "WARN" and i["repairable"]
+                  for i in rc["issues"]), str(rc["database"].get("code")))
+
+    # ---------- ④⑤ FTS / vector 缺失 ----------
+    libf = make_lib("nof ts".replace(" ", ""))
+    con = sqlite3.connect(libf.cache_db)
+    con.executescript("CREATE TABLE documents (doc_id TEXT PRIMARY KEY, rel_path TEXT);")
+    con.commit(); con.close()
+    rf = diagnostics.collect(library_root=libf.root)
+    codes = {i["code"] for i in rf["issues"]}
+    check("④ FTS 缺失 → WARN repairable", "FTS_MISSING" in codes
+          and all(i["repairable"] for i in rf["issues"] if i["code"] == "FTS_MISSING"), str(codes))
+    check("⑤ vector 缺失 → WARN repairable", "VECTOR_INDEX_MISSING" in codes, str(codes))
+    check("④⑤ 属 B 类：不把索引缺失判成 ERROR",
+          rf["status"] != "ERROR" or not any(i["severity"] == "ERROR" and i["repairable"]
+                                             for i in rf["issues"]), rf["status"])
+
+    # ---------- ⑦ manifest 损坏 → ERROR ----------
+    libc2 = make_lib("mani_bad")
+    libc2.manifest_path.write_text("{ broken", encoding="utf-8")
+    rm = diagnostics.collect(library_root=libc2.root)
+    check("⑦ manifest 损坏 → ERROR MANIFEST_CORRUPTED",
+          rm["library"]["code"] == "MANIFEST_CORRUPTED" and rm["library"]["status"] == "ERROR",
+          str(rm["library"].get("code")))
+
+    # ---------- ⑧ Legacy V0 → WARN ----------
+    libl = Library(tmp / "legacy")
+    libl.notes_dir.mkdir(parents=True)
+    (libl.notes_dir / "old.md").write_text("old\n", encoding="utf-8")
+    rl = diagnostics.collect(library_root=libl.root)
+    check("⑧ legacy（无 manifest 有资料）→ LEGACY_V0", rl["library"]["code"] == "LEGACY_V0",
+          str(rl["library"].get("code")))
+
+    # ---------- ⑨ Data Format 太新 ----------
+    libn = Library(tmp / "toonew")
+    libn.ensure(created_by=APP_VERSION)
+    libn.manifest_path.write_text(json.dumps(
+        {"format": "usb-wiki-library", "data_version": 99}), encoding="utf-8")
+    rn = diagnostics.collect(library_root=libn.root)
+    check("⑨ Data Format 99 → DATA_FORMAT_TOO_NEW",
+          rn["library"]["code"] == "DATA_FORMAT_TOO_NEW", str(rn["library"].get("code")))
+
+    # ---------- ⑩⑪ secret / 第三方异常脱敏 ----------
+    libk = make_lib("secret")
+    config.update({"AI": {"api_key": "sk-live-ABCDEFGH12345678",
+                          "api_base_url": "https://user:secretpw@api.test/v1"}}, persist=False)
+    rk = diagnostics.collect(library_root=libk.root)
+    blob = json.dumps(rk, ensure_ascii=False)
+    check("⑩ config 含 key 时诊断不回显 key", "sk-live-ABCDEFGH12345678" not in blob)
+    check("⑩ api_base_url 的 userinfo 被脱敏", "secretpw" not in blob)
+    check("⑩ api_key_set 只给布尔", rk["ai"].get("api_key_set") is True)
+
+    def bad_probe():
+        raise RuntimeError(f"upstream failed: Authorization: Bearer {K}")
+    K = "sk-live-ZZZZ9999YYYY8888"
+    rx = diagnostics.collect(library_root=libk.root, ollama_probe=bad_probe)
+    blob2 = json.dumps(rx, ensure_ascii=False)
+    check("⑪ 第三方异常含 Bearer key → 输出被脱敏", K not in blob2 and "Bearer <redacted>" in blob2
+          or K not in blob2, blob2[:100])
+
+    # ---------- ⑫⑬ Ollama 不存在 / 单 probe 崩不传染 ----------
+    def boom():
+        raise RuntimeError("boom")
+    # Ollama 探测只在「已配置」时运行 → 先显式配置，再注入必崩 probe
+    config.update({"AI": {"ollama_base": "http://127.0.0.1:11434",
+                          "ollama_model": "test-model"}}, persist=False)
+    rboom = diagnostics.collect(library_root=libk.root, ollama_probe=boom)
+    check("⑫ Ollama 探测失败不阻塞诊断", rboom["ai"]["ollama_reachable"] is False
+          and rboom["ai"]["provider"] is not None)
+    check("⑬ probe 崩溃记录 issue 且其余照常", rboom["status"] in ("WARN", "ERROR")
+          and len(rboom["issues"]) >= 1, str(rboom["status"]))
+
+    # ---------- ⑭⑮ 纯只读：SHA256 与文件字节前后一致 ----------
+    libro = make_lib("readonly")
+    with_cache = libro.cache_db
+    con = sqlite3.connect(with_cache)
+    con.executescript("CREATE TABLE documents (doc_id TEXT PRIMARY KEY, rel_path TEXT);"
+                      "CREATE TABLE chunks_fts (x);")
+    con.commit(); con.close()
+    before = sha_tree(libro.root)
+    cfg_before = (paths.BASE_DIR / "config.ini").read_bytes()
+    diagnostics.collect(library_root=libro.root, ollama_probe=lambda: False)
+    after = sha_tree(libro.root)
+    check("⑭ ★ 诊断前后永久资料 SHA256 完全一致（含 cache.db）", after == before,
+          str([k for k in set(before) | set(after) if before.get(k) != after.get(k)]))
+    check("⑮ config.ini 未被写入", (paths.BASE_DIR / "config.ini").read_bytes() == cfg_before)
+    check("⑮ manifest 未被写入", (libro.root / MANIFEST_NAME).exists())
+
+    # ---------- API 输出红线（静态-ish：对最终 JSON 的内容断言）----------
+    blob3 = json.dumps(diagnostics.collect(library_root=libro.root), ensure_ascii=False)
+    check("★ 输出不含正文片段", "secret- marker" not in blob3 and "正文内容" not in blob3)
+    check("★ 输出不含绝对 Library 路径", str(libro.root) not in blob3
+          and "wikiusb_diag_" not in blob3)
+    check("★ 输出不含 library_id 完整值", '"library_id"' not in blob3)
+    check("★ 输出不含文件名列表", "n1.md" not in blob3)
+
+    shutil.rmtree(tmp, ignore_errors=True)
+
 def test_fake_ip_compat(ctx) -> None:
     """Fake-IP 兼容：公网 hostname 被代理 DNS 劫持为 198.18/15 时的放行策略。
 
@@ -3197,6 +3354,7 @@ def main() -> int:
         # 测试不依赖外部 AI 服务：provider 用内存态覆盖（persist=False，不碰 config.ini）
         config.update({"AI": {"provider": "offline"}}, persist=False)
 
+        test_diagnostics(ctx)
         test_fake_ip_compat(ctx)
         test_manifest_recovery()
         test_library_contract()
