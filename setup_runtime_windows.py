@@ -331,9 +331,95 @@ def _scan_build_junk() -> list[str]:
                 junk.append(str(rel / d) if str(rel) != "." else d)
                 dirs.remove(d)                      # prune，不递归进去
         for fn in files:
-            if fn.endswith((".pyc", ".pyo")) or fn in (".DS_Store", "Thumbs.db"):
+            hit = (fn.endswith((".pyc", ".pyo"))
+                   or fn in (".DS_Store", "Thumbs.db")
+                   # 一次性调试脚本的约定前缀（scripts/_tmp_*.py），属工程垃圾
+                   or (fn.startswith("_tmp_") and fn.endswith(".py")))
+            if hit:
                 junk.append(str(rel / fn) if str(rel) != "." else fn)
     return junk
+
+
+def _path_size(p: Path) -> int:
+    """文件或目录树的总字节数，单文件失败不影响整体统计。"""
+    if p.is_file():
+        try:
+            return p.stat().st_size
+        except OSError:
+            return 0
+    total = 0
+    for root, _dirs, files in os.walk(p):
+        for fn in files:
+            try:
+                total += (Path(root) / fn).stat().st_size
+            except OSError:
+                pass
+    return total
+
+
+def clean(*, dry_run: bool = False) -> int:
+    """清除工程垃圾，让 U 盘发布包不带构建残留。
+
+    安全边界：只动**项目自身源码树**（已跳过 runtime/ 与 data/）——
+      * data/ 是用户真相源，误删等于删掉用户的知识库
+      * runtime/ 是官方发行包，其中第三方包的散落 .pyc 可能为其分发所需，
+        收益不明确而风险存在，故不碰
+    被清除的都是 **Python 会自动重建** 的编译缓存与编辑器/调试残留。
+    """
+    junk = _scan_build_junk()
+    if not junk:
+        print("  ✅ 无工程垃圾，无需清理")
+        return 0
+
+    dirs = sorted({j for j in junk if (BASE / j).is_dir()}, reverse=True)
+    files = sorted(j for j in junk if (BASE / j).is_file())
+    freed = sum(_path_size(BASE / j) for j in dirs + files)
+
+    verb = "将清除" if dry_run else "已清除"
+    print("=" * 66)
+    print(f"  Wiki-USB 发布清理{'（预览，不做任何改动）' if dry_run else ''}")
+    print("=" * 66)
+    print(f"  {verb}：目录 {len(dirs)} 个 / 文件 {len(files)} 个"
+          f" ，释放约 {freed / 1048576:.1f} MB")
+    for d in dirs[:12]:
+        print(f"    ├── {d}/")
+    if len(dirs) > 12:
+        print(f"    └── … 其余 {len(dirs) - 12} 个目录")
+    for fn in files[:12]:
+        print(f"    ├── {fn}")
+    if len(files) > 12:
+        print(f"    └── … 其余 {len(files) - 12} 个文件")
+
+    if dry_run:
+        print("-" * 66)
+        print("  预览结束，未做任何改动。确认无误后去掉 --dry-run 执行清理。")
+        print("=" * 66)
+        return 0
+
+    removed_d = removed_f = 0
+    for d in dirs:
+        p = BASE / d
+        # 最后一道保险：只认 __pycache__ 这一个确切目录名
+        if p.name != "__pycache__" or not p.is_dir():
+            continue
+        try:
+            shutil.rmtree(p, ignore_errors=True)
+            removed_d += 1
+        except OSError as exc:
+            print(f"    ! 删除失败 {d}: {exc}")
+    for fn in files:
+        try:
+            (BASE / fn).unlink(missing_ok=True)
+            removed_f += 1
+        except OSError as exc:
+            print(f"    ! 删除失败 {fn}: {exc}")
+
+    print("-" * 66)
+    print(f"  实际清除：目录 {removed_d} / 文件 {removed_f}"
+          f" ，释放约 {freed / 1048576:.1f} MB")
+    print("  提示：这些均为编译缓存，下次运行会由 Python 自动重建。")
+    print("=" * 66)
+    return 0
 
 
 def verify(*, as_json: bool = False) -> int:
@@ -453,6 +539,10 @@ def main() -> int:
                     help="发布完整性校验：文件/资产/启动脚本齐不齐、是否残留外链（答「能否交付」）")
     ap.add_argument("--json", action="store_true",
                     help="以 JSON 输出校验结果（配合 --verify，便于 CI 消费）")
+    ap.add_argument("--clean", action="store_true",
+                    help="清理工程垃圾（__pycache__/.pyc/编辑器残留），不动 runtime/ 与 data/")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="配合 --clean：只预览将被清除的内容，不实际删除")
     ap.add_argument("--with-onnx", action="store_true", help="额外下载本地 ONNX 嵌入模型")
     ap.add_argument("--no-mirror", action="store_true", help="不使用清华 PyPI 镜像")
     ap.add_argument("--dev", action="store_true",
@@ -465,6 +555,9 @@ def main() -> int:
 
     if args.verify:
         return verify(as_json=args.json)
+
+    if args.clean:
+        return clean(dry_run=args.dry_run)
 
     if os.name != "nt":
         print("[setup] 提示：本脚本用于生成 Windows 发布版。")
