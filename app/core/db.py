@@ -81,9 +81,11 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         host      TEXT DEFAULT '',
         language  TEXT DEFAULT '',
         summary   TEXT DEFAULT '',
-        entities  TEXT DEFAULT ''
+        entities  TEXT DEFAULT '',
+        normalized_url TEXT DEFAULT ''
     );""",
     """CREATE INDEX IF NOT EXISTS idx_doc_meta_host ON doc_meta(host);""",
+    """CREATE INDEX IF NOT EXISTS idx_doc_meta_normurl ON doc_meta(normalized_url);""",
     # 索引加速
     "CREATE INDEX IF NOT EXISTS idx_chunk_meta_doc ON chunk_metadata(doc_id);",
     "CREATE INDEX IF NOT EXISTS idx_parent_doc ON parent_blocks(doc_id);",

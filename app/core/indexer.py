@@ -14,6 +14,7 @@ from urllib.parse import urlparse
 from . import chunker, paths
 from .db import Database
 from .log_util import get_logger
+from . import urls as _urls
 
 log = get_logger()
 
@@ -168,16 +169,25 @@ def index_parsed(
                     _host = (urlparse(_src).hostname or "").lower()
                 except ValueError:
                     _host = ""
+            # 归一化来源 URL：抓取前用它判重（同一页面的 utm / fragment / 尾斜杠
+            # 等差异不应产生多篇笔记）。见 core/urls.py。
+            _norm_url = ""
+            if _src:
+                try:
+                    _norm_url = _urls.normalize_url(_src)
+                except Exception:  # noqa: BLE001 - 规范化失败不影响索引
+                    _norm_url = ""
             try:
                 conn.execute(
                     """INSERT OR REPLACE INTO doc_meta
-                       (doc_id, keywords, host, language, summary, entities)
-                       VALUES (?,?,?,?,?,?)""",
+                       (doc_id, keywords, host, language, summary, entities, normalized_url)
+                       VALUES (?,?,?,?,?,?,?)""",
                     (
                         parsed.doc_id, _kw_text[:600], _host,
                         str(_m.get("language") or "")[:16],
                         str(_m.get("summary") or "")[:300],
                         json.dumps(_m.get("entities") or {}, ensure_ascii=False)[:900],
+                        _norm_url,
                     ),
                 )
             except sqlite3.Error as exc:  # 元数据写入失败不该影响索引
@@ -288,6 +298,36 @@ def scan_notes(abs_dir: Path | None = None) -> list[Path]:
     if not root.exists():
         return []
     return sorted(p for p in root.rglob("*.md") if p.is_file())
+
+
+def find_by_normalized_url(db: Database, url: str) -> dict | None:
+    """按**归一化**来源 URL 查已抓过的笔记。
+
+    返回 ``{doc_id, rel_path, title, normalized_url}`` 或 ``None``。
+    用 doc_meta 的索引列做 O(1) 查找，避免每次抓取都去扫 notes 目录。
+    """
+    norm = _urls.normalize_url(url)
+    if not norm:
+        return None
+    try:
+        row = db.query_one(
+            """SELECT d.doc_id, d.rel_path, d.title, m.normalized_url
+                 FROM doc_meta m JOIN documents d ON d.doc_id = m.doc_id
+                WHERE m.normalized_url = ?
+                ORDER BY d.mtime DESC LIMIT 1""",
+            (norm,),
+        )
+    except Exception as exc:  # noqa: BLE001 - 表可能尚未建出（老库未重建）
+        log.warning("按 URL 查重失败（将视为未重复）: %s", exc)
+        return None
+    if not row:
+        return None
+    return {
+        "doc_id": row["doc_id"],
+        "rel_path": row["rel_path"] or "",
+        "title": row["title"] or row["rel_path"] or "",
+        "normalized_url": norm,
+    }
 
 
 def rebuild_all(db: Database, embedder=None, recreate_vec: bool = False) -> dict:

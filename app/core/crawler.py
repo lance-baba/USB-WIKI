@@ -53,6 +53,8 @@ class CaptureResult:
     snapshot_path: str = ""
     original_path: str = ""
     used: str = "trafilatura"
+    # 命中重复来源 URL 时，带上已存在笔记的信息，供前端给出「打开/更新/另存/取消」
+    duplicate: dict | None = None
     # 系统自愈 / 自动降级的过程信息（按项目约定：这类信息不打扰用户，
     # 只作为说明随结果返回，不进顶部告警条）
     notes: list[str] = field(default_factory=list)
@@ -377,10 +379,21 @@ def save_markdown(
     when: datetime | None = None,
     html_text: str = "",
     extra: dict | None = None,
+    target_path: Path | None = None,
 ) -> Path:
     when = when or datetime.now()
     paths.NOTES_DIR.mkdir(parents=True, exist_ok=True)
-    target = paths.NOTES_DIR / _safe_name(url, when)
+    # target_path 用于「更新已有」：沿用原文件名，避免同一页面变成两篇笔记
+    target = Path(target_path) if target_path else paths.NOTES_DIR / _safe_name(url, when)
+    # 自动命名的时间戳只到秒：同一秒内抓两次会撞名，**静默覆盖**掉前一篇。
+    # （写测试时实测到：连续两次抓取只留下 1 个文件。）
+    # 撞名时改加数字后缀；显式指定 target_path（更新已有）时不改，那种覆盖是预期的。
+    if target_path is None and target.exists():
+        for _n in range(2, 100):
+            cand = target.with_name(f"{target.stem}-{_n}{target.suffix}")
+            if not cand.exists():
+                target = cand
+                break
 
     fields = {
         "title": title or url,
@@ -420,11 +433,45 @@ def save_snapshot(url: str, html_text: str, when: datetime | None = None) -> Pat
 
 
 # --------------------------------------------------------------------------
-def capture_url(url: str, db=None, embedder=None) -> CaptureResult:
-    """抓取 -> 清洗 -> 阈值判定 -> 落盘（成功/降级）-> 索引。"""
+def capture_url(url: str, db=None, embedder=None, on_duplicate: str = "abort") -> CaptureResult:
+    """抓取 -> 清洗 -> 阈值判定 -> 落盘（成功/降级）-> 索引。
+
+    ``on_duplicate`` 处理「同一来源 URL 已抓过」：
+
+    * ``abort``（默认）—— 不抓取，直接返回 ``status="duplicate"`` 并附上已有笔记信息。
+      **默认拒绝而不是默默新建**：重复笔记会污染检索、引用、关键词、主题与统计。
+    * ``update`` —— 重新抓取并**覆盖已存在的那篇笔记**（页面会更新，这是正当需求）。
+    * ``new``    —— 另存为新笔记（保留旧版本）。
+
+    判重在**抓取之前**完成，因此 abort 分支不会产生任何网络请求。
+    前端是否预先查过重复都无所谓 —— 后端自己一定会查。
+    """
     url = (url or "").strip()
     if not re.match(r"^https?://", url, re.IGNORECASE):
         return CaptureResult(False, "error", message="仅支持 http/https 开头的标准 URL")
+
+    # ---- 来源 URL 判重（归一化后比较：utm / fragment / 尾斜杠等差异不算新页面）----
+    existing: dict | None = None
+    if db is not None and on_duplicate != "new":
+        try:
+            from . import indexer as _indexer  # noqa: PLC0415 - 避免循环导入
+
+            existing = _indexer.find_by_normalized_url(db, url)
+        except Exception as exc:  # noqa: BLE001 - 判重失败不应阻断抓取
+            log.warning("来源 URL 判重失败（按未重复继续）: %s", exc)
+            existing = None
+
+    if existing and on_duplicate == "abort":
+        return CaptureResult(
+            False, "duplicate",
+            title=existing.get("title", ""),
+            file_path=existing.get("rel_path", ""),
+            message=(
+                f"该网页已经保存过：{existing.get('title', '')}"
+                "（可在弹窗里选择打开已有 / 更新已有 / 另存为新版本）"
+            ),
+            duplicate={**existing, "action": "abort"},
+        )
 
     min_chars = config.get_int("CRAWLER", "min_body_chars", 150)
     snapshot_chars = config.get_int("CRAWLER", "snapshot_chars", 1000)
@@ -486,8 +533,13 @@ def capture_url(url: str, db=None, embedder=None) -> CaptureResult:
 
     # ---- 成功分支 ----
     if len(body) >= min_chars:
-        target = save_markdown(title, body, url, meta, "success", html_text=html_text,
-                              extra=ana_extra)
+        target = save_markdown(
+            title, body, url, meta, "success", html_text=html_text, extra=ana_extra,
+            # update：直接覆盖已存在的那篇，保持同一路径（不再多出一篇）
+            target_path=(paths.NOTES_DIR / existing["rel_path"].split("/")[-1]
+                         if (existing and on_duplicate == "update"
+                             and existing.get("rel_path")) else None),
+        )
         result = CaptureResult(
             True, "success", title=title or url,
             file_path=paths.rel_to_data(target), abs_path=str(target),

@@ -423,10 +423,32 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/chat/completions":
             return self._chat()
 
+        # 前端在抓取前先问一次「这个网页是不是已经存过」，
+        # 以便弹出「打开已有 / 更新已有 / 另存为新版本 / 取消」。
+        # 注意：后端在 capture 时**自己也会再查一次** —— 前端判断不可信。
+        if path == "/api/capture/duplicate":
+            target = (q.get("url") or [""])[0]
+            from .core import indexer as _indexer  # noqa: PLC0415
+
+            found = _indexer.find_by_normalized_url(self.ctx.db, target)
+            return self._send_json(
+                {"ok": True, "data": {"duplicate": bool(found), "existing": found or None}}
+            )
+
         if path == "/api/capture/url":
             body = self._read_json()
             url = str(body.get("url") or "").strip()
-            result = crawler.capture_url(url, db=self.ctx.db, embedder=self.ctx.embedder)
+            # on_duplicate: abort(默认) / update / new —— 由用户在弹窗里选择后带上。
+            # 不给就按 abort 处理：宁可让调用方显式表态，也不默默产生重复笔记。
+            on_dup = str(body.get("on_duplicate") or "abort").strip().lower()
+            if on_dup not in ("abort", "update", "new"):
+                on_dup = "abort"
+            result = crawler.capture_url(
+                url, db=self.ctx.db, embedder=self.ctx.embedder, on_duplicate=on_dup
+            )
+            if result.status == "duplicate":
+                # 不是服务端错误，而是一个**需要用户决策**的正常状态
+                return self._send_json(result.to_dict(), 409)
             return self._send_json(result.to_dict(), 200 if result.ok else 500)
 
         if path == "/api/notes/save":

@@ -749,6 +749,145 @@ def test_original_preview(ctx) -> None:
     check("Office 文档不内联（走下载）", ".docx" not in Handler.INLINE_TYPES)
 
 
+def test_duplicate_url_detection(ctx) -> None:
+    """同一来源 URL 判重：规范化 → 抓取前检查 → 由用户决定动作。
+
+    背景（实测事故）：同一篇 Grok 文章被抓成两篇笔记，直接污染检索引用、
+    关键词、主题分组与统计。
+
+    设计约束：
+    * **判重必须发生在抓取之前**（abort 分支不发任何网络请求）
+    * **后端必须自己查**，不能只靠前端
+    * 默认 ``abort`` 而非默默新建 —— 宁可让调用方显式表态
+    * 网页会更新，所以不能「一律禁止重复」，要支持 更新 / 另存
+    """
+    section("同一来源 URL 判重（规范化 + 抓取前检查）")
+    import http.server
+    import threading
+    import time
+    from pathlib import Path
+
+    from app.core import crawler, indexer
+    from app.core import urls as U
+
+    # ---------- ① 归一化：这些都应视为同一页 ----------
+    base = "https://example.com/article"
+    variants = [
+        "https://example.com/article",
+        "https://example.com/article/",
+        "https://EXAMPLE.com/article",
+        "https://example.com/article#section",
+        "https://example.com/article?utm_source=twitter&utm_medium=social",
+        "https://example.com:443/article",
+        "https://example.com/article?fbclid=abc123",
+    ]
+    check("七种写法归一化后完全一致",
+          len({U.normalize_url(v) for v in variants}) == 1,
+          str({U.normalize_url(v) for v in variants}))
+
+    # 但**不同页面**绝不能被误判 —— 误判会导致「更新已有」覆盖掉另一篇真实内容
+    distinct = [
+        ("https://example.com/article", "https://example.com/article2"),
+        ("https://example.com/article", "https://example.com/other"),
+        ("https://example.com/article", "https://example.com/article?page=2"),
+        ("https://example.com/article", "https://other.com/article"),
+        ("http://example.com/article", "https://example.com/article"),
+        ("https://example.com/article", "https://example.com/Article"),
+    ]
+    for a, b in distinct:
+        check(f"不同页面不误判：{a} ≠ {b}", not U.same_page(a, b))
+    check("query 顺序不同视为同一页（a=1&b=2 与 b=2&a=1）",
+          U.same_page("https://e.com/x?a=1&b=2", "https://e.com/x?b=2&a=1"))
+    check("追踪参数识别", U.is_tracking_param("utm_source")
+          and U.is_tracking_param("fbclid")
+          and not U.is_tracking_param("page")
+          and not U.is_tracking_param("id"))
+    check("空/非法 URL 不抛异常", U.normalize_url("") == "" and U.normalize_url("  ") == "")
+
+    # ---------- 起一个本地页面，做真实抓取 ----------
+    PAGE = ("<html><head><title>去重测试页</title></head><body><article>"
+            + "这是一篇用于验证重复抓取检测的中文正文。" * 30
+            + "</article></body></html>").encode("utf-8")
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(PAGE)))
+            self.end_headers()
+            self.wfile.write(PAGE)
+
+        def log_message(self, *a):  # 静音
+            return
+
+    pre_existing = {p.name for p in paths.NOTES_DIR.glob("*.md")}
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    port = srv.server_address[1]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    time.sleep(0.3)
+    url = f"http://127.0.0.1:{port}/article?utm_source=test"
+    canonical = f"http://127.0.0.1:{port}/article"
+
+    def n_notes() -> int:
+        return len(list(paths.NOTES_DIR.glob("*.md")))
+
+    try:
+        before = n_notes()
+        r1 = crawler.capture_url(url, db=ctx.db, embedder=ctx.embedder)
+        check("首次抓取成功", r1.ok, f"status={r1.status} msg={r1.message}")
+        check("首次抓取后多了一篇笔记", n_notes() == before + 1)
+
+        # ---------- ② 默认 abort：不发网络请求，返回 duplicate ----------
+        r2 = crawler.capture_url(canonical, db=ctx.db, embedder=ctx.embedder)
+        check("★ 再次抓取（不同写法）→ status=duplicate", r2.status == "duplicate",
+              f"status={r2.status}")
+        check("★ 返回已存在笔记的信息（供弹窗展示）",
+              bool(r2.duplicate and r2.duplicate.get("rel_path")),
+              str(r2.duplicate))
+        check("★ abort 分支未新建笔记", n_notes() == before + 1)
+
+        # ---------- ③ 显式 new：允许另存为新版本 ----------
+        r3 = crawler.capture_url(canonical, db=ctx.db, embedder=ctx.embedder,
+                                 on_duplicate="new")
+        check("显式 new → 另存为新笔记（网页会更新，这是正当需求）",
+              r3.ok and n_notes() == before + 2, f"status={r3.status} n={n_notes()}")
+
+        # ---------- ④ 显式 update：覆盖已有那篇，不新增 ----------
+        n_now = n_notes()
+        r4 = crawler.capture_url(canonical, db=ctx.db, embedder=ctx.embedder,
+                                 on_duplicate="update")
+        check("显式 update → 成功且不新增笔记", r4.ok and n_notes() == n_now,
+              f"status={r4.status} before={n_now} after={n_notes()}")
+
+        # ---------- ⑤ 后端自查（不依赖前端）----------
+        found = indexer.find_by_normalized_url(
+            ctx.db, f"http://127.0.0.1:{port}/article/?utm_campaign=x#top")
+        check("按 URL 变体也能查到已存在笔记（归一化生效）",
+              bool(found), str(found))
+        import inspect as _inspect
+
+        sig = _inspect.signature(crawler.capture_url)
+        check("★ capture_url 默认策略是 abort（调用方不表态就不会产生重复）",
+              sig.parameters["on_duplicate"].default == "abort")
+        srv_src = (paths.CORE_DIR.parent / "server.py").read_text(encoding="utf-8")
+        check("★ 服务端自己做判重（同时提供 /api/capture/duplicate 预检）",
+              '"/api/capture/duplicate"' in srv_src and "find_by_normalized_url" in srv_src)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+        # 清理本测试产生的笔记。其它测试断言 NOTES_DIR 的精确篇数
+        # （如「文档全部入库 == 3」），留下垃圾会让它们无故失败 —— 之前就踩过。
+        for _f in paths.NOTES_DIR.glob("*.md"):
+            if _f.name not in pre_existing:
+                try:
+                    _f.unlink()
+                except OSError:
+                    pass
+        try:
+            indexer.rebuild_all(ctx.db, ctx.embedder)
+        except Exception:  # noqa: BLE001 - 清理失败不影响本测试结论
+            pass
+
 def test_localhost_security(ctx) -> None:
     """Localhost 安全边界：Host 校验 + Fetch Metadata + 同源判定。
 
@@ -1522,6 +1661,7 @@ def main() -> int:
         # 测试不依赖外部 AI 服务：provider 用内存态覆盖（persist=False，不碰 config.ini）
         config.update({"AI": {"provider": "offline"}}, persist=False)
 
+        test_duplicate_url_detection(ctx)
         test_localhost_security(ctx)
         test_schema_compatibility(ctx)
         test_atomic_io()

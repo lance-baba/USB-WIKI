@@ -759,15 +759,63 @@ function handleFrame(f, bub) {
   }
 }
 
-/* ---------------------------- 剪藏 ---------------------------- */
-async function doCapture() {
-  const url = $("#capUrl").value.trim();
-  if (!url) return toast("请输入 URL");
-  const box = $("#capResult");
-  box.innerHTML = '<span class="hint"><span class="spin"></span> 正在抓取并清洗正文…</span>';
-  $("#btnCapture").disabled = true;
-  try {
-    const r = await api("/api/capture/url", { method: "POST", body: JSON.stringify({ url }) });
+  /* ---------------------------- 剪藏 ---------------------------- */
+  /* 抓取前先问后端「这个网页是不是已经保存过」。
+     注意后端在真正抓取时**自己也会再查一次** —— 这里的预检只是为了让界面
+     能在重复时给出选择，不是安全/正确性的依据。 */
+  async function doCapture() {
+    const url = $("#capUrl").value.trim();
+    if (!url) return toast("请输入 URL");
+    const box = $("#capResult");
+    box.innerHTML = '<span class="hint"><span class="spin"></span> 正在检查这个网页是否已保存过…</span>';
+    $("#btnCapture").disabled = true;
+    let dup = null;
+    try {
+      const chk = await api("/api/capture/duplicate?url=" + encodeURIComponent(url));
+      dup = (chk.data || {}).existing || null;
+    } catch (e) {
+      // 预检失败不阻断抓取：后端自己会判重，真重复时会返回 409
+    }
+    $("#btnCapture").disabled = false;
+    if (dup) return renderDuplicateChoice(url, dup);
+    return doCaptureWith(url, "abort");
+  }
+
+  /* 重复来源 URL 的四个选项。刻意不做「一律禁止重复」—— 网页会更新，
+     用户有时确实要保存同一页面的不同版本，所以把决定权交回用户。 */
+  function renderDuplicateChoice(url, dup) {
+    const box = $("#capResult");
+    box.innerHTML =
+      '<div class="alert">⚠ 该网页已经保存过：' + esc(dup.title || dup.rel_path) + "</div>" +
+      '<div class="hint" style="margin:6px 0">请选择处理方式</div>' +
+      '<div style="display:flex;gap:8px;flex-wrap:wrap">' +
+      '<button class="btn" data-dup="open">打开已有</button>' +
+      '<button class="btn primary" data-dup="update">更新已有</button>' +
+      '<button class="btn" data-dup="new">另存为新版本</button>' +
+      '<button class="btn ghost" data-dup="cancel">取消</button>' +
+      "</div>";
+    $$("#capResult [data-dup]").forEach(function (b) {
+      b.onclick = function () {
+        const act = b.dataset.dup;
+        if (act === "cancel") {
+          box.innerHTML = '<span class="hint">已取消，未做任何改动。</span>';
+          return;
+        }
+        if (act === "open") return openNoteByPath(dup.rel_path);
+        return doCaptureWith(url, act);
+      };
+    });
+  }
+
+  async function doCaptureWith(url, onDup) {
+    const box = $("#capResult");
+    box.innerHTML = '<span class="hint"><span class="spin"></span> 正在抓取并清洗正文…</span>';
+    $("#btnCapture").disabled = true;
+    try {
+      const r = await api("/api/capture/url", {
+        method: "POST",
+        body: JSON.stringify({ url: url, on_duplicate: onDup }),
+      });
     const d = r.data || {};
     // 系统自愈 / 自动降级的过程信息：按项目约定不打扰用户，只在结果区作说明
     const notesHtml = (d.notes && d.notes.length)

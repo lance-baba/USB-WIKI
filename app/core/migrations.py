@@ -43,7 +43,7 @@ from .log_util import get_logger
 log = get_logger()
 
 # 索引结构版本。唯一来源 —— db.py 从这里取，不再各写一份。
-CURRENT_SCHEMA_VERSION = "1.3"
+CURRENT_SCHEMA_VERSION = "1.4"   # 1.4: doc_meta 增加 normalized_url（抓取去重）
 
 META_SCHEMA_VERSION = "schema_version"
 
