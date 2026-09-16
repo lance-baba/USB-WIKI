@@ -235,7 +235,8 @@ def check() -> int:
     print(f"  ONNX 模型  : {'✅' if model.exists() else '⚠ 未下载（将降级嵌入源）'}")
     web = BASE / "app" / "web"
     print(f"  离线前端   : {'✅' if (web / 'index.html').exists() else '❌'} index.html"
-          f" ，{'✅' if (web / 'vendor' / 'd3.v7.min.js').exists() else '❌'} vendor/d3.v7.min.js")
+          f" ，{'✅' if (web / 'app.css').exists() else '❌'} app.css"
+          f" ，{'✅' if (web / 'app.js').exists() else '❌'} app.js")
     print("=" * 66)
     print("  结论：" + ("✅ 运行时可用于发布" if ok else "❌ 存在缺失项，请执行完整安装"))
     return 0 if ok else 1

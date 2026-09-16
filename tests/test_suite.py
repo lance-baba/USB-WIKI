@@ -3265,6 +3265,7 @@ def test_console_encoding_guard() -> None:
 def test_offline_assets() -> None:
     section("离线资源 Vendor 化（PRD 4.6）")
     html = (paths.WEB_DIR / "index.html").read_text(encoding="utf-8")
+    js = (paths.WEB_DIR / "app.js").read_text(encoding="utf-8")
     import re
 
     external = re.findall(r'(?:src|href)\s*=\s*["\'](https?://[^"\']+)', html)
@@ -3277,14 +3278,17 @@ def test_offline_assets() -> None:
           "initGraphSvg" not in html and "drawGraph" not in html
           and "const GRAPH" not in html and "#graphSvg" not in html)
     check("vendor/d3.v7.min.js 已删除", not (paths.VENDOR_DIR / "d3.v7.min.js").exists())
-    check("控制台包含未闭合角标缓冲实现", "splitHold" in html and "\\[\\^?" in html)
+    # Commit B：前端拆分为 index.html + app.css + app.js（零构建 / 零 CDN）。
+    check("前端拆分产物 app.css 存在", (paths.WEB_DIR / "app.css").exists())
+    check("前端拆分产物 app.js 存在", (paths.WEB_DIR / "app.js").exists())
+    check("未闭合角标缓冲实现已迁至 app.js", "splitHold" in js and "\\[\\^?" in js)
     # 节点图已被「主题分组」取代：实测本项目语料是「剪藏一批互不相关页面」，
     # 12 篇分成 9 个连通分量，节点图必然是一堆孤岛（不匹配使用形态）。
     check("控制台已把星图换为主题分组", "主题分组" in html and "topicBox" in html)
     # 用户可见性质：主题页里不再有节点图画布（SVG 元素从未在 DOM 中存在）。
     check("主题页不再有节点图画布", '<svg id="graphSvg">' not in html)
     check("主题页有「共现若干篇才成主题」的阈值控件", 'id="topicMin"' in html)
-    check("控制台包含安全退出按钮", "/api/system/shutdown" in html)
+    check("控制台包含安全退出按钮（调用 /api/system/shutdown）", "/api/system/shutdown" in js)
 
 
 def test_no_absolute_paths() -> None:
@@ -3376,6 +3380,59 @@ def _isolate_data_dir() -> Path:
     return tmp
 
 
+def test_static_assets_serving(ctx) -> None:
+    """Commit B：前端拆分后，静态资源经 HTTP 正常返回且 Content-Type 正确、无目录穿越。
+
+    同时验证「零构建 / 零 CDN」不变量：HTML 不内联 <style>/<script>，仅引用 /app.css、/app.js。
+    """
+    section("静态资源服务（Commit B 拆分后）")
+    import re, time, threading, http.client
+    from app.server import Server
+
+    html = (paths.WEB_DIR / "index.html").read_text(encoding="utf-8")
+    check("HTML 不再内联 <style>", "<style>" not in html)
+    check("HTML 不再内联 <script>", "<script>" not in html)
+    check("HTML 引用 /app.css", '<link rel="stylesheet" href="/app.css">' in html)
+    check("HTML 引用 /app.js", '<script src="/app.js"></script>' in html)
+    check("零 CDN：HTML 无外链资源",
+          not re.findall(r'(?:src|href)\s*=\s*["\'](https?://[^"\']+)', html))
+
+    srv = Server(("127.0.0.1", 0), ctx, allow_lan=False)
+    port = srv.server_address[1]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    time.sleep(0.4)
+
+    def get(p: str):
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=6)
+        try:
+            conn.request("GET", p, headers={"Host": f"127.0.0.1:{port}"})
+            resp = conn.getresponse()
+            body = resp.read()
+            ct = resp.getheader("Content-Type", "")
+            return resp.status, ct, body
+        finally:
+            conn.close()
+
+    try:
+        st, ct, body = get("/")
+        check("GET / → 200 且返回 HTML", st == 200 and b"<html" in body, f"{st} {ct}")
+        st, ct, body = get("/app.css")
+        check("GET /app.css → 200 且 text/css", st == 200 and ct.startswith("text/css"), f"{st} {ct}")
+        check("/app.css 含 :root 变量定义", b":root" in body)
+        st, ct, body = get("/app.js")
+        check("GET /app.js → 200 且 javascript", st == 200 and "javascript" in ct, f"{st} {ct}")
+        check("/app.js 含 use strict", b'"use strict"' in body)
+        # 不存在的源码路径不得泄露
+        st, ct, body = get("/app.py")
+        check("不存在的源码路径不泄露（404）", st == 404 and b"def main" not in body, f"{st}")
+        # 目录穿越防护：归一化后仍应被拒绝
+        st, ct, body = get("/%2e%2e/app.py")
+        check("目录穿越被拒绝（404/403）", st in (403, 404), f"{st} {ct}")
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
 def main() -> int:
     print("=" * 74)
     print("  Wiki-USB v1.2  自动化验收测试")
@@ -3447,6 +3504,7 @@ def main() -> int:
         test_lifecycle_shutdown()
         test_duplicate_url_detection(ctx)
         test_localhost_security(ctx)
+        test_static_assets_serving(ctx)
         test_schema_compatibility(ctx)
         test_atomic_io()
         test_inject_budget(ctx)

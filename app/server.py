@@ -347,6 +347,12 @@ class Handler(BaseHTTPRequestHandler):
             return self._serve_static(paths.VENDOR_DIR / posixpath.basename(path))
         if path.startswith("/static/"):
             return self._serve_static(paths.WEB_DIR / posixpath.basename(path))
+        # 拆分后的前端静态资源（Commit B）：app.css / app.js 位于 web 根目录，
+        # 可选的领域模块放在 /js/ 下（按 basename 提供，杜绝目录穿越）。
+        if path in ("/app.css", "/app.js"):
+            return self._serve_static(paths.WEB_DIR / path.lstrip("/"))
+        if path.startswith("/js/") and "/" not in path[len("/js/"):]:
+            return self._serve_static(paths.WEB_DIR / "js" / posixpath.basename(path))
         if path.startswith(archiver.ASSET_URL_PREFIX):
             return self._serve_asset(path[len(archiver.ASSET_URL_PREFIX):])
 
