@@ -3426,6 +3426,53 @@ def test_portable_containment() -> None:
             pass
 
 
+def test_chrome_fallback_ssrf() -> None:
+    """SSRF 红线：Headless Chrome fallback **不得**成为安全闸门的绕过口。
+
+    漏洞链（修复前真实存在）：
+        safe_fetch 安全拒绝 → html_text 为空 → 走到 Chrome fallback
+        → Chrome 自行解析 DNS 并代抓 → 内网地址被抓取
+    根因：Chrome 既不受 net_guard 的逐跳校验约束，也无法像 safe_fetch 那样
+    把校验过的 IP 钉住再连接，所以**必须在起子进程之前**先做同一套校验。
+    """
+    import inspect as _inspect
+
+    section("安全 / Headless Chrome 不得绕过 SSRF")
+
+    from app.core import crawler, net_guard
+
+    payloads = [
+        "http://169.254.169.254/latest/meta-data/",   # 云元数据（最经典）
+        "http://127.0.0.1:8080/admin",                 # 本机服务
+        "http://192.168.1.1/",                         # 内网网关
+        "http://10.0.0.5/internal",                    # 内网
+        "file:///etc/passwd",                          # 本地文件
+        "http://localhost:63342/api",                  # localhost
+    ]
+    leaked: list[str] = []
+    for u in payloads:
+        try:
+            crawler.fetch_with_chrome(u)
+            leaked.append(f"{u} -> 未被拦截")
+        except net_guard.SSRFBlocked:
+            pass                                        # 正确：在出口处就被挡住
+        except Exception as exc:                        # noqa: BLE001
+            # 走到别的分支说明 URL 校验没排在最前（例如直接去找 Chrome 可执行文件）
+            leaked.append(f"{u} -> {type(exc).__name__}: {exc}")
+    check("★ headless Chrome 出口对 SSRF payload 全拒（不代抓）",
+          not leaked, "; ".join(leaked)[:240])
+
+    # 源码级防删：将来若有人「顺手优化」掉这段，这条会立刻红。
+    src = _inspect.getsource(crawler.fetch_with_chrome)
+    check("★ fetch_with_chrome 内含 net_guard 校验（源码级防删）",
+          "resolve_and_validate" in src, src[:160])
+
+    # 安全拒绝必须**明确回传**给用户，不能被 fallback 吞成「页面抓取失败」
+    src2 = (paths.CORE_DIR / "crawler.py").read_text(encoding="utf-8")
+    check("★ SSRFBlocked 被单独捕获并回传原因（不被宽泛 except 吞掉）",
+          "except _net_guard.SSRFBlocked" in src2 and "安全策略已拒绝" in src2)
+
+
 # ==========================================================================
 def _isolate_data_dir() -> Path:
     """把测试用到的**一切数据路径**重定向到临时目录，并断言没有漏网之鱼。
@@ -3556,6 +3603,7 @@ def main() -> int:
         test_offline_assets()
         test_no_absolute_paths()
         test_portable_containment()
+        test_chrome_fallback_ssrf()
         from tests.test_converters import run as run_converter_tests
         run_converter_tests(check)
         # 发布完整性校验器自身也要被回归：一个永远返回「可交付」的校验器

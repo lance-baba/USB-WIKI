@@ -294,7 +294,29 @@ def chrome_executable() -> str | None:
 
 
 def fetch_with_chrome(url: str, timeout: float = 30.0) -> str:
-    """Headless Chrome 渲染抓取（沙箱隔离 + 强制清理临时 profile，PRD 4.2）。"""
+    """Headless Chrome 渲染抓取（沙箱隔离 + 强制清理临时 profile，PRD 4.2）。
+
+    ⚠ SSRF 闸门：**必须在起子进程之前**做完整校验。
+
+    为什么不能省：Chrome 会**自己**解析 DNS 并跟随重定向，既不受
+    :func:`net_guard.safe_fetch` 的逐跳校验约束，也无法像它那样把校验过的
+    IP 钉住后再连接。所以若这里不加闸门，下面这条链就是一条完整的 SSRF 绕过：
+
+        safe_fetch 安全拒绝 → html_text 为空 → 走到本函数的 Chrome fallback
+        → 被策略挡住的内网地址由 Chrome 代抓
+
+    这里复用与 ``safe_fetch`` **完全相同** 的 :func:`net_guard.resolve_and_validate`，
+    保证两条路径策略一致；不符策略时抛 :class:`net_guard.SSRFBlocked`。
+    """
+    if _net_guard is not None:
+        # 与 fetch_html 走同一个 allow_private_network 配置，避免
+        # 「HTTP 路放行、Chrome 路拒绝」或反之的策略漂移。
+        _net_guard.resolve_and_validate(
+            url,
+            allow_private_network=config.get_bool(
+                "CRAWLER", "allow_private_network", False),
+        )
+
     exe = chrome_executable()
     if not exe:
         raise RuntimeError("未找到本机 Chrome/Edge 可执行文件")
@@ -485,6 +507,11 @@ def capture_url(url: str, db=None, embedder=None, on_duplicate: str = "abort") -
         try:
             html_text = fetch_with_chrome(url)
             used = "headless-chrome"
+        except _net_guard.SSRFBlocked as exc:
+            # 安全拒绝**不能**被 headless fallback 悄悄吞掉 —— 否则用户拿到的
+            # 是含糊的「页面抓取失败」，却不知道其实是被安全策略挡住了。
+            err = f"安全策略已拒绝该地址：{exc}"
+            html_text = ""
         except Exception as exc:  # noqa: BLE001
             log.warning("Headless Chrome 抓取失败: %s", exc)
 
