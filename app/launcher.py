@@ -175,6 +175,24 @@ def main(argv: list[str] | None = None) -> int:
             log.error("安全退出异常: %s", exc)
         log.info("安全退出完成，用时 %.0fms", (time.time() - t0) * 1000)
 
+    # 2.5) 索引结构兼容预检 —— 放在**绑定端口之前**：
+    # 「索引由更新版本创建」时必须拒绝启动，而不是带病跑起来再报错。
+    from app.core import migrations as _migrations  # noqa: PLC0415
+    from app.core import paths as _paths            # noqa: PLC0415
+    try:
+        _state = _migrations.needs_migration(_paths.CACHE_DB)
+    except Exception:                                # noqa: BLE001
+        _state = _migrations.FRESH
+    if _state == _migrations.DOWNGRADE:
+        _probe = _migrations.probe(_paths.CACHE_DB)
+        print(
+            "\n  无法打开该知识库：索引结构为 " + _probe.version
+            + "，而当前程序只支持 " + _migrations.CURRENT_SCHEMA_VERSION + "。"
+            + "\n  该索引由更新版本的 USB-WIKI 创建，请升级 USB-WIKI 后再打开。"
+            + "\n  （不会自动重建或降级，以免破坏新版本产生的数据状态）\n",
+            file=sys.stderr,
+        )
+        sys.exit(2)
     # 3) 先起服务框架（此时 /api/status 返回 ready:false，前端显示初始化中）
     try:
         server = Server((host, port), ctx, on_shutdown=on_exit)

@@ -749,6 +749,166 @@ def test_original_preview(ctx) -> None:
     check("Office 文档不内联（走下载）", ".docx" not in Handler.INLINE_TYPES)
 
 
+def test_schema_compatibility(ctx) -> None:
+    """索引结构版本兼容：只读探测 → 判版本 → 决定动作（**不做 migration framework**）。
+
+    设计前提：Markdown 是真相源、cache.db 是纯派生索引，所以升级策略是
+    「备份 + 全量重建」，而不是维护 ALTER 链。
+
+    本次修复的核心缺陷：`init_schema()` 曾用 `INSERT OR REPLACE` 写版本号，
+    于是**旧库一被打开，版本证据就被抹掉**，之后再也判断不出它原本是哪一版。
+    下面第 ⑫ 项就是这条的 regression test。
+    """
+    section("索引结构版本兼容（不做 migration framework）")
+    import hashlib
+    import sqlite3
+    import tempfile
+    from pathlib import Path
+
+    from app.core import db as dbmod
+    from app.core import indexer, migrations as M
+    from app.core import search as search_mod
+
+    tmp = Path(tempfile.mkdtemp(prefix="wikiusb_schema_"))
+    cache = tmp / "cache.db"
+
+    def set_version(path: Path, value: str) -> None:
+        c = sqlite3.connect(str(path))
+        c.execute("INSERT OR REPLACE INTO sys_meta(key, value) VALUES(?,?)",
+                  (M.META_SCHEMA_VERSION, value))
+        c.commit()
+        c.close()
+
+    def make_db(path: Path) -> dbmod.Database:
+        d = dbmod.Database(db_path=path, embedding_dim=64)
+        d.init_schema()
+        return d
+
+    # ① 无数据库 → fresh，且探测本身不得建出空库
+    check("① 无库 → fresh", M.needs_migration(cache) == M.FRESH, M.needs_migration(cache))
+    check("   只读探测不会创建数据库文件", not cache.exists())
+
+    # ② 当前版本 → OK，且重复 init_schema 不改写版本
+    d1 = make_db(cache)
+    check("② 新库写入当前版本", M.get_schema_version(cache) == M.CURRENT_SCHEMA_VERSION,
+          M.get_schema_version(cache))
+    check("   版本一致 → ok", M.needs_migration(cache) == M.OK)
+    d1.init_schema()
+    d1.init_schema()
+    check("   重复初始化后版本仍是同一个（不被改写）",
+          M.get_schema_version(cache) == M.CURRENT_SCHEMA_VERSION)
+
+    # ⑫ regression：init_schema 绝不能把旧版本静默改成当前版本
+    set_version(cache, "1.2")
+    d1.init_schema()
+    check("⑫ init_schema() 不会把旧版本静默改成当前版本（本次缺陷的 regression）",
+          M.get_schema_version(cache) == "1.2", M.get_schema_version(cache))
+    d1.checkpoint_and_close()
+
+    # ⑪ 用户 Markdown 在升级过程中不得被改动
+    mark = {p.name: hashlib.sha256(p.read_bytes()).hexdigest()
+            for p in sorted(paths.NOTES_DIR.glob("*.md"))}
+    if not mark:
+        (paths.NOTES_DIR / "_probe.md").write_text("---\ntitle: probe\n---\n\n正文\n", encoding="utf-8")
+        mark = {p.name: hashlib.sha256(p.read_bytes()).hexdigest()
+                for p in sorted(paths.NOTES_DIR.glob("*.md"))}
+
+    # ③ 老版本 → upgrade：备份 + 清缓存（重建交给全量索引）
+    check("③ 旧库 → upgrade", M.needs_migration(cache) == M.UPGRADE, M.needs_migration(cache))
+    info = M.migrate(cache)
+    check("   动作是 rebuild", info["action"] == "rebuild", str(info))
+    check("   旧索引已备份且备份文件存在",
+          bool(info["backup"]) and Path(info["backup"]).exists(), str(info["backup"]))
+    check("   旧索引已被清走（交由全量重建）", not cache.exists())
+    after = {p.name: hashlib.sha256(p.read_bytes()).hexdigest()
+             for p in sorted(paths.NOTES_DIR.glob("*.md"))}
+    check("⑪ 升级全程未改动任何用户 Markdown", after == mark,
+          f"{set(mark) ^ set(after)}")
+
+    # ④ 比程序新 → 拒绝（不重建 / 不覆盖 / 不降级）
+    make_db(cache)
+    set_version(cache, "9.9")
+    check("④ 库比程序新 → downgrade", M.needs_migration(cache) == M.DOWNGRADE,
+          M.needs_migration(cache))
+    raised = ""
+    try:
+        M.migrate(cache)
+    except M.SchemaTooNewError as exc:
+        raised = str(exc)
+    check("   拒绝升级并抛出 SchemaTooNewError", bool(raised), raised)
+    check("   提示文案是人话（含「请升级」）", "升级" in raised and "9.9" in raised, raised)
+    check("   拒绝时库文件仍在、版本未被改写",
+          cache.exists() and M.get_schema_version(cache) == "9.9",
+          M.get_schema_version(cache))
+
+    # ⑤ / ⑥ 版本缺失、非法 → unknown（保守走重建），且不崩
+    c = sqlite3.connect(str(cache))
+    c.execute("DELETE FROM sys_meta WHERE key=?", (M.META_SCHEMA_VERSION,))
+    c.commit(); c.close()
+    check("⑤ 版本行缺失 → unknown", M.needs_migration(cache) == M.UNKNOWN,
+          M.needs_migration(cache))
+    set_version(cache, "not-a-version")
+    check("⑥ 版本号非法 → unknown（不抛异常）", M.needs_migration(cache) == M.UNKNOWN,
+          M.needs_migration(cache))
+    # sys_meta 表整体缺失（被外部工具动过）
+    c = sqlite3.connect(str(cache)); c.execute("DROP TABLE sys_meta"); c.commit(); c.close()
+    check("⑥b sys_meta 表缺失 → unknown", M.needs_migration(cache) == M.UNKNOWN,
+          M.needs_migration(cache))
+
+    # ⑦ 升级中途失败（备份失败）→ 中止且**不删任何数据**
+    make_db(cache)
+    set_version(cache, "1.2")
+    real_backup = M.backup_cache
+    M.backup_cache = lambda *a, **k: None            # 模拟备份失败
+    try:
+        failed = ""
+        try:
+            M.migrate(cache)
+        except RuntimeError as exc:
+            failed = str(exc)
+    finally:
+        M.backup_cache = real_backup
+    check("⑦ 备份失败时中止升级并报错", bool(failed), failed)
+    check("   中止时未删除任何数据库文件（有退路才敢动数据）", cache.exists())
+
+    # ⑧⑨⑩ 全量重建后的完整性（用隔离环境 + 夹具笔记）
+    for name, body in NOTES.items():
+        (paths.NOTES_DIR / name).write_text(body, encoding="utf-8")
+    cache2 = tmp / "rebuilt.db"
+    d2 = dbmod.Database(db_path=cache2, embedding_dim=ctx.db.embedding_dim)
+    d2.init_schema()
+    rep = indexer.rebuild_all(d2, ctx.embedder)
+    stats = d2.stats()
+    notes_md = list(paths.NOTES_DIR.glob("*.md"))
+    check("⑧ 重建后文档数量与笔记文件数一致",
+          stats["docs"] == len(notes_md), f"docs={stats['docs']} files={len(notes_md)} rep={rep}")
+    res = search_mod.hybrid_search(d2, ctx.embedder, "注意力机制", top_k_parents=3)
+    check("⑨ 重建后 FTS 可检索（能召回）",
+          len(res.references) > 0 or res.counts.get("fts_candidates", 0) > 0,
+          f"route={res.route} counts={res.counts}")
+    check("⑩ 重建后向量表状态正确",
+          d2.vec_table_ready and not d2.signature_mismatch,
+          f"ready={d2.vec_table_ready} mismatch={d2.signature_mismatch}")
+    d2.checkpoint_and_close()
+
+    # 探测函数本身是只读的（静态断言）
+    src = (paths.CORE_DIR / "migrations.py").read_text(encoding="utf-8")
+    check("探测使用只读 URI 连接（mode=ro）", "mode=ro" in src and "uri=True" in src)
+    import re as _re
+
+    # 剥掉文档字符串再断言：模块 docstring 里解释「为什么不做 ALTER」时会提到它，
+    # 那是说明而不是实现。这里只保证**可执行代码里没有**增量迁移。
+    _code = _re.sub(r'""".*?"""', "", src, flags=_re.S)
+    check("可执行代码中不使用 ALTER TABLE（本阶段刻意不做增量迁移）",
+          "ALTER TABLE" not in _code.upper(),
+          str([ln.strip()[:60] for ln in _code.splitlines() if "ALTER TABLE" in ln.upper()]))
+
+    try:
+        import shutil
+        shutil.rmtree(tmp, ignore_errors=True)
+    except OSError:
+        pass
+
 def test_atomic_io() -> None:
     """原子写：用户资产（Markdown / 原件 / config）的异常安全。
 
@@ -1231,6 +1391,7 @@ def main() -> int:
         # 测试不依赖外部 AI 服务：provider 用内存态覆盖（persist=False，不碰 config.ini）
         config.update({"AI": {"provider": "offline"}}, persist=False)
 
+        test_schema_compatibility(ctx)
         test_atomic_io()
         test_inject_budget(ctx)
         test_ingest_analysis_and_graph(ctx)

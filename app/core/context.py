@@ -10,6 +10,7 @@ import time
 from dataclasses import dataclass, field
 
 from .db import SCHEMA_VERSION  # noqa: E402
+from . import migrations as migrations_mod  # noqa: E402
 from . import config, db as db_mod, embedder as embedder_mod, indexer, llm, net_util, paths, sync
 from .log_util import get_logger
 
@@ -28,6 +29,9 @@ class AppContext:
     started_at: float = 0.0
     boot_report: dict = field(default_factory=dict)
     _boot_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    # 索引结构升级状态（由 boot 的版本检查填写）
+    _needs_full_rebuild: bool = False
+    _migration: dict = field(default_factory=dict)
 
     # ------------------------------------------------------------------
     def boot(self, db_path=None, start_syncer: bool = True, probe_ollama: bool = True) -> dict:
@@ -40,6 +44,23 @@ class AppContext:
 
             # 1) WAL 残留自愈（必须在任何连接建立之前）
             healed = db_mod.wal_self_heal(db_path)
+
+            # 1.5) 索引结构版本检查 —— **必须早于任何建表动作**。
+            # 旧代码顺序是「先跑完 CREATE TABLE IF NOT EXISTS 再写版本号」，那会让程序先
+            # 部分修改旧库、之后才发现版本不对；版本号还会被 INSERT OR REPLACE 静默改写，
+            # 从此查不出它原本是哪一版。现在改为：只读探测 → 判版本 → 决定动作。
+            self._needs_full_rebuild = False
+            # db_path 可为 None（用默认位置）—— 必须显式解析，
+            # 否则探测会拿到 None 而抛 TypeError。
+            _cache_path = db_path or paths.CACHE_DB
+            self._migration = migrations_mod.rebuild_cache_if_incompatible(_cache_path)
+            _act = self._migration.get("action")
+            if _act == "rebuild":
+                # 索引结构已变：旧库已备份并清空，稍后 Schema 建好再全量重建
+                self._needs_full_rebuild = True
+                self.notes.append(self._migration.get("message", ""))
+            elif _act == "create":
+                self.notes.append(self._migration.get("message", ""))
 
             # 2) 打开主库（此时仅建立连接，Schema 推迟到确定真实向量维度之后再建）
             dim = config.get_int("AI", "embedding_dim", 512)
@@ -58,8 +79,6 @@ class AppContext:
             self.warnings.extend(resolved.warnings)
             self.notes.extend(resolved.notes)
 
-        # 索引结构变更（如新增派生表）时，旧库不会自动补齐 —— 如实告知并可一键重建。
-        # 刻意不自动重建：大库重建耗时且会占 IO，应由用户决定时机（设置页有按钮）。
             self.gateway.embedder = self.embedder
 
             # 5) ⚠ 用真实维度建向量表。Ollama / API 的维度由模型决定（自动探测得到），
@@ -70,6 +89,27 @@ class AppContext:
                 log.info("向量表维度跟随嵌入模型：%d -> %d", self.db.embedding_dim, actual_dim)
                 self.db.embedding_dim = actual_dim
             self.db.init_schema()
+
+            # 3.5) 结构升级后的一次性全量重建。
+            # 用重建而非增量迁移：Markdown 是真相源、cache.db 是纯派生索引，维护 ALTER 链
+            # 只会增加错误面。注意：**只重建索引，绝不改动 data/notes**。
+            if self._needs_full_rebuild:
+                try:
+                    from . import indexer as _indexer  # noqa: PLC0415
+
+                    rep = _indexer.rebuild_all(self.db, self.embedder)
+                    log.info("结构升级后全量重建完成: %s", rep)
+                    self.notes.append(
+                        f"索引已按新结构重建：{rep.get('indexed', 0)} 篇 / "
+                        f"{rep.get('chunks', 0)} 切片"
+                    )
+                except Exception as exc:  # noqa: BLE001 - 重建失败不阻断启动，但必须明示
+                    log.error("结构升级后全量重建失败: %s", exc)
+                    self.warnings.append(
+                        "索引结构已升级，但全量重建失败，请到「设置」页手动点一次「全量重建索引」"
+                    )
+                finally:
+                    self._needs_full_rebuild = False
 
             # 6) 向量空间签名守卫
             model_name = config.get_str("AI", "embedding_model_name", "bge-small-zh-q4")
