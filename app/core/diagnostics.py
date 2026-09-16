@@ -340,12 +340,19 @@ def _runtime_probe() -> dict:
 
     portable = (Path(sys.executable).resolve().parent.parent / "python-3.11-embed").is_dir() or \
                "python-3.11-embed" in str(Path(sys.executable).resolve())
+    # release 依赖锁的 SHA256 —— 让诊断/未来 BUILD_INFO 能报告「当前程序到底是不是
+    # 官方那套依赖闭包」，无需把整份清单塞进输出。lock 缺失时返回 None（开发环境可能无）。
+    lock_sha = None
+    lock_path = Path(__file__).resolve().parent.parent.parent / "requirements-release.lock"
+    if lock_path.is_file():
+        lock_sha = hashlib.sha256(lock_path.read_bytes()).hexdigest()
     return {
         "python_version": sys.version.split()[0],
         "os": os.name,
         "machine": platform.machine() or None,
         "portable_runtime": bool(portable),
         "frozen": bool(getattr(sys, "frozen", False)),
+        "dependency_lock_sha256": lock_sha,
     }
 
 

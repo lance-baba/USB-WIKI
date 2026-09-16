@@ -42,12 +42,12 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
           cache: pip
-          cache-dependency-path: requirements.txt
+          cache-dependency-path: requirements-release.lock
 
-      - name: 安装依赖
+      - name: 安装依赖（release lock，可复现验证）
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install -r requirements-release.lock
 
       # 环境自检：确认测试确实是在「干净环境」下跑的
       # （无嵌入式 runtime、无 onnxruntime），否则「降级链」相关断言等于没测

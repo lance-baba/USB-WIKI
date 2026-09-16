@@ -1076,6 +1076,76 @@ def test_fake_ip_compat(ctx) -> None:
     print("      TUN 模式：proxy_active=False → 钉住 Fake-IP 直连 → TUN 网卡接管，代理还原真实目标")
     print("      系统代理模式：proxy_active=True → 代理建连（Fake-IP 对代理内部透明）")
 
+def test_dependency_consistency() -> None:
+    """Release 依赖锁一致性：requirements.txt 直接依赖必须都在 lock 中 == 精确锁定。
+
+    这是 dependency release lock 的核心不变量 —— 锁是「未来重新构建得到同一套依赖」
+    的保证，绝不能出现「源清单有、锁里没有/只有浮动区间」的漂移。
+    """
+    root = Path(__file__).resolve().parent.parent
+    import hashlib
+    import re
+    req = root / "requirements.txt"
+    lock = root / "requirements-release.lock"
+    check("★ release lock 文件存在", lock.is_file(), str(lock))
+
+    def canon(name: str) -> str:
+        return name.lower().replace("_", "-").replace(".", "-")
+
+    # 解析 requirements.txt 的直接依赖（跳过空行 / 整行与行尾注释）
+    direct: dict[str, str] = {}
+    for raw in req.read_text(encoding="utf-8").splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        name = line.split("==")[0].split(">=")[0].split("~=")[0].split("[")[0].strip()
+        direct[canon(name)] = line
+
+    # 解析 lock：建立 canonical name -> 原始锁定行
+    lock_lines = [l for l in lock.read_text(encoding="utf-8").splitlines()
+                  if l.strip() and not l.lstrip().startswith("#")]
+    lock_map: dict[str, str] = {}
+    for l in lock_lines:
+        name = canon(l.split("==")[0].split("[")[0].split(";")[0].strip())
+        lock_map[name] = l
+
+    # ① 每个直接依赖都必须在 lock 中，且是 == 精确锁定（不允许 >= ~= 漂移）
+    for cname, raw in direct.items():
+        locked = lock_map.get(cname)
+        check(f"★ 直接依赖 {raw} 已进入 release lock", locked is not None,
+              f"lock 中缺失 {raw}")
+        if locked:
+            pinned = locked.split(";")[0].strip()
+            check(f"★ 直接依赖 {raw} 在 lock 中为 == 精确锁定", "==" in pinned,
+                  f"lock 行: {locked}")
+
+    # ② lock 不得混入构建期工具 / 非运行依赖
+    forbidden = {"pip", "setuptools", "wheel", "pytest", "pip-tools"}
+    leaked = [l for c, l in lock_map.items() if c in forbidden]
+    check("★ release lock 未混入构建/测试期依赖（pip/setuptools/wheel/pytest/pip-tools）",
+          not leaked, f"泄漏: {leaked}")
+
+    # ③ lock 内不应有任何浮动区间（>= ~= < 等）—— 锁定必须全部 ==
+    floating = [l for l in lock_lines if re.search(r"(>=|~=|<=|>|<)[0-9]", l.split(";")[0])]
+    check("★ release lock 内无浮动版本区间（全部 ==）", not floating,
+          f"浮动: {floating[:3]}")
+
+    # ④ lock SHA256 为合法 64 位十六进制（供 diagnostics / BUILD_INFO 报告）
+    sha = hashlib.sha256(lock.read_bytes()).hexdigest()
+    check("★ release lock SHA256 为 64 位十六进制", bool(re.fullmatch(r"[0-9a-f]{64}", sha)),
+          sha)
+
+    # ⑤ 与 diagnostics 集成：运行时探针能算出同一 SHA256
+    try:
+        from app.core import diagnostics  # noqa: PLC0415
+        rt = diagnostics._runtime_probe()
+        reported = rt.get("dependency_lock_sha256")
+        check("★ diagnostics 报告 dependency_lock_sha256", reported == sha,
+              f"报告={reported} 实际={sha}")
+    except Exception as exc:  # noqa: BLE001
+        check("★ diagnostics 探针可读取 lock SHA256", False, f"{type(exc).__name__}: {exc}")
+
+
 def test_manifest_recovery() -> None:
     """Data Contract 收尾：manifest 损坏与 legacy library 的安全接管。
 
@@ -3360,6 +3430,7 @@ def main() -> int:
         test_diagnostics(ctx)
         test_fake_ip_compat(ctx)
         test_manifest_recovery()
+        test_dependency_consistency()
         test_library_contract()
         test_single_version_source(ctx)
         from tests.test_rag_regression import run as _run_rag

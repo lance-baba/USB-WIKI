@@ -8,8 +8,14 @@
 
 用法：
     python setup_runtime_windows.py                # 精简安装（约 65MB，需联网一次）
+    python setup_runtime_windows.py --dev           # 开发安装：用 requirements.txt 浮动区间
     python setup_runtime_windows.py --with-onnx    # 同时启用本地 ONNX 嵌入引擎
     python setup_runtime_windows.py --check        # 仅体检现有运行时
+
+依赖来源：
+    发布构建默认读取 requirements-release.lock（== 精确锁定、可复现）；
+    --dev 才用 requirements.txt（兼容区间）。lock 由
+    scripts/lock_dependencies.py 从 requirements.txt 重新生成。
 
 ⚠ 本脚本可被宿主 Python 运行，但**只向 U 盘目录内写入**，不触碰注册表与系统环境。
 """
@@ -41,9 +47,13 @@ ONNX_MODEL_URL = (
     "https://huggingface.co/BAAI/bge-small-zh-v1.5/resolve/main/onnx/model_quantized.onnx"
 )
 
-# 依赖清单的**唯一来源** —— 与 Linux/macOS 启动脚本、CI 共用同一份，
-# 避免多份列表互相漂移（历史教训：曾出现 requirements.txt 有、本脚本没有的依赖）。
+# 依赖清单：两份，职责不同（见 docs/DEPENDENCY_LOCK.md）
+#   requirements.txt            —— 直接依赖 + 兼容区间，用于开发安装（浮动解析）
+#   requirements-release.lock   —— 完整闭包 + == 精确锁定，用于发布构建 / CI（可复现）
+# 两者必须保持一致：scripts/lock_dependencies.py 从 requirements.txt 生成 lock，
+# tests/test_suite.py 的 test_dependency_consistency 校验直接依赖都已在 lock 中 == 锁定。
 REQ_FILE: Path = BASE / "requirements.txt"
+LOCK_FILE: Path = BASE / "requirements-release.lock"
 
 # 可选重型依赖：仅在 --with-onnx 时安装。
 # onnxruntime + numpy 约 +140MB，且缺少模型文件时**不提供任何能力**，
@@ -53,10 +63,10 @@ ONNX_REQUIREMENTS = ["onnxruntime>=1.17"]
 
 
 def load_requirements(path: Path | None = None) -> list[str]:
-    """从 requirements.txt 解析核心依赖。
+    """解析依赖清单（按行，跳过空行 / 整行与行尾注释）。
 
-    跳过空行、整行注释与行尾注释；因此文件里**被注释掉的 `# onnxruntime>=1.17`
-    不会被装上**——这正是「可选依赖」的表达方式。
+    默认读 *path*；本脚本发布构建默认传 LOCK_FILE（精确锁定），
+    ``--dev`` 时传 REQ_FILE（浮动区间）。
     """
     target = path or REQ_FILE
     if not target.exists():
@@ -134,7 +144,7 @@ def step2_patch_pth() -> None:
         log(f"    {line}")
 
 
-def step3_install_deps(mirror: bool) -> None:
+def step3_install_deps(mirror: bool, dev: bool = False) -> None:
     SITE_PACKAGES.mkdir(parents=True, exist_ok=True)
     getpip = RUNTIME / "get-pip.py"
     if not (SITE_PACKAGES / "pip").exists():
@@ -146,12 +156,16 @@ def step3_install_deps(mirror: bool) -> None:
         )
         getpip.unlink(missing_ok=True)
 
-    deps = load_requirements()          # 单一来源：requirements.txt
+    # 发布构建默认用 **release lock**（== 精确锁定，可复现）；
+    # 开发模式（--dev）才用 requirements.txt 的浮动区间。
+    src = LOCK_FILE if (LOCK_FILE.exists() and not dev) else REQ_FILE
+    deps = load_requirements(src)
     cmd = [str(EMBED_PY), "-m", "pip", "install", "--no-warn-script-location",
            "--disable-pip-version-check", *deps]
     if mirror:
         cmd += ["-i", MIRROR_INDEX]
-    log(f"从 {REQ_FILE.name} 安装 {len(deps)} 项核心依赖：" + " ".join(deps))
+    log(f"从 {src.name} 安装 {len(deps)} 项核心依赖（{'精确锁定' if src is LOCK_FILE else '浮动区间'}）："
+        + " ".join(deps[:6]) + (" …" if len(deps) > 6 else ""))
     result = subprocess.run(cmd, cwd=str(EMBED_DIR))
     if result.returncode != 0:
         raise SystemExit("[setup] 依赖安装失败，请检查网络后重试")
@@ -232,6 +246,8 @@ def main() -> int:
     ap.add_argument("--check", action="store_true", help="仅体检，不做任何修改")
     ap.add_argument("--with-onnx", action="store_true", help="额外下载本地 ONNX 嵌入模型")
     ap.add_argument("--no-mirror", action="store_true", help="不使用清华 PyPI 镜像")
+    ap.add_argument("--dev", action="store_true",
+                   help="开发安装：用 requirements.txt 的浮动区间而非 release lock")
     ap.add_argument("--force", action="store_true", help="重装依赖")
     args = ap.parse_args()
 
@@ -252,7 +268,7 @@ def main() -> int:
     if args.force and SITE_PACKAGES.exists():
         shutil.rmtree(SITE_PACKAGES, ignore_errors=True)
         log("已清空旧的 site-packages（--force）")
-    step3_install_deps(mirror=not args.no_mirror)
+    step3_install_deps(mirror=not args.no_mirror, dev=args.dev)
     if args.with_onnx:
         step4_onnx(mirror=not args.no_mirror)
     else:
