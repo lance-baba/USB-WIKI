@@ -17,11 +17,11 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from .core import (archiver, config, crawler, graph as graph_mod, paths,
+from .core import (archiver, config, crawler, paths,
                    redact as redact_mod, search as search_mod,
-                   security as security_mod,
-                   topics as topics_mod)
-from .api import config as api_config, diagnostics as api_diagnostics, system as api_system
+                   security as security_mod)
+from .api import (ask as api_ask, config as api_config, diagnostics as api_diagnostics,
+                  search as api_search, system as api_system)
 from .core.context import AppContext, get_ctx
 from .core.log_util import get_logger
 
@@ -367,6 +367,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         if api_diagnostics.handle_get(self, path):
             return
+        if api_search.handle_get(self, path):
+            return
+        if api_ask.handle_get(self, path):
+            return
 
         if path == "/api/notes":
             limit = int((q.get("limit") or ["200"])[0])
@@ -391,58 +395,10 @@ class Handler(BaseHTTPRequestHandler):
                 {"ok": True, "data": {"duplicate": bool(found), "existing": found or None}}
             )
 
-        if path == "/api/topics":
-            try:
-                min_docs = int((q.get("min_docs") or ["2"])[0])
-            except ValueError:
-                min_docs = 2
-            data = topics_mod.build_topics(self.ctx.db, min_docs=max(1, min(20, min_docs)))
-            return self._send_json({"code": 200, "data": data})
-
-        if path == "/api/graph":
-            thr = float((q.get("threshold") or [str(config.get_float("GRAPH", "semantic_threshold", 0.82))])[0])
-            thr = max(0.0, min(1.0, thr))
-            term_thr = float(
-                (q.get("term_threshold") or [str(config.get_float("GRAPH", "term_threshold", 0.10))])[0]
-            )
-            term_thr = max(0.0, min(1.0, term_thr))
-            # 向量边默认关闭：它依赖嵌入源，且会引入「语义相近但无关」的噪声边。
-            # 需要时用 ?use_vectors=1 显式打开。
-            use_vec = (q.get("use_vectors") or ["0"])[0] == "1"
-            g = graph_mod.build_graph(
-                self.ctx.db, threshold=thr, term_threshold=term_thr, use_vectors=use_vec
-            )
-            return self._send_json({"code": 200, "data": g})
-
-        if path == "/api/search":
-            query = (q.get("q") or [""])[0]
-            top_k = int((q.get("top_k") or ["5"])[0])
-            res = search_mod.hybrid_search(self.ctx.db, self.ctx.embedder, query, top_k_parents=top_k)
-            return self._send_json(
-                {
-                    "code": 200,
-                    "data": {
-                        "route": res.route,
-                        "counts": res.counts,
-                        "references": [r.__dict__ for r in res.references],
-                        "warnings": res.warnings,
-                    },
-                }
-            )
-
         if path == "/api/import/formats":
             from .core import converters  # noqa: PLC0415
 
             return self._send_json({"code": 200, "data": converters.supported_extensions()})
-
-        if path == "/api/ollama/models":
-            host = (q.get("host") or [""])[0] or None
-            if self.ctx.gateway is None:
-                return self._send_json(
-                    {"code": 503, "message": "服务尚未初始化完成", "data": {"available": False, "models": []}}
-                )
-            info = self.ctx.gateway.list_ollama_models(host)
-            return self._send_json({"code": 200, "data": info})
 
         return self._send_json({"code": 404, "message": "接口不存在"}, 404)
 
@@ -455,9 +411,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         if api_config.handle_post(self, path):
             return
-
-        if path == "/api/chat/completions":
-            return self._chat()
+        if api_ask.handle_post(self, path):
+            return
 
         if path == "/api/capture/url":
             body = self._read_json()
@@ -488,42 +443,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/notes/import":
             return self._import_notes()
 
-        if path == "/api/ai/test":
-            body = self._read_json()
-            target = str(body.get("target") or "ollama").lower()
-            if self.ctx.gateway is None:
-                return self._send_json({"code": 503, "message": "服务尚未初始化完成"}, 503)
-            if target == "ollama":
-                result = self.ctx.gateway.test_ollama(str(body.get("model") or "") or None)
-            elif target == "api":
-                result = self.ctx.gateway.test_api()
-            else:
-                return self._send_json({"code": 400, "message": "target 仅支持 ollama / api"}, 400)
-            return self._send_json({"code": 200 if result.get("ok") else 200, "data": result})
-
         return self._send_json({"code": 404, "message": "接口不存在"}, 404)
 
     # ------------------------------------------------------------------
-    def _chat(self) -> None:
-        body = self._read_json()
-        query = str(body.get("query") or "").strip()
-        history = body.get("history")
-        if not isinstance(history, list):
-            history = []
-
-        self._sse_start()
-        try:
-            for frame in self.ctx.gateway.stream_chat(query, history):
-                if not self._sse_write(f"data: {json.dumps(frame, ensure_ascii=False)}\n\n"):
-                    break
-        except Exception as exc:  # noqa: BLE001
-            log.error("SSE 推流异常: %s", exc)
-            self._sse_write(
-                f"data: {json.dumps({'type': 'error', 'message': str(exc)}, ensure_ascii=False)}\n\n"
-            )
-        finally:
-            self._sse_end()
-
     def _import_notes(self) -> None:
         """批量导入文件（拖拽上传落点）。
 
