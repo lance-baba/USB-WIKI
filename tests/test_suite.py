@@ -217,6 +217,21 @@ def test_crawler(ctx) -> None:
             skip(_n, "离线模式（WIKIUSB_SKIP_NET=1）")
     else:
         r1 = crawler.capture_url("https://example.com/", db=ctx.db, embedder=ctx.embedder)
+
+        # SSRF 策略拒绝属**环境问题**：某些网络/代理会把公网域名解析成非公网地址
+        # （本机实测 example.com → 198.18.0.120），此时拒绝是**正确行为**，
+        # 不该算被测对象失败 → 六条一起记 SKIP。判断必须放在第一条 check 之前。
+        if "公网地址" in r1.message:
+            for _n in NET_CASES:
+                skip(_n, "目标被 SSRF 策略拒绝（当前网络解析到非公网地址）")
+            bad = crawler.capture_url("ftp://x", db=None)
+            check("非法协议被拒绝", not bad.ok and "http" in bad.message)
+            note = crawler.save_manual_note(
+                "手工测试笔记", "手工录入的注意力机制要点。", db=ctx.db, embedder=ctx.embedder
+            )
+            check("剪贴板录入通道可用", note.ok and paths.abs_from_data(note.file_path).exists())
+            return
+
         check(NET_CASES[0], r1.status == "partial_fallback", str(r1.to_dict())[:200])
         check(NET_CASES[1], bool(r1.snapshot_path) and paths.abs_from_data(r1.snapshot_path).exists())
         check(NET_CASES[2], "前端动态渲染" in r1.message)
@@ -227,6 +242,9 @@ def test_crawler(ctx) -> None:
         )
         # 外网/代理不可达属**环境问题**，不是被测对象失败 —— 记 SKIP 而非 FAIL，
         # 但三条仍然登记，保证总数不变。
+        # SSRF 策略拒绝也算**环境问题**：某些网络/代理会把公网域名解析成
+        # 非公网地址（本机实测 example.com → 198.18.0.120），此时拒绝是正确行为，
+        # 不该算被测对象失败 → 记 SKIP。
         net_err = (not r2.ok) and any(
             k in r2.message for k in ("urlopen error", "ProxyError", "Tunnel connection", "HTTP 0")
         )
@@ -783,6 +801,285 @@ def test_original_preview(ctx) -> None:
     check("Office 文档不内联（走下载）", ".docx" not in Handler.INLINE_TYPES)
 
 
+def test_ssrf_guard(ctx) -> None:
+    """SSRF 防护：公网白名单 + 钉住 IP + 逐跳校验重定向。
+
+    ## 为什么不能只判断一次 IP 就放行
+
+    「解析 → 是公网 → 用 hostname 发请求」有 TOCTOU 窗口：建连时会**再解析一次**，
+    攻击者让域名第一次返回公网、第二次返回 127.0.0.1 即可绕过（DNS rebinding）。
+    本实现把校验过的 IP **钉住**，连接时不再解析。
+
+    ## 测试策略：确定性
+
+    核心回归**不依赖公共 DNS**（CI 必须可复现）：
+    * 解析器可注入 —— 想让它返回什么就返回什么
+    * redirect 用**真实本地 HTTP server** 验证行为
+    * 公共 DNS 只作为可选集成项，不作为成败条件
+    """
+    section("SSRF 防护（公网白名单 / 钉住 IP / 逐跳校验）")
+    import http.server
+    import ipaddress
+    import socket
+    import threading
+    import time
+
+    from app.core import net_guard as G
+
+    def fake(*ips):
+        """构造一个返回指定地址的解析器。"""
+        def _r(host, port):
+            return [ipaddress.ip_address(x) for x in ips]
+        return _r
+
+    def blocked(url, want=None, **kw):
+        """被拒绝（且原因符合预期）→ 返回 None；否则返回诊断串。
+
+        注意语义方向：**None 表示「正确拦截了」**。
+        """
+        try:
+            G.resolve_and_validate(url, **kw)
+        except G.SSRFBlocked as exc:
+            if want is None or exc.reason == want:
+                return None
+            return f"{exc.reason} != {want}"
+        return "未被拒绝（应拒绝）"
+
+    def allowed(url, **kw):
+        """**应放行**：放行返回 None，被拒绝则返回原因码。"""
+        try:
+            G.resolve_and_validate(url, **kw)
+            return None
+        except G.SSRFBlocked as exc:
+            return exc.reason
+
+    # ---------- ① 危险地址一律拒绝（用 is_global + 排除组播，而非手写网段）----------
+    DANGEROUS = {
+        "http://127.0.0.1/": "loopback",
+        "http://127.0.0.5/": "loopback 整段",
+        "http://[::1]/": "IPv6 loopback",
+        "http://10.0.0.1/": "RFC1918",
+        "http://172.16.0.1/": "RFC1918",
+        "http://192.168.1.1/": "RFC1918",
+        "http://169.254.169.254/": "link-local / 云 metadata",
+        "http://100.64.0.1/": "CGNAT",
+        "http://224.0.0.1/": "multicast（is_global 竟为 True）",
+        "http://240.0.0.1/": "reserved",
+        "http://0.0.0.0/": "unspecified",
+        "http://[ff02::1]/": "IPv6 multicast（is_global 竟为 True）",
+        "http://[fe80::1]/": "IPv6 link-local",
+        "http://[fc00::1]/": "IPv6 ULA",
+        "http://[::ffff:127.0.0.1]/": "IPv4-mapped loopback",
+        "http://[::ffff:10.0.0.1]/": "IPv4-mapped private",
+        "http://198.18.0.1/": "benchmark",
+        "http://192.0.0.1/": "IETF 保留",
+    }
+    for url, label in DANGEROUS.items():
+        got = blocked(url, "TARGET_NOT_PUBLIC")
+        check(f"拒绝 {label}", got is None, f"{url} → {got}")
+
+    # ---------- ② 奇怪 IP 表达不能绕过（解析成真实 IP 后再判）----------
+    WEIRD = {
+        "http://2130706433/": "十进制 127.0.0.1",
+        "http://0x7f000001/": "十六进制 127.0.0.1",
+        "http://017700000001/": "八进制 127.0.0.1",
+        "http://127.1/": "简写 127.0.0.1",
+        "http://0/": "0.0.0.0 的整数形式",
+        "http://[0:0:0:0:0:0:0:1]/": "展开的 IPv6 loopback",
+    }
+    for url, label in WEIRD.items():
+        # 这些形态没有合法 IP 字面量 → 走解析器；注入一个「会解析成私网」的替身，
+        # 以此验证：不管原始写法多奇怪，判定都发生在**解析结果**上
+        got = blocked(url, "TARGET_NOT_PUBLIC", resolver=fake("127.0.0.1"))
+        check(f"奇怪写法不绕过：{label}", got is None, f"{url} → {got}")
+
+    # ---------- ③ hostname 解析结果策略 ----------
+    check("hostname 解析到私网 → 拒绝",
+          blocked("http://evil.test/", "TARGET_NOT_PUBLIC",
+                  resolver=fake("192.168.1.10")) is None)
+    mixed = blocked("http://mixed.test/", "MIXED_PUBLIC_PRIVATE",
+                    resolver=fake("93.184.216.34", "10.0.0.5"))
+    check("★ 同时解析出公网+私网 → 拒绝（不挑公网那个继续）", mixed is None, str(mixed))
+    ok_pub = None
+    try:
+        v = G.resolve_and_validate("http://good.test/", resolver=fake("93.184.216.34"))
+        ok_pub = v.hostname
+    except G.SSRFBlocked as exc:
+        ok_pub = exc.reason
+    check("公网 hostname → 放行", ok_pub == "good.test", str(ok_pub))
+    check("DNS 解析失败 → 拒绝且不抛异常",
+          blocked("http://nx.test/", "DNS_RESOLUTION_FAILED",
+                  resolver=lambda h, p: (_ for _ in ()).throw(socket.gaierror("no"))) is None)
+
+    # ---------- ④ 协议白名单（与 allow_private_network 无关）----------
+    for url in ("file:///C:/Windows/win.ini", "ftp://x/y", "gopher://x/",
+                "data:text/html,<b>x</b>", "javascript:alert(1)", "ws://x/"):
+        got = blocked(url, "SCHEME_NOT_ALLOWED")
+        check(f"拒绝协议 {url.split(':')[0]}", got is None, str(got))
+
+    # ---------- ⑤ URL 层面 ----------
+    check("拒绝 user:pass@host",
+          blocked("http://u:p@example.com/", "USERINFO_NOT_ALLOWED") is None)
+    check("拒绝非法端口",
+          blocked("http://example.com:99999/", "INVALID_PORT") is None)
+    check("空 URL 被拒", blocked("", "MALFORMED_URL") is None)
+    try:
+        v6 = G.check_url_syntax("http://[2001:db8::1]:8080/a")
+        v6ok = (v6.hostname == "2001:db8::1" and v6.port == 8080 and "[2001:db8::1]" in v6.url)
+    except G.SSRFBlocked:
+        v6ok = False
+    check("IPv6 字面量正确解析（含端口）", v6ok)
+    check("hostname 规范化（大写/尾点）",
+          G.check_url_syntax("http://EXAMPLE.com./a").hostname == "example.com")
+
+    # ---------- ⑥ allow_private_network 只放宽地址，不放宽其它 ----------
+    check("allow_private_network=True 时局域网放行",
+          allowed("http://192.168.1.10/", allow_private_network=True) is None,
+          str(allowed("http://192.168.1.10/", allow_private_network=True)))
+    for url, want in (("file:///etc/passwd", "SCHEME_NOT_ALLOWED"),
+                      ("ftp://x/", "SCHEME_NOT_ALLOWED"),
+                      ("http://u:p@x/", "USERINFO_NOT_ALLOWED")):
+        got = blocked(url, want, allow_private_network=True)
+        check(f"★ 开私网后仍拒绝 {url.split(':')[0]}（只有地址策略被放宽）",
+              got is None, str(got))
+
+    # ---------- ⑦ redirect：公网 → 私网/本机 必须拦住 ----------
+    real_hop = G._one_hop
+
+    def hop_to(location):
+        def _h(v, *, headers, timeout, use_proxy):
+            return 302, b"", {"Location": location}, v.url
+        return _h
+
+    try:
+        G._one_hop = hop_to("http://127.0.0.1/")
+        r = G.safe_fetch("http://start.test/", resolver=fake("93.184.216.34"))
+        check("★ 公网 URL --302--> 127.0.0.1 被拦住",
+              (not r.ok) and r.reason == "TARGET_NOT_PUBLIC", f"{r.ok} {r.reason}")
+
+        G._one_hop = hop_to("http://10.1.2.3/")
+        r = G.safe_fetch("http://start.test/", resolver=fake("93.184.216.34"))
+        check("★ 公网 URL --302--> 私网 被拦住",
+              (not r.ok) and r.reason == "TARGET_NOT_PUBLIC", f"{r.ok} {r.reason}")
+
+        G._one_hop = hop_to("file:///etc/passwd")
+        r = G.safe_fetch("http://start.test/", resolver=fake("93.184.216.34"))
+        check("★ 重定向到 file: 被拦住（协议限制逐跳生效）",
+              (not r.ok) and r.reason == "SCHEME_NOT_ALLOWED", f"{r.ok} {r.reason}")
+
+        G._one_hop = lambda v, *, headers, timeout, use_proxy: (302, b"", {}, v.url)
+        r = G.safe_fetch("http://start.test/", resolver=fake("93.184.216.34"))
+        check("重定向缺少 Location → 拒绝",
+              (not r.ok) and r.reason == "REDIRECT_WITHOUT_LOCATION", f"{r.ok} {r.reason}")
+    finally:
+        G._one_hop = real_hop
+
+    # ---------- ⑧ redirect：真实本地 HTTP server（行为正确性）----------
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            p = self.path
+            if p == "/final":
+                body = b"<html><body>ok</body></html>"
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            if p == "/rel":                       # 相对 Location
+                self.send_response(302)
+                self.send_header("Location", "final")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            if p in ("/loop-a", "/loop-b"):       # 环
+                self.send_response(302)
+                self.send_header("Location", "/loop-b" if p == "/loop-a" else "/loop-a")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            if p.startswith("/chain/"):           # 超跳数
+                n = int(p.rsplit("/", 1)[1])
+                nxt = "/final" if n <= 0 else f"/chain/{n - 1}"
+                self.send_response(302)
+                self.send_header("Location", nxt)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            self.send_response(404)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, *a):
+            return
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    port = srv.server_address[1]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    time.sleep(0.3)
+    base = f"http://127.0.0.1:{port}"
+    priv = {"allow_private_network": True}      # 本地 server 属私网，需显式放行
+
+    try:
+        r = G.safe_fetch(f"{base}/final", **priv)
+        check("本地 200（开私网后）", r.ok and r.status == 200, f"{r.ok} {r.status} {r.reason}")
+
+        r = G.safe_fetch(f"{base}/rel", **priv)
+        check("相对 Location 正确解析并跟随（urljoin）",
+              r.ok and r.status == 200 and r.final_url.endswith("/final"),
+              f"{r.final_url} {r.reason}")
+
+        r = G.safe_fetch(f"{base}/loop-a", **priv)
+        check("★ 重定向环被检测", (not r.ok) and r.reason == "REDIRECT_LOOP",
+              f"{r.ok} {r.reason}")
+
+        r = G.safe_fetch(f"{base}/chain/20", **priv)
+        check("★ 重定向超过上限被拒绝",
+              (not r.ok) and r.reason == "TOO_MANY_REDIRECTS", f"{r.ok} {r.reason}")
+
+        # ---------- ⑨ DNS rebinding：证明「校验的 IP」就是「连接的 IP」----------
+        # 用一个**真实 DNS 里不存在**的域名，解析器只返回 127.0.0.1：
+        # 若能连通，说明连接用的就是解析器给的 IP，而不是重新解析（那必然失败）。
+        calls = []
+
+        def counting(host, port):
+            calls.append(host)
+            return [ipaddress.ip_address("127.0.0.1")]
+
+        # 有代理时请求由代理代发（就无法钉 IP）——为了确定性地验证钉 IP 逻辑，
+        # 这里显式把代理判定置假。CI 与本机代理配置不同，不固定就不可复现。
+        _real_pa = G.proxy_active
+        G.proxy_active = lambda: False
+        try:
+            r = G.safe_fetch(f"http://pinned-does-not-exist.test:{port}/final",
+                             allow_private_network=True, resolver=counting)
+        finally:
+            G.proxy_active = _real_pa
+        check("★ 连接使用解析器给出的 IP（不二次解析，无 TOCTOU 窗口）",
+              r.ok and r.status == 200, f"{r.ok} {r.status} {r.reason}")
+        check("★ 每个跳只解析一次", len(calls) == 1, str(calls))
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+    # ---------- ⑩ 出口收敛：抓取必须走安全通道 ----------
+    csrc = (paths.CORE_DIR / "crawler.py").read_text(encoding="utf-8")
+    check("★ crawler 抓取走 safe_fetch", "safe_fetch(" in csrc)
+    import re as _re
+    ccode = _re.sub(r'""".*?"""', "", csrc, flags=_re.S)      # 去掉文档串
+    ccode = "\n".join(ln for ln in ccode.splitlines() if not ln.strip().startswith("#"))
+    check("★ 可执行代码中不再使用自动跟随重定向",
+          "allow_redirects" not in ccode,
+          str([ln.strip()[:60] for ln in ccode.splitlines() if "allow_redirects" in ln]))
+    gsrc = (paths.CORE_DIR / "net_guard.py").read_text(encoding="utf-8")
+    check("钉住 IP：覆盖 connect() 直连已验证地址",
+          "_PinnedHTTPConnection" in gsrc and "_PinnedHTTPSConnection" in gsrc
+          and "socket.create_connection((self._pinned_ip" in gsrc)
+    check("HTTPS 的 SNI/证书校验仍用 hostname",
+          "server_hostname=self.host" in gsrc)
+    check("组播被显式排除（is_global 单独用不够）",
+          "is_multicast" in gsrc)
+
 def test_lifecycle_shutdown() -> None:
     """生命周期：安全退出必须**真的结束进程**，且初始化中途退出不能崩。
 
@@ -982,6 +1279,13 @@ def test_duplicate_url_detection(ctx) -> None:
         def log_message(self, *a):  # 静音
             return
 
+    # 本测试抓的是本地 HTTP server（私网地址）——SSRF 防护默认会拒绝，
+    # 所以这里显式开启 allow_private_network（正是该开关的用途）。
+    from app.core import config as _cfg
+
+    _orig_allow = _cfg.get_str("CRAWLER", "allow_private_network", "0")
+    _cfg.update({"CRAWLER": {"allow_private_network": "1"}}, persist=False)
+
     pre_existing = {p.name for p in paths.NOTES_DIR.glob("*.md")}
     srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
     port = srv.server_address[1]
@@ -1077,6 +1381,7 @@ def test_duplicate_url_detection(ctx) -> None:
             indexer.rebuild_all(ctx.db, ctx.embedder)
         except Exception:  # noqa: BLE001 - 清理失败不影响本测试结论
             pass
+        _cfg.update({"CRAWLER": {"allow_private_network": _orig_allow}}, persist=False)
 
 def test_localhost_security(ctx) -> None:
     """Localhost 安全边界：Host 校验 + Fetch Metadata + 同源判定。
@@ -1851,6 +2156,7 @@ def main() -> int:
         # 测试不依赖外部 AI 服务：provider 用内存态覆盖（persist=False，不碰 config.ini）
         config.update({"AI": {"provider": "offline"}}, persist=False)
 
+        test_ssrf_guard(ctx)
         test_lifecycle_shutdown()
         test_duplicate_url_detection(ctx)
         test_localhost_security(ctx)

@@ -16,7 +16,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import urlparse
 
-from . import analyzer, archiver, atomic_io, config, net_util, paths
+from . import analyzer, archiver, atomic_io, config, net_guard as _net_guard, net_util, paths
 from .log_util import get_logger
 
 log = get_logger()
@@ -182,47 +182,47 @@ def resolve_html_encoding(raw: bytes, content_type: str = "", apparent: str = ""
     return apparent or "utf-8"
 
 
+def _net_guard_ready() -> bool:
+    """安全网络出口是否可用（导入失败时明确降级，不静默放行）。"""
+    return _net_guard is not None
+
+
 def fetch_html(url: str, timeout: float | None = None) -> tuple[str, str]:
-    """抓取页面 HTML。返回 (html, error)。优先 requests（代理/UA 控制更好）。"""
+    """抓取页面 HTML。返回 (html, error)。
+
+    ⚠ 必须走 :func:`net_guard.safe_fetch` —— 这是本模块**唯一**允许访问
+    用户提供 URL 的出口。此前这里用 ``requests.get(allow_redirects=True)``：
+    既自动跟随重定向（校验形同虚设），又会在建连时**二次解析 DNS**
+    （TOCTOU / DNS rebinding 窗口）。
+
+    safe_fetch 会逐跳做完整 SSRF 校验，并把校验过的 IP 钉住后再连接。
+    """
     timeout = timeout or config.get_float("CRAWLER", "request_timeout", 20.0)
-    headers = {
-        "User-Agent": net_util.DEFAULT_UA,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-        "Cache-Control": "no-cache",
-    }
-    try:
-        import requests  # type: ignore
+    if not _net_guard_ready():
+        return "", "网络出口未就绪"
 
-        session = requests.Session()
-        session.trust_env = True  # 自动读取 HTTP_PROXY / HTTPS_PROXY
-        resp = session.get(url, headers=headers, timeout=timeout, allow_redirects=True)
-        if resp.status_code >= 400:
-            return "", f"HTTP {resp.status_code}"
-        raw = resp.content
-        enc = resolve_html_encoding(
-            raw, resp.headers.get("Content-Type", ""), resp.apparent_encoding or ""
-        )
-        return raw.decode(enc, "replace"), ""
-    except ImportError:
-        pass
-    except Exception as exc:  # noqa: BLE001
-        log.warning("requests 抓取失败，回退 urllib: %s", exc)
+    res = _net_guard.safe_fetch(
+        url,
+        headers={
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "Cache-Control": "no-cache",
+        },
+        timeout=timeout,
+        allow_private_network=config.get_bool("CRAWLER", "allow_private_network", False),
+    )
+    if not res.ok:
+        # 安全拒绝要与普通网络错误区分开，否则用户不知道是被策略挡住了
+        return "", res.message or "抓取失败"
+    if res.status >= 400:
+        return "", f"HTTP {res.status}"
 
-    status, body, resp_headers = net_util.http_get(url, headers=headers, timeout=timeout)
-    if status == 0:
-        return "", str(body)
-    if status >= 400:
-        return "", f"HTTP {status}"
-    if isinstance(body, str):  # pragma: no cover
-        return body, ""
-    # 响应头键名大小写因实现而异，统一按小写匹配
-    ctype = ""
-    for k, v in (resp_headers or {}).items():
-        if k.lower() == "content-type":
-            ctype = v
-            break
-    return body.decode(resolve_html_encoding(body, ctype), "replace"), ""
+    raw = res.body
+    enc = resolve_html_encoding(
+        raw, res.headers.get("Content-Type", ""), ""
+    )
+    return raw.decode(enc, "replace"), ""
+
 
 
 def extract_body(html_text: str, url: str) -> tuple[str, dict, str]:

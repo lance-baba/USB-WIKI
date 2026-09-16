@@ -66,6 +66,11 @@ ai_summary = 1
 allow_semantic_only = 0
 
 [CRAWLER]
+# 是否允许抓取**非公网**地址（局域网 / 内网 / 本机）。
+# 默认 0：只允许解析结果为公网地址的目标，且逐跳校验重定向（防 SSRF）。
+# 置 1 仅表示「你明确允许抓局域网资源」——
+# 协议白名单（只 http/https）、URL 合法性、重定向跳数与环检测**一律不变**。
+allow_private_network = 0
 # 正文提取字数降级门限
 min_body_chars = 150
 # 是否允许调用本机 Headless Chrome 处理动态页 (0: 禁用, 1: 启用)
