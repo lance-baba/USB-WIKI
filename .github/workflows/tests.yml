@@ -192,6 +192,30 @@ jobs:
               if not ok:
                   raise SystemExit("嵌入式运行时未能在 60s 内就绪")
 
+              # ⚠ 等**初始化真正完成**再继续。
+              # `/healthz` 一响应就代表「端口起来了」，但后台的 boot 线程可能还在
+              # 解析嵌入源 —— 此时发退出请求会撞上仍在初始化的上下文。
+              # （实测到：那种情况下 boot 线程会抛 'NoneType' object has no
+              # attribute 'embedder'，且**进程此后不退出**。那是一个独立的产品
+              # 竞态缺陷，记为待修；本冒烟测的是「就绪后的优雅退出」，故先等到 ready。）
+              ready = False
+              for _ in range(90):
+                  try:
+                      c = http.client.HTTPConnection("127.0.0.1", 28902, timeout=3)
+                      c.request("GET", "/api/status", headers={"Host": "127.0.0.1:28902"})
+                      r = c.getresponse()
+                      st = json.loads(r.read()).get("data") or {}
+                      c.close()
+                      if st.get("ready"):
+                          ready = True
+                          break
+                  except Exception:
+                      pass
+                  time.sleep(1)
+              if not ready:
+                  raise SystemExit("初始化未在 90s 内完成（ready 仍为 false）")
+              print("初始化完成（ready=true）")
+
               # 一个核心 API（能力清单）
               c = http.client.HTTPConnection("127.0.0.1", 28902, timeout=10)
               c.request("GET", "/api/import/formats", headers={"Host": "127.0.0.1:28902"})
