@@ -803,6 +803,119 @@ def test_original_preview(ctx) -> None:
     check("Office 文档不内联（走下载）", ".docx" not in Handler.INLINE_TYPES)
 
 
+def test_fake_ip_compat(ctx) -> None:
+    """Fake-IP 兼容：公网 hostname 被代理 DNS 劫持为 198.18/15 时的放行策略。
+
+    环境事实（docs/NET_FAKEIP_TODO.md）：Clash/Mihomo Fake-IP 下
+    ``news.china.com → 198.18.1.127``，SSRF Guard 按非公网正确拒绝但属于系统性误伤。
+
+    关键区分（用户明确要求）：
+      * 公网 hostname 被系统 DNS 映射为 198.18.x.x  → 兼容路径放行
+      * 用户直接输入 http://198.18.x.x（IP literal） → 仍拒绝
+    安全边界不削弱：localhost / 127 / RFC1918 / metadata / 非 http(s) / redirect 全照旧。
+    """
+    section("Fake-IP 兼容（198.18/15 误伤修复）")
+    import ipaddress
+    from app.core import net_guard as G
+
+    def resolver_of(*ips):
+        def _r(host, port):
+            return [ipaddress.ip_address(x) for x in ips]
+        return _r
+
+    def blocked(url, want=None, **kw):
+        try:
+            G.resolve_and_validate(url, **kw)
+        except G.SSRFBlocked as exc:
+            if want is None or exc.reason == want:
+                return None
+            return f"{exc.reason} != {want}"
+        return "未被拒绝（应拒绝）"
+
+    def hop_to(location):
+        """把 _one_hop 替换为「返回 302 → Location」的桩，用于 redirect 回归。"""
+        def _h(v, *, headers, timeout, use_proxy):
+            return 302, b"", {"Location": location}, v.url
+        return _h
+
+    FAKE = "198.18.0.10"
+    PUB = "93.184.216.34"
+    real_hop = G._one_hop
+    real_res = G._default_resolver
+
+    # ---------- ① hostname → 全 Fake-IP：放行，走兼容路径 ----------
+    v = G.resolve_and_validate("http://news.test/", resolver=resolver_of(FAKE))
+    check("★ 公网 hostname → 198.18.x.x → 放行（兼容路径）",
+          v.ips and str(v.ips[0]) == FAKE, str(v.ips))
+    check("★ 标记 fake_ip=True（可观测，便于日志/诊断）", v.fake_ip is True)
+    check("兼容路径下 Host/SNI 仍用原 hostname", v.hostname == "news.test")
+
+    # ---------- ② IP literal 仍拒绝 ----------
+    check("★ 用户直接输入 http://198.18.1.127 → 拒绝",
+          blocked("http://198.18.1.127/", "TARGET_NOT_PUBLIC") is None)
+    check("★ IPv4-mapped Fake-IP literal 同样拒绝",
+          blocked("http://[::ffff:198.18.0.1]/", "TARGET_NOT_PUBLIC") is None)
+    check("★ Fake-IP 段边界内全部拒绝（literal）",
+          blocked("http://198.19.255.254/", "TARGET_NOT_PUBLIC") is None)
+    check("198.17.x（段外，真实公网）不受影响",
+          G.resolve_and_validate("http://198.17.0.1/").fake_ip is False)
+
+    # ---------- ③ 混合解析的取舍 ----------
+    v3 = G.resolve_and_validate("http://half.test/", resolver=resolver_of(PUB, FAKE))
+    check("公网 + Fake-IP 混合 → 用真实公网地址（丢弃 Fake-IP）",
+          [str(i) for i in v3.ips] == [PUB] and v3.fake_ip is False, str(v3.ips))
+    check("★ Fake-IP + 真私网混合 → 拒绝（不得借兼容路径放行私网）",
+          blocked("http://evil.test/", "TARGET_NOT_PUBLIC",
+                  resolver=resolver_of(FAKE, "10.0.0.5")) is None)
+
+    # ---------- ④ 安全边界不削弱 ----------
+    for url, want, label in [
+        ("http://localhost/", None, "localhost"),
+        ("http://127.0.0.1/", None, "127.0.0.1"),
+        ("http://[::1]/", None, "::1"),
+        ("http://192.168.1.1/", None, "RFC1918"),
+        ("http://169.254.169.254/", None, "metadata"),
+        ("file:///C:/Windows/win.ini", "SCHEME_NOT_ALLOWED", "file scheme"),
+    ]:
+        got = blocked(url, want, resolver=resolver_of(FAKE))
+        check(f"Fake-IP 时代不放过：{label}", got is None, str(got))
+
+    # ---------- ⑤ redirect：fake hostname 每跳重新校验 ----------
+    try:
+        G._default_resolver = resolver_of(FAKE)
+
+        G._one_hop = hop_to("http://127.0.0.1/")
+        r = G.safe_fetch("http://fake.test/", allow_private_network=False)
+        check("★ fake hostname --302--> localhost 被拦",
+              (not r.ok) and r.reason == "TARGET_NOT_PUBLIC", f"{r.ok} {r.reason}")
+
+        G._one_hop = hop_to("http://10.0.0.5/")
+        r = G.safe_fetch("http://fake.test/", allow_private_network=False)
+        check("★ fake hostname --302--> 私网被拦",
+              (not r.ok) and r.reason == "TARGET_NOT_PUBLIC", f"{r.ok} {r.reason}")
+
+        # fake hostname --302--> 公网：放行（兼容路径 + 逐跳校验都通过）
+        G._one_hop = lambda v, *, headers, timeout, use_proxy: (200, b"ok", {}, v.url)
+        r = G.safe_fetch("http://fake.test/jump", allow_private_network=False)
+        check("fake hostname --302--> 公网 → 正常跟随",
+              r.ok and r.status == 200, f"{r.ok} {r.reason}")
+    finally:
+        G._default_resolver = real_res
+        G._one_hop = real_hop
+
+    # ---------- ⑥ allow_private_network 语义不变 ----------
+    v6 = G.resolve_and_validate("http://lan.test/", resolver=resolver_of(FAKE),
+                                allow_private_network=True)
+    check("allow_private_network=True 时 Fake-IP 照常放行", v6.fake_ip is True)
+    check("★ allow_private_network=True 时 IP literal 私网照常放行",
+          G.resolve_and_validate("http://10.0.0.5/",
+                                 allow_private_network=True) is not None)
+
+    # ---------- ⑦ proxy/TUN 审计结论（输出供人工核对）----------
+    print(f"      proxy_active()={G.proxy_active()}")
+    print("      TUN 模式：proxy_active=False → 钉住 Fake-IP 直连 → TUN 网卡接管，代理还原真实目标")
+    print("      系统代理模式：proxy_active=True → 代理建连（Fake-IP 对代理内部透明）")
+
 def test_manifest_recovery() -> None:
     """Data Contract 收尾：manifest 损坏与 legacy library 的安全接管。
 
@@ -3084,6 +3197,7 @@ def main() -> int:
         # 测试不依赖外部 AI 服务：provider 用内存态覆盖（persist=False，不碰 config.ini）
         config.update({"AI": {"provider": "offline"}}, persist=False)
 
+        test_fake_ip_compat(ctx)
         test_manifest_recovery()
         test_library_contract()
         test_single_version_source(ctx)

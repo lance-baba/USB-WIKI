@@ -145,6 +145,23 @@ def is_public_ip(ip) -> bool:
     return bool(a.is_global)
 
 
+# Clash / Mihomo 的默认 Fake-IP 段。代理把公网域名的 DNS 应答劫持成这个段的
+# 内部路由标记，真实连接由代理（TUN 网卡 / 系统代理）还原。
+FAKEIP_NETWORK = ipaddress.ip_network("198.18.0.0/15")
+
+
+def is_fake_ip(ip) -> bool:
+    """是否落入 Fake-IP 段（``198.18.0.0/15``）。
+
+    ⚠ 仅对 **hostname 的解析结果** 有意义：用户直接输入的 ``198.18.x.x``
+    IP literal 仍必须拒绝（见 :func:`resolve_and_validate` 的 literal 分支）。
+    """
+    a = effective_ip(ip)
+    if a.version != 4:
+        return False
+    return a in FAKEIP_NETWORK
+
+
 def parse_ip(text: str):
     """把字面量解析成 ip 对象；不是字面量返回 None。"""
     try:
@@ -164,6 +181,9 @@ class ValidatedURL:
     port: int
     hostname: str              # 原始 hostname（用于 Host 头 / SNI / 证书校验）
     ips: list = field(default_factory=list)
+    # True = 该 hostname 的解析结果全部落在 Fake-IP 段（疑似代理 Fake-IP 环境），
+    # 走兼容路径放行；连接目标仍是校验过的解析结果，SSRF 边界不变。
+    fake_ip: bool = False
 
 
 def _default_resolver(host: str, port: int):
@@ -241,6 +261,11 @@ def resolve_and_validate(
 
     if literal is not None:
         ips = [literal]
+        # ⚠ 用户直接输入的 IP literal：Fake-IP 兼容**不适用**——
+        # 它没有「公网域名被代理 DNS 劫持」的解释，非公网一律拒绝
+        # （否则 http://198.18.1.127 会借 Fake-IP 兼容路径溜进来）。
+        if not allow_private_network and not is_public_ip(literal):
+            raise SSRFBlocked(R_NOT_PUBLIC, str(literal))
     elif allow_private_network and _is_localhostish(v.hostname):
         # 显式开启后，仍允许 localhost / *.localhost 这类名称
         ips = [ipaddress.ip_address("127.0.0.1")]
@@ -262,20 +287,57 @@ def resolve_and_validate(
 
     if allow_private_network:
         v.ips = uniq
+        v.fake_ip = any(is_fake_ip(ip) for ip in uniq)
         return v
 
-    publics = [ip for ip in uniq if is_public_ip(ip)]
-    if not publics:
-        raise SSRFBlocked(R_NOT_PUBLIC, f"{v.hostname} → {', '.join(str(i) for i in uniq[:4])}")
-    if len(publics) != len(uniq):
-        # 同时解析出公网 + 私网 → 拒绝，不「挑公网那个继续」。
-        # 否则解析顺序一变，行为就漂移（今天能抓、明天不能）。
-        raise SSRFBlocked(
-            R_MIXED,
-            f"{v.hostname} → {', '.join(str(i) for i in uniq[:4])}",
-        )
-    v.ips = uniq
-    return v
+    # 三类划分：真实公网 / Fake-IP 段 / 其它（loopback·RFC1918·link-local·metadata·组播…）
+    publics, fakes, others = [], [], []
+    for ip in uniq:
+        if is_public_ip(ip):
+            publics.append(ip)
+        elif is_fake_ip(ip):
+            fakes.append(ip)
+        else:
+            others.append(ip)
+
+    # localhost / *.localhost：无论解析成什么，非 LAN 模式一律拒绝。
+    # 否则恶意配置把 localhost 映射到 Fake-IP 段会借兼容路径放行，
+    # 而 TUN/代理还原 localhost 时真实目标就是本机。
+    if _is_localhostish(v.hostname):
+        raise SSRFBlocked(R_NOT_PUBLIC, v.hostname)
+
+    # 三类划分：真实公网 / Fake-IP 段 / 其它（loopback·RFC1918·link-local·metadata·组播…）
+    publics, fakes, others = [], [], []
+    for ip in uniq:
+        if is_public_ip(ip):
+            publics.append(ip)
+        elif is_fake_ip(ip):
+            fakes.append(ip)
+        else:
+            others.append(ip)
+
+    # 有真实公网地址：Fake-IP 地址丢弃（同一域名被代理缓存与真实解析混合时取真实）
+    if publics and not others:
+        v.ips = publics
+        v.fake_ip = False
+        return v
+
+    # 全 Fake-IP 段 → 疑似 Fake-IP 环境（公网 hostname 被代理 DNS 劫持）。
+    # 安全性：连接目标仍是「校验过的解析结果」；真实私网若混入会落进 others 被拒，
+    # 因此兼容路径不会触达 loopback / RFC1918 / metadata。
+    # literal 分支在上面已单独处理（用户直接输入 198.18.x.x 仍拒绝）。
+    if fakes and not others:
+        v.ips = fakes
+        v.fake_ip = True
+        log.info("疑似 Fake-IP 环境：%s → %s，按代理兼容路径放行",
+                 v.hostname, ", ".join(str(i) for i in fakes[:2]))
+        return v
+
+    # 其余（纯私网 / 公网+私网混合 / Fake-IP+私网混合）→ 一律拒绝。
+    # 原因码沿用既有语义：混入公网 → MIXED；纯私网 → NOT_PUBLIC。
+    if publics:
+        raise SSRFBlocked(R_MIXED, f"{v.hostname} → {', '.join(str(i) for i in uniq[:4])}")
+    raise SSRFBlocked(R_NOT_PUBLIC, f"{v.hostname} → {', '.join(str(i) for i in uniq[:4])}")
 
 
 def _is_localhostish(host: str) -> bool:

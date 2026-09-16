@@ -60,3 +60,34 @@ Fake-IP 是代理对 DNS 的正常劫持方式：真实连接由代理发起，`
 
 本条只处理 **Fake-IP 兼容**。不允许顺带放宽其它非公网地址策略，
 也不允许把 `allow_private_network` 的语义与 Fake-IP 兼容混在一起。
+
+---
+
+## 状态：已实现（fix(net): support proxy fake-ip without weakening ssrf guard）
+
+### 审计结论（实现前实测，非假设）
+
+* Fake-IP 是**间歇性**的：同一域名有时返回真实公网 IP、有时返回 198.18.x.x
+  → 实现必须是**按每次解析结果自动识别**，不能靠配置开关或一次性检测。
+* `proxy_active()` 只反映**环境变量代理**；TUN 模式下为 False，走「钉住解析 IP」路径。
+* TUN 模式下钉住 Fake-IP 直连 → 连接被 TUN 网卡接管 → 代理按 SNI/Host 还原真实目标，
+  **恰好保持 SSRF 边界**（全程不可能触达 loopback/RFC1918/metadata）。
+* Fake-IP 段判定实测精确：`198.18.0.0–198.19.255.255` 命中，`198.17.x` 不误入。
+
+### 实现要点
+
+* 新增 `is_fake_ip()`（`198.18.0.0/15`，IPv4）与 `ValidatedURL.fake_ip` 标记。
+* 解析结果三类划分：真实公网 / Fake-IP 段 / 其它（loopback·RFC1918·metadata…）。
+  * 公网 + Fake-IP 混合 → 丢弃 Fake-IP，用真实公网地址。
+  * 全 Fake-IP 且无其它 → 兼容路径放行（`fake_ip=True`，日志可观测）。
+  * 混入真私网 → 照旧拒绝（NOT_PUBLIC / MIXED）。
+* **IP literal 例外**：用户直接输入 `198.18.x.x`（含 IPv4-mapped 形式）仍拒绝 ——
+  Fake-IP 兼容只适用于「公网 hostname 被系统 DNS 劫持」。
+* **localhost 例外**：`localhost` / `*.localhost` 无论解析成什么都拒绝（非 LAN 模式），
+  否则恶意配置可借 Fake-IP 兼容路径触达本机。
+* redirect 逐跳校验不变；`allow_private_network` 语义不变。
+
+### 回归（16 项，注入 resolver，确定性）
+
+覆盖 docs 上半部列出的全部场景，另含段边界（198.17.x / 198.19.255.254）、
+literal IPv4-mapped Fake-IP、fake→localhost 与 fake→私网的 redirect 拦截。
