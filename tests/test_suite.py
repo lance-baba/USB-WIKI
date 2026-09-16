@@ -749,6 +749,132 @@ def test_original_preview(ctx) -> None:
     check("Office 文档不内联（走下载）", ".docx" not in Handler.INLINE_TYPES)
 
 
+def test_atomic_io() -> None:
+    """原子写：用户资产（Markdown / 原件 / config）的异常安全。
+
+    背景：``data/notes/*.md`` 是**用户真相源**。``cache.db`` 可以全量重建，
+    Markdown 不能。而 ``open(path, "w") -> write()`` 是「先截断再写」——
+    进程若在写入中途终止（断电 / 拔盘 / 被杀），用户拿到半截笔记，
+    **原内容已经没了**。本测试固化「失败时目标文件必须原样保留」这条不变量。
+    """
+    section("原子写（用户资产异常安全）")
+    import os
+    import tempfile
+    from pathlib import Path
+
+    from app.core import atomic_io
+
+    tmp = Path(tempfile.mkdtemp(prefix="wikiusb_atomic_"))
+
+    # ---------- ③ 成功写入：内容完全一致 ----------
+    f1 = tmp / "note.md"
+    atomic_io.atomic_write_text(f1, "第一行\n第二行\n")
+    with open(f1, encoding="utf-8", newline="") as fh:      # 3.11 无 Path.read_text(newline=)
+        got = fh.read().replace("\r\n", "\n")
+    check("成功写入后内容一致", got == "第一行\n第二行\n", repr(got))
+
+    # ---------- ④ 临时文件不残留 ----------
+    check("成功后目录内不残留临时文件",
+          [p.name for p in tmp.iterdir()] == ["note.md"],
+          str([p.name for p in tmp.iterdir()]))
+
+    # ---------- ⑥ 换行/编码行为与旧写法逐字节一致 ----------
+    f_old = tmp / "old.txt"
+    f_new = tmp / "new.txt"
+    sample = "标题\n正文 with UTF-8 中文\n尾行\n"
+    with open(f_old, "w", encoding="utf-8") as fh:      # 旧写法（Path.write_text 同语义）
+        fh.write(sample)
+    atomic_io.atomic_write_text(f_new, sample)
+    check("换行与编码字节级等价于旧的 write_text（不会改动既有笔记的换行）",
+          f_old.read_bytes() == f_new.read_bytes(),
+          f"{f_old.read_bytes()[:24]!r} vs {f_new.read_bytes()[:24]!r}")
+    check("显式 newline='' 时不翻译换行",
+          b"\r\n" not in atomic_io.atomic_write_text(
+              tmp / "raw.txt", "a\nb\n", newline="").read_bytes())
+
+    # ---------- ⑤ 中文文件名 ----------
+    f_cn = tmp / "宁波华林工贸-基坑监测简报.md"
+    atomic_io.atomic_write_text(f_cn, "中文文件名测试\n")
+    check("中文文件名可原子写入且内容正确",
+          f_cn.read_text(encoding="utf-8").strip() == "中文文件名测试")
+
+    # ---------- ① 已存在文件 + 写入中途失败 → 旧文件完整保留 ----------
+    f_exist = tmp / "existing.md"
+    atomic_io.atomic_write_text(f_exist, "旧内容-必须是完整的\n")
+    before = f_exist.read_bytes()
+
+    real_fsync = os.fsync
+    def boom(fd):                       # 模拟「数据已写一半/落盘阶段」故障
+        raise OSError("模拟写入中途失败")
+    os.fsync = boom
+    try:
+        try:
+            atomic_io.atomic_write_text(f_exist, "新内容" * 5000)
+            failed = False
+        except OSError:
+            failed = True
+    finally:
+        os.fsync = real_fsync
+    check("写入中途失败会抛异常（不静默）", failed)
+    check("★ 失败后旧文件完整保留（不是半截新文件）",
+          f_exist.read_bytes() == before, repr(f_exist.read_bytes()[:40]))
+
+    # ---------- ② 新文件首次创建失败 → 不留半截正式文件 ----------
+    f_new2 = tmp / "brand_new.md"
+    os.fsync = boom
+    try:
+        try:
+            atomic_io.atomic_write_text(f_new2, "内容" * 5000)
+        except OSError:
+            pass
+    finally:
+        os.fsync = real_fsync
+    check("★ 首次创建失败时不生成半截正式文件", not f_new2.exists())
+
+    # ---------- 失败后临时文件尽量清理 ----------
+    leftovers = [p.name for p in tmp.iterdir() if p.name.endswith(".tmp")]
+    check("失败后临时文件已清理", not leftovers, str(leftovers))
+
+    # ---------- 替换阶段失败（目标被占用等）也不破坏目标 ----------
+    f_rep = tmp / "replace_fail.md"
+    atomic_io.atomic_write_text(f_rep, "替换前内容\n")
+    before2 = f_rep.read_bytes()
+    real_replace = atomic_io._replace_with_retry
+    atomic_io._replace_with_retry = lambda a, b: (_ for _ in ()).throw(PermissionError("被占用"))
+    try:
+        try:
+            atomic_io.atomic_write_text(f_rep, "替换后内容\n")
+        except PermissionError:
+            pass
+    finally:
+        atomic_io._replace_with_retry = real_replace
+    check("★ 替换阶段失败时目标仍是完整旧内容", f_rep.read_bytes() == before2)
+    check("替换失败后临时文件也已清理",
+          not [p.name for p in tmp.iterdir() if p.name.endswith(".tmp")])
+
+    # ---------- 二进制原子写 ----------
+    f_bin = tmp / "orig.bin"
+    payload = bytes(range(256)) * 8
+    atomic_io.atomic_write_bytes(f_bin, payload)
+    check("二进制原子写字节完全一致", f_bin.read_bytes() == payload)
+
+    # ---------- 临时文件与目标同目录（跨盘 rename 不保证原子）----------
+    src = (paths.CORE_DIR / "atomic_io.py").read_text(encoding="utf-8")
+    check("临时文件创建在目标同目录（dir= 目标父目录）", "dir=str(target.parent)" in src)
+    check("使用 os.replace 而非 shutil.move（后者跨盘非原子）",
+          "os.replace(" in src and "shutil.move" not in src)
+
+    # 清理
+    for p in sorted(tmp.rglob("*"), reverse=True):
+        try:
+            p.unlink() if p.is_file() else p.rmdir()
+        except OSError:
+            pass
+    try:
+        tmp.rmdir()
+    except OSError:
+        pass
+
 def test_inject_budget(ctx) -> None:
     """注入给模型的上下文必须有硬预算。
 
@@ -1037,6 +1163,19 @@ def _isolate_data_dir() -> Path:
     for d in (paths.DATA_DIR, paths.NOTES_DIR, paths.SNAPSHOT_DIR, paths.ORIGINALS_DIR):
         d.mkdir(parents=True, exist_ok=True)
 
+    # ⚠ 只改 paths.CONFIG_FILE 还不够：config 模块在**导入时**就把 _path 绑定到了
+    # 真实路径（`_path: Path = paths.CONFIG_FILE`），之后再改 paths 对它无效。
+    # 后果是测试里任何 `config.update(..., persist=True)` 都会写进用户的真实
+    # config.ini —— 实测已发生过（把测试段落写进了用户配置），而该文件含 API Key，
+    # 属于「写坏即永久丢失」的用户资产。这里连同解析缓存一起重绑。
+    try:
+        from app.core import config as _cfg
+
+        _cfg._path = paths.CONFIG_FILE
+        _cfg._parser = None              # 丢掉可能已缓存的真实配置
+    except Exception:  # noqa: BLE001 - 隔离失败不该让测试崩，但要显式暴露
+        print("  ⚠ 无法把 config 模块重定向到隔离目录")
+
     # 守护断言：任何仍指向真实 data/ 的属性都说明隔离清单漏了项 —— 宁可当场失败
     leaked = sorted(n for n, v in vars(paths).items()
                     if isinstance(v, Path) and str(v).startswith(str(real_data)))
@@ -1092,6 +1231,7 @@ def main() -> int:
         # 测试不依赖外部 AI 服务：provider 用内存态覆盖（persist=False，不碰 config.ini）
         config.update({"AI": {"provider": "offline"}}, persist=False)
 
+        test_atomic_io()
         test_inject_budget(ctx)
         test_ingest_analysis_and_graph(ctx)
         test_search_quality_guards(ctx)

@@ -16,7 +16,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import urlparse
 
-from . import analyzer, archiver, config, net_util, paths
+from . import analyzer, archiver, atomic_io, config, net_util, paths
 from .log_util import get_logger
 
 log = get_logger()
@@ -398,7 +398,8 @@ def save_markdown(
             fields[k] = v
     fm = _frontmatter(fields)
     content = f"{fm}\n\n# {title or url}\n\n{body.strip()}\n"
-    target.write_text(content, encoding="utf-8")
+    # 真相源必须原子写：半截笔记比没有笔记更糟（原内容已被截断）
+    atomic_io.atomic_write_text(target, content)
 
     # 留存原始 HTML：让「原版预览」能用沙箱 iframe 还原网页原本的观感
     if html_text:
@@ -412,7 +413,7 @@ def save_snapshot(url: str, html_text: str, when: datetime | None = None) -> Pat
     snap = paths.SNAPSHOT_DIR / _safe_name(url, when).replace(".md", ".html")
     header = f"<!-- 原始快照 source_url={url} captured_at={when:%Y-%m-%d %H:%M:%S} -->\n"
     try:
-        snap.write_text(header + html_text, encoding="utf-8")
+        atomic_io.atomic_write_text(snap, header + html_text)
     except OSError as exc:
         log.error("快照写入失败: %s", exc)
     return snap
@@ -553,7 +554,7 @@ def save_manual_note(title: str, body: str, db=None, embedder=None, source: str 
             "doc_type": source,
         }
     )
-    target.write_text(f"{fm}\n\n# {title}\n\n{body}\n", encoding="utf-8")
+    atomic_io.atomic_write_text(target, f"{fm}\n\n# {title}\n\n{body}\n")
 
     result = CaptureResult(
         True, "success", title=title, file_path=paths.rel_to_data(target),
@@ -591,7 +592,7 @@ def save_original(stem: str, ext: str, data: bytes) -> str:
     try:
         paths.ORIGINALS_DIR.mkdir(parents=True, exist_ok=True)
         target = paths.ORIGINALS_DIR / f"{stem}{ext}"
-        target.write_bytes(data)
+        atomic_io.atomic_write_bytes(target, data)
         return f"originals/{target.name}"
     except OSError as exc:
         log.warning("原文件留存失败 %s%s: %s", stem, ext, exc)
@@ -742,7 +743,7 @@ def import_document(
         text = f"{fm}\n\n{body}\n"
 
     try:
-        target.write_text(text, encoding="utf-8")
+        atomic_io.atomic_write_text(target, text)
     except OSError as exc:
         return CaptureResult(False, "error", message=f"写入失败：{exc}")
 

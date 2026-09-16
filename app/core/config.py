@@ -5,11 +5,12 @@
 from __future__ import annotations
 
 import configparser
+import io
 import threading
 from pathlib import Path
 from typing import Any
 
-from . import paths
+from . import atomic_io, paths
 from .log_util import get_logger
 
 log = get_logger()
@@ -116,7 +117,7 @@ def load(path: Path | None = None, force: bool = False) -> configparser.ConfigPa
         if not _path.exists():
             try:
                 _path.parent.mkdir(parents=True, exist_ok=True)
-                _path.write_text(DEFAULT_TEMPLATE, encoding="utf-8")
+                atomic_io.atomic_write_text(_path, DEFAULT_TEMPLATE)
                 log.info("已生成默认配置模板: %s", _path)
             except OSError as exc:
                 log.warning("默认配置写入失败(将以内存模板运行): %s", exc)
@@ -200,8 +201,11 @@ def update(values: dict[str, dict[str, Any]], persist: bool = True) -> dict[str,
                 p.set(section, str(key), "" if value is None else str(value))
         if persist:
             try:
-                with _path.open("w", encoding="utf-8") as fh:
-                    p.write(fh)
+                # config.ini 含 API Key，写坏即永久丢失且无法重建 → 原子写。
+                # 先写进内存缓冲再整块落盘：替换前目标始终是完整旧内容。
+                buf = io.StringIO()
+                p.write(buf)
+                atomic_io.atomic_write_text(_path, buf.getvalue())
             except OSError as exc:
                 log.error("配置回写失败: %s", exc)
         return {s: dict(p.items(s)) for s in p.sections()}
