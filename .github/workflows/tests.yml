@@ -65,9 +65,14 @@ jobs:
 
       - name: 运行测试套件
         shell: bash
+        # ⚠ bash -e 会在 python 失败时立刻退出，rc 与 cat 都执行不到，
+        # 于是「测试失败时 CI 只能看到 exit 1，看不到任何诊断」——
+        # 这正是此前定位困难的原因。必须先关掉 -e 再恢复。
         run: |
+          set +e
           python -u tests/test_suite.py > test-out.txt 2>&1
           rc=$?
+          set -e
           cat test-out.txt
           exit "$rc"
 
@@ -148,8 +153,10 @@ jobs:
       - name: 用嵌入式 Python 跑测试套件（这才是产品形态）
         shell: bash
         run: |
+          set +e
           runtime/python-3.11-embed/python.exe -u tests/test_suite.py > portable-out.txt 2>&1
           rc=$?
+          set -e
           grep -aE "TOTAL=|通过 .* 项" portable-out.txt || true
           cat portable-out.txt
           exit "$rc"
