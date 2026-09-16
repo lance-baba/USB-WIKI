@@ -73,11 +73,24 @@ def ensure_dirs() -> None:
 
 
 def rel_to_data(p: Path) -> str:
-    """把绝对路径转换成相对 ``data/`` 的 POSIX 风格路径，用于跨机器持久化。"""
+    """把绝对路径转换成相对 ``data/`` 的 POSIX 风格路径，用于跨机器持久化。
+
+    ⚠ **绝不返回绝对路径** —— 那会让资料库无法整盘搬移（Data Contract 第 6 条）。
+    Library 根被重定向时（如恢复测试 / WIKIUSB_LIBRARY），文件不在 DATA_DIR 下，
+    此前 ``except ValueError`` 直接返回 ``p.as_posix()``（绝对路径），
+    导致 CI 的换目录测试失败。现按优先级退回相对形式：
+    data/ 相对 → notes/ 相对 → 仅文件名。
+    """
+    p = p.resolve()
     try:
-        return p.resolve().relative_to(DATA_DIR.resolve()).as_posix()
+        return p.relative_to(DATA_DIR.resolve()).as_posix()
     except ValueError:
-        return p.as_posix()
+        pass
+    try:
+        return "notes/" + p.relative_to(NOTES_DIR.resolve()).as_posix()
+    except ValueError:
+        pass
+    return "notes/" + p.name
 
 
 def abs_from_data(rel: str) -> Path:

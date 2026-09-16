@@ -913,9 +913,9 @@ def test_library_contract() -> None:
     st2 = ctx2.db.stats()
     check("⑨ 资料库换目录后文档仍在（无绝对路径依赖）",
           st2["docs"] == 2, str(st2))
-    check("   相对路径未受影响",
-          all(not r["rel_path"].count(":\\") and not r["rel_path"].startswith("/")
-              for r in ctx2.db.query("SELECT rel_path FROM documents")), "")
+    _rels = [r["rel_path"] or "" for r in ctx2.db.query("SELECT rel_path FROM documents")]
+    _bad = [x for x in _rels if ":\\" in x or x.startswith("/") or x.startswith("\\\\")]
+    check("   相对路径未受影响（无绝对路径依赖）", not _bad, str(_bad[:3]))
     res2 = search_mod.hybrid_search(ctx2.db, ctx2.embedder, "hello", top_k_parents=3)
     check("   换目录后检索仍可用", len(res2.references) > 0, str(res2.route))
     ctx2.db.checkpoint_and_close()
