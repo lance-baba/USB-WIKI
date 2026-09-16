@@ -942,12 +942,15 @@ def test_diagnostics(ctx) -> None:
                       "CREATE TABLE chunks_fts (x);")
     con.commit(); con.close()
     before = sha_tree(libro.root)
-    cfg_before = (paths.BASE_DIR / "config.ini").read_bytes()
+    # config.ini 在 CI（Linux）的干净 checkout 里不存在（被 gitignore），需守卫
+    cfg_path = paths.BASE_DIR / "config.ini"
+    cfg_before = cfg_path.read_bytes() if cfg_path.exists() else None
     diagnostics.collect(library_root=libro.root, ollama_probe=lambda: False)
     after = sha_tree(libro.root)
     check("⑭ ★ 诊断前后永久资料 SHA256 完全一致（含 cache.db）", after == before,
           str([k for k in set(before) | set(after) if before.get(k) != after.get(k)]))
-    check("⑮ config.ini 未被写入", (paths.BASE_DIR / "config.ini").read_bytes() == cfg_before)
+    cfg_after = cfg_path.read_bytes() if cfg_path.exists() else None
+    check("⑮ config.ini 未被写入", cfg_after == cfg_before)
     check("⑮ manifest 未被写入", (libro.root / MANIFEST_NAME).exists())
 
     # ---------- API 输出红线（静态-ish：对最终 JSON 的内容断言）----------
