@@ -109,3 +109,119 @@ jobs:
               except subprocess.TimeoutExpired:
                   proc.kill()
           PY
+
+  # ==========================================================================
+  # 第二条强制验收链：**产品真实形态**
+  #
+  # 上面的 test job 跑的是 GitHub runner 的系统 Python + pip 安装依赖，
+  # 只能证明「开发环境兼容」。而我们真正交付给用户的是
+  # **Windows 自包含嵌入式运行时**（runtime/python-3.11-embed）。
+  #
+  # 两者必须都绿：系统 Python CI = 开发兼容性，Portable CI = 产品兼容性。
+  # 任何一条红了都不许往下开发。
+  # ==========================================================================
+  windows-portable-smoke:
+    name: windows-latest / Portable Runtime
+    runs-on: windows-latest
+    env:
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: "utf-8"
+    steps:
+      - uses: actions/checkout@v4
+
+      # 这个 Python 只用来**运行构建脚本本身**；被测的是它构建出来的运行时。
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 构建 Windows 自包含运行时
+        shell: bash
+        # --no-mirror：构建脚本默认走清华镜像（给国内用户），
+        # 在 GitHub runner 上反而可能超时。
+        # 不加 --with-onnx：默认发布形态不含 onnxruntime（体积翻倍且缺模型时无用）。
+        run: python setup_runtime_windows.py --no-mirror
+
+      - name: 运行时体检
+        shell: bash
+        run: runtime/python-3.11-embed/python.exe setup_runtime_windows.py --check
+
+      - name: 用嵌入式 Python 跑测试套件（这才是产品形态）
+        shell: bash
+        run: |
+          runtime/python-3.11-embed/python.exe -u tests/test_suite.py > portable-out.txt 2>&1
+          rc=$?
+          grep -aE "TOTAL=|通过 .* 项" portable-out.txt || true
+          cat portable-out.txt
+          exit "$rc"
+
+      - name: 用嵌入式 Python 启动冒烟
+        shell: bash
+        run: |
+          python - <<'PY'
+          import http.client, json, os, subprocess, sys, time
+
+          # 被测进程用嵌入式运行时；本脚本用 runner 的 Python 做驱动
+          exe = os.path.join("runtime", "python-3.11-embed", "python.exe")
+          if not os.path.exists(exe):
+              raise SystemExit(f"嵌入式运行时不存在: {exe}")
+
+          env = {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
+          proc = subprocess.Popen(
+              [exe, "app/launcher.py", "--no-browser", "--port", "28902"],
+              env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+          )
+          ok = False
+          try:
+              for _ in range(60):
+                  time.sleep(1)
+                  try:
+                      c = http.client.HTTPConnection("127.0.0.1", 28902, timeout=3)
+                      c.request("GET", "/healthz", headers={"Host": "127.0.0.1:28902"})
+                      r = c.getresponse()
+                      body = r.read()
+                      c.close()
+                      if r.status == 200 and json.loads(body).get("ok"):
+                          ok = True
+                          break
+                  except Exception:
+                      pass
+              if not ok:
+                  raise SystemExit("嵌入式运行时未能在 60s 内就绪")
+
+              # 一个核心 API（能力清单）
+              c = http.client.HTTPConnection("127.0.0.1", 28902, timeout=10)
+              c.request("GET", "/api/import/formats", headers={"Host": "127.0.0.1:28902"})
+              r = c.getresponse()
+              caps = json.loads(r.read())["data"]
+              c.close()
+              print("支持扩展名:", len(caps["exts"]), "| PDF 后端:", caps["pdf_backend"])
+
+              # 优雅退出
+              c = http.client.HTTPConnection("127.0.0.1", 28902, timeout=10)
+              c.request("POST", "/api/system/shutdown", headers={
+                  "Host": "127.0.0.1:28902", "Content-Type": "application/json"}, body="{}")
+              c.getresponse().read()
+              c.close()
+
+              proc.wait(timeout=30)
+              if proc.returncode != 0:
+                  raise SystemExit(f"优雅退出返回码异常: {proc.returncode}")
+              print("进程已退出，返回码 0")
+
+              # 端口必须已释放
+              time.sleep(1)
+              probe = subprocess.run([exe, "-c",
+                  "import socket;s=socket.socket();"
+                  "s.settimeout(2);"
+                  "\nprint('PORT_FREE' if s.connect_ex(('127.0.0.1',28902))!=0 else 'PORT_STILL_BUSY')"],
+                  env=env, capture_output=True, text=True)
+              print(probe.stdout.strip() or probe.stderr.strip())
+              print("PORTABLE SMOKE OK")
+          finally:
+              if proc.poll() is None:
+                  proc.terminate()
+                  try:
+                      proc.wait(timeout=15)
+                  except subprocess.TimeoutExpired:
+                      proc.kill()
+          PY
