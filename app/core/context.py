@@ -31,6 +31,7 @@ class AppContext:
     _boot_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     # 索引结构升级状态（由 boot 的版本检查填写）
     _needs_full_rebuild: bool = False
+    _shutting_down: bool = False      # 初始化期间收到退出请求时置位，供 boot 提前收手
     _migration: dict = field(default_factory=dict)
 
     # ------------------------------------------------------------------
@@ -79,6 +80,14 @@ class AppContext:
             self.warnings.extend(resolved.warnings)
             self.notes.extend(resolved.notes)
 
+            # 初始化期间用户已经点了「安全退出」→ 提前收手。
+            # 否则下面会去写一个已被 shutdown 置空的 gateway，
+            # 抛 `'NoneType' object has no attribute 'embedder'`，
+            # 而且那次异常会被当成「初始化失败」上报给用户。
+            if self._shutting_down:
+                log.info("初始化期间收到退出请求，已中止后续初始化")
+                return self.boot_report
+
             self.gateway.embedder = self.embedder
 
             # 5) ⚠ 用真实维度建向量表。Ollama / API 的维度由模型决定（自动探测得到），
@@ -88,6 +97,10 @@ class AppContext:
             if actual_dim != self.db.embedding_dim:
                 log.info("向量表维度跟随嵌入模型：%d -> %d", self.db.embedding_dim, actual_dim)
                 self.db.embedding_dim = actual_dim
+            if self._shutting_down:      # 上面的嵌入源解析可能耗时较久
+                log.info("初始化期间收到退出请求，已中止建表")
+                return self.boot_report
+
             self.db.init_schema()
 
             # 3.5) 结构升级后的一次性全量重建。
@@ -171,6 +184,9 @@ class AppContext:
     # ------------------------------------------------------------------
     def shutdown(self) -> dict:
         report: dict = {"syncer": False, "db": {}}
+        # 先置位：boot 线程可能在初始化中途，它据此提前收手，
+        # 避免去操作马上要被置空的 gateway / db（实测会抛 AttributeError）。
+        self._shutting_down = True
         if self.syncer is not None:
             try:
                 self.syncer.stop()

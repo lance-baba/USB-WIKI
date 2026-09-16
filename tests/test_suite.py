@@ -783,6 +783,134 @@ def test_original_preview(ctx) -> None:
     check("Office 文档不内联（走下载）", ".docx" not in Handler.INLINE_TYPES)
 
 
+def test_lifecycle_shutdown() -> None:
+    """生命周期：安全退出必须**真的结束进程**，且初始化中途退出不能崩。
+
+    这两条都是 Portable CI 实测暴露出来的真实缺陷：
+
+    * `/api/system/shutdown` 此前只关库与 HTTP server，**从不设置 SHUTDOWN_EVENT**，
+      主线程永远停在 `while not SHUTDOWN_EVENT.is_set()` ——
+      表现是「端口释放了，但进程变成残留」。
+    * 初始化仍在进行时收到退出请求 → boot 线程继续跑到
+      `self.gateway.embedder = ...`，而 gateway 已被置空 →
+      `'NoneType' object has no attribute 'embedder'`，
+      且那次异常被当成「初始化失败」上报给用户。
+
+    这里用**真实子进程**验证 —— 静态断言挡不住这类问题。
+    """
+    section("生命周期：安全退出的正确性（真实子进程）")
+    import http.client
+    import json as _json
+    import socket
+    import subprocess
+    import sys
+    import time
+
+    exe = sys.executable
+    port = 28977
+
+    def call(method: str, path: str, body: str | None = None, timeout: float = 4.0):
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
+        hdrs = {"Host": f"127.0.0.1:{port}"}
+        if body is not None:
+            hdrs["Content-Type"] = "application/json"
+        c.request(method, path, headers=hdrs, body=body)
+        r = c.getresponse()
+        data = r.read()
+        c.close()
+        return r.status, data
+
+    def port_free() -> bool:
+        s = socket.socket()
+        s.settimeout(2)
+        try:
+            return s.connect_ex(("127.0.0.1", port)) != 0
+        finally:
+            s.close()
+
+    def spawn():
+        # 不用 PIPE：没人读会把子进程堵在 64KB 管道缓冲上（Portable CI 踩过）
+        f = open(f"lifecycle-{int(time.time()*1000)}.log", "wb")
+        p = subprocess.Popen(
+            [exe, "app/launcher.py", "--no-browser", "--port", str(port)],
+            stdout=f, stderr=subprocess.STDOUT,
+        )
+        return p, f
+
+    # ---------- 场景 A：初始化**尚未完成**时就退出 ----------
+    proc, logf = spawn()
+    try:
+        t0 = time.time()
+        while time.time() - t0 < 40:
+            try:
+                st, _ = call("GET", "/healthz")
+                if st == 200:
+                    break
+            except Exception:
+                pass
+            time.sleep(0.3)
+
+        st, _ = call("POST", "/api/system/shutdown", "{}")
+        check("初始化期间也能接受退出请求", st == 200, f"HTTP {st}")
+
+        exited = True
+        try:
+            proc.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            exited = False
+            proc.kill()
+        check("★ 初始化中途退出 → 进程真的结束（此前会残留）", exited)
+        time.sleep(1)
+        check("★ 退出后端口已释放", port_free())
+        logf.flush()
+        text = open(logf.name, encoding="utf-8", errors="replace").read()
+        check("★ 不再出现 'NoneType' 崩溃",
+              "NoneType" not in text,
+              [ln for ln in text.splitlines() if "NoneType" in ln][:2])
+        check("★ 不再把竞态当成「初始化失败」上报",
+              "初始化失败" not in text,
+              [ln for ln in text.splitlines() if "初始化失败" in ln][:2])
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        logf.close()
+        try:
+            __import__("os").unlink(logf.name)
+        except OSError:
+            pass
+
+    # ---------- 场景 B：就绪后正常退出（防回归）----------
+    proc2, logf2 = spawn()
+    try:
+        t0 = time.time()
+        while time.time() - t0 < 90:
+            try:
+                st, d = call("GET", "/api/status")
+                if st == 200 and (_json.loads(d).get("data") or {}).get("ready"):
+                    break
+            except Exception:
+                pass
+            time.sleep(1)
+        call("POST", "/api/system/shutdown", "{}")
+        exited = True
+        try:
+            proc2.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            exited = False
+            proc2.kill()
+        check("就绪后退出 → 进程结束且返回码为 0",
+              exited and proc2.returncode == 0, f"rc={proc2.returncode}")
+        time.sleep(1)
+        check("就绪后退出 → 端口已释放", port_free())
+    finally:
+        if proc2.poll() is None:
+            proc2.kill()
+        logf2.close()
+        try:
+            __import__("os").unlink(logf2.name)
+        except OSError:
+            pass
+
 def test_duplicate_url_detection(ctx) -> None:
     """同一来源 URL 判重：规范化 → 抓取前检查 → 由用户决定动作。
 
@@ -1723,6 +1851,7 @@ def main() -> int:
         # 测试不依赖外部 AI 服务：provider 用内存态覆盖（persist=False，不碰 config.ini）
         config.update({"AI": {"provider": "offline"}}, persist=False)
 
+        test_lifecycle_shutdown()
         test_duplicate_url_detection(ctx)
         test_localhost_security(ctx)
         test_schema_compatibility(ctx)

@@ -197,6 +197,13 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as exc:  # noqa: BLE001
             log.error("安全退出异常: %s", exc)
         log.info("安全退出完成，用时 %.0fms", (time.time() - t0) * 1000)
+        # ⚠ 必须唤醒主循环。
+        # 此前这里只关了库和 HTTP server，**从不设置 SHUTDOWN_EVENT**，
+        # 于是主线程永远停在 `while not SHUTDOWN_EVENT.is_set()` 上 ——
+        # 表现为「点了安全退出，端口释放了，但进程变成残留」。
+        # 信号路径（Ctrl+C / 关窗口）会设置它，所以那个入口一直正常，
+        # 掩盖了 API 退出路径的问题。
+        SHUTDOWN_EVENT.set()
 
     # 2.5) 索引结构兼容预检 —— 放在**绑定端口之前**：
     # 「索引由更新版本创建」时必须拒绝启动，而不是带病跑起来再报错。
