@@ -15,11 +15,20 @@ jobs:
   test:
     name: ${{ matrix.os }} / Python ${{ matrix.python }}
     runs-on: ${{ matrix.os }}
-    # Windows job 在 GitHub runner 上存在**未定位**的失败（本地 Windows 双环境
-    # 189/189 通过，Linux runner 亦全绿）。已试过 5 种诊断通道均拿不到日志 ——
-    # 公开仓库的 Actions 日志下载需要鉴权，而运行页面是 JS 渲染。
-    # 在定位前先让它不挡住徽章；失败仍会以警告形式显示在运行页上，并未隐藏。
-    continue-on-error: ${{ matrix.os == 'windows-latest' }}
+    # ⚠ 不要恢复 continue-on-error。曾用它「先让徽章变绿」，代价是
+    # Windows 上测试套件与冒烟测试**从未真正执行**，而工作流仍显示成功 ——
+    # 等于验收仪器本身坏了。任何平台的失败都必须让 workflow 真正失败。
+    #
+    # 此前 Windows 失败的真实原因（2026-09-16 定位）：
+    # GitHub 的 windows-latest runner 是**英文 locale（cp1252）**，而内联 Python
+    # 脚本向非 UTF-8 流打印中文会抛 UnicodeEncodeError。当时只有「启动冒烟」
+    # 步骤单独设了编码变量，其余步骤没有 —— 于是「环境自检」先炸，
+    # 后续步骤全部被跳过。
+    # 修法：在 **job 级**统一注入编码变量，新增步骤也自动继承，
+    # 不再依赖每个内联脚本各自记得设置。
+    env:
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: "utf-8"
     strategy:
       fail-fast: false          # 一个平台挂了也要看其它平台的结果
       matrix:
@@ -64,9 +73,7 @@ jobs:
 
       - name: 启动冒烟（服务能否真正起来并响应）
         shell: bash
-        env:
-          PYTHONUTF8: "1"          # 内联脚本不导入应用模块，需自行保证输出编码
-          PYTHONIOENCODING: utf-8
+        # 编码变量已由 job 级 env 统一注入，此处不再单独设置
         run: |
           python - <<'PY'
           import json, os, subprocess, sys, time, urllib.request
