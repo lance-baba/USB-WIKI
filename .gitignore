@@ -31,3 +31,18 @@ venv/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# ── 凭据类文件：绝不允许进仓库 ──────────────────────────────
+# 本地配置允许明文保存 API Key（Local-First），但**只在本机**。
+.env
+.env.*
+*.env
+secrets.txt
+credentials.json
+*.pem
+*.key
+id_rsa
+id_ed25519
+.gh_token*
+*_token.txt
+*_secret.txt

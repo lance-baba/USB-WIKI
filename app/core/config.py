@@ -10,7 +10,7 @@ import threading
 from pathlib import Path
 from typing import Any
 
-from . import atomic_io, paths
+from . import atomic_io, paths, redact
 from .log_util import get_logger
 
 log = get_logger()
@@ -215,6 +215,12 @@ def update(values: dict[str, dict[str, Any]], persist: bool = True) -> dict[str,
             if not p.has_section(section):
                 p.add_section(section)
             for key, value in items.items():
+                # ⚠ 脱敏占位值必须**跳过**：前端读取设置时拿到的是 `sk-****abcd`，
+                # 若用户只改了别的字段再保存，把这个占位写回去就会把真 key
+                # 覆盖成一串星号。**未修改 ≠ 要写回脱敏值。**
+                if redact.is_masked(value):
+                    continue
+                # 空串 = 明确清空（用户主动删掉 key）；此处不做「空即未改」的猜测
                 p.set(section, str(key), "" if value is None else str(value))
         if persist:
             try:

@@ -18,7 +18,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from .core import (archiver, config, crawler, graph as graph_mod, paths,
-                   search as search_mod, security as security_mod,
+                   redact as redact_mod, search as search_mod,
+                   security as security_mod,
                    topics as topics_mod)
 from .core.context import AppContext, get_ctx
 from .core.log_util import get_logger
@@ -314,13 +315,21 @@ class Handler(BaseHTTPRequestHandler):
         关键：若响应头**已经发出**（例如在 send_header 中途抛错），再补发一个 JSON 响应
         会让 HTTP 协议错乱、客户端一直等到超时。此时只能记日志并断开连接。
         """
-        log.error("%s %s 异常: %s\n%s", method, self.path, exc, traceback.format_exc())
+        # 异常文本可能来自第三方（上游服务会把 Authorization 原样回显进错误信息），
+        # 落日志与回前端**都要先脱敏**。
+        log.error("%s %s 异常: %s\n%s", method, self.path,
+                  redact_mod.sanitize_text(str(exc)),
+                  redact_mod.sanitize_text(traceback.format_exc()))
         if getattr(self, "_responded", False):
             log.error("响应头已发出，无法补发错误响应，直接断开连接")
             self.close_connection = True
             return
         try:
-            self._send_json({"code": status, "message": f"服务内部错误：{exc}"}, status)
+            self._send_json(
+                {"code": status,
+                 "message": redact_mod.sanitize_text(f"服务内部错误：{exc}")},
+                status,
+            )
         except Exception:  # noqa: BLE001 - 兜底失败只能静默断开
             self.close_connection = True
 
@@ -410,7 +419,18 @@ class Handler(BaseHTTPRequestHandler):
             )
 
         if path == "/api/config":
-            return self._send_json({"code": 200, "data": config.as_dict()})
+            # ⚠ 此前这里直接返回 config.as_dict() —— 把**明文 api_key**
+            # 通过 HTTP 发出去了。设置页读取只能拿到脱敏值（sk-****abcd），
+            # 是否已配置用单独的 *_set 字段表达。
+            masked = redact_mod.mask_config(config.as_dict())
+            for _sec, _items in masked.items():
+                if isinstance(_items, dict):
+                    for _k in list(_items):
+                        if redact_mod.is_secret_key(_k):
+                            _items[f"{_k}_set"] = bool(
+                                config.get_str(_sec, _k, "")
+                            )
+            return self._send_json({"code": 200, "data": masked})
 
         if path == "/api/import/formats":
             from .core import converters  # noqa: PLC0415

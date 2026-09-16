@@ -801,6 +801,160 @@ def test_original_preview(ctx) -> None:
     check("Office 文档不内联（走下载）", ".docx" not in Handler.INLINE_TYPES)
 
 
+def test_secret_redaction(ctx) -> None:
+    """Secret 脱敏：明文可存本地，但绝不意外向外泄露。
+
+    四条泄露路径都要堵：**Git / 日志 / HTTP 响应 / 异常信息**。
+    刻意不做 Keychain、DPAPI、配置加密 —— Local-First 产品没必要，
+    本轮只保证「不泄露」。
+    """
+    section("Secret 脱敏（Git / 日志 / 响应 / 异常）")
+    import io
+    import logging
+
+    from app.core import config, redact
+    from app.core.log_util import get_logger
+
+    SECRET = "sk-live-ABCDEFGH12345678"
+    SECRET2 = "sk-proj-ZZZZ9999YYYY8888"
+
+    # ---------- ① 脱敏函数本身 ----------
+    check("界面脱敏保留尾 4 位（便于用户辨认）",
+          redact.redact_secret(SECRET).endswith(SECRET[-4:])
+          and SECRET not in redact.redact_secret(SECRET),
+          redact.redact_secret(SECRET))
+    check("日志脱敏一律 <redacted>（不保留任何片段）",
+          redact.redact_for_log(SECRET) == "<redacted>")
+    check("空值脱敏后仍是空（不留「已设置」假象）", redact.redact_secret("") == "")
+    check("敏感头被整体抹掉",
+          redact.sanitize_headers({"Authorization": f"Bearer {SECRET}",
+                                   "User-Agent": "x"})["Authorization"] == "<redacted>")
+    check("敏感配置键识别",
+          redact.is_secret_key("api_key") and redact.is_secret_key("AUTH_TOKEN")
+          and not redact.is_secret_key("api_base_url"))
+    check("脱敏占位可识别（避免被写回）",
+          redact.is_masked(redact.redact_secret(SECRET)) and not redact.is_masked(SECRET))
+
+    # ---------- ② 第三方异常文本也要脱敏（容易漏）----------
+    for raw, label in [
+        (f"request failed:\nAuthorization: Bearer {SECRET}", "上游把 Authorization 回显进错误"),
+        (f"api_key={SECRET2}", "错误信息里带 api_key="),
+        ("proxy error http://user:secretpw@proxy.local:8080", "代理 URL 带 userinfo"),
+        (f"token: {SECRET}", "token: 形式"),
+    ]:
+        out = redact.sanitize_text(raw)
+        leaked = (SECRET in out) or (SECRET2 in out) or ("secretpw" in out)
+        check(f"★ 脱敏第三方异常：{label}", not leaked, out[:60])
+    check("base_url 里的 userinfo 被去掉",
+          redact.sanitize_url_userinfo("https://u:p@api.example.com/v1") == "https://api.example.com/v1")
+
+    # ---------- ③ 日志路径收口（Formatter 级）----------
+    log = get_logger()
+    buf = io.StringIO()
+    h = logging.StreamHandler(buf)
+    h.setFormatter(log.handlers[0].formatter)      # 复用脱敏 Formatter
+    log.addHandler(h)
+    try:
+        log.error("Authorization: Bearer %s", SECRET)
+        log.error("proxy http://user:secretpw@proxy.local:8080 failed")
+        log.error(f"api_key={SECRET2}")
+    finally:
+        log.removeHandler(h)
+    out = buf.getvalue()
+    check("★ 日志不出现完整 API key", SECRET not in out and SECRET2 not in out, out[:80])
+    check("★ 日志不出现代理密码", "secretpw" not in out, out[:80])
+
+    # ---------- ④ /api/status 不含 key ----------
+    from app.core.context import AppContext
+
+    st = ctx.status_payload() if hasattr(ctx, "status_payload") else None
+    if st is None:
+        import json as _json
+
+        from app.server import Handler as _H
+        st = _json.loads(_json.dumps(ctx.boot_report or {}, ensure_ascii=False))
+    check("★ /api/status 不含明文 key",
+          SECRET not in str(st) and "api_key\":" not in str(st).replace("api_key_configured", ""),
+          str(st)[:120])
+
+    # ---------- ⑤ Settings API：读取脱敏 / 写入不回灌掩码 ----------
+    orig_key = config.get_str("AI", "api_key", "")
+    orig_base = config.get_str("AI", "api_base_url", "")
+    try:
+        config.update({"AI": {"api_key": SECRET}}, persist=False)
+        view = redact.mask_config(config.as_dict())
+        ai = view.get("AI", {})
+        check("★ settings GET 不返回真实 key",
+              SECRET not in str(view), str(ai.get("api_key"))[:40])
+        check("settings GET 给出掩码与「是否已配置」",
+              redact.is_masked(ai.get("api_key")) and ai.get("api_key") == redact.redact_secret(SECRET),
+              str(ai.get("api_key")))
+
+        # 只改普通字段（key 位置带着掩码一起提交）→ key 必须保留
+        config.update({"AI": {"api_key": ai.get("api_key"), "api_base_url": "https://x.test/v1"}},
+                      persist=False)
+        check("★ 只改普通字段时 key 不被掩码覆盖",
+              config.get_str("AI", "api_key", "") == SECRET,
+              config.get_str("AI", "api_key", "")[:12])
+
+        # 明确清空 → 才删除
+        config.update({"AI": {"api_key": ""}}, persist=False)
+        check("★ 明确提交空串才清空 key", config.get_str("AI", "api_key", "") == "")
+
+        # 设置新 key
+        config.update({"AI": {"api_key": SECRET2}}, persist=False)
+        check("设置新 key 生效", config.get_str("AI", "api_key", "") == SECRET2)
+    finally:
+        config.update({"AI": {"api_key": orig_key, "api_base_url": orig_base}}, persist=False)
+
+    # ---------- ⑥ config 解析失败不误删 key ----------
+    config.update({"AI": {"api_key": SECRET}}, persist=False)
+    cfg_path = paths.CONFIG_FILE
+    before = cfg_path.read_text(encoding="utf-8") if cfg_path.exists() else ""
+    try:
+        cfg_path.write_text("[AI]\napi_key = " + SECRET + "\nembedding_dim = 不是数字\n[bogus\n",
+                           encoding="utf-8")
+        config.reload()
+        got = config.get_str("AI", "api_key", "")
+        check("★ config 有非法内容时 key 仍被读出（不误删）", got == SECRET, got[:12])
+    finally:
+        if before:
+            cfg_path.write_text(before, encoding="utf-8")
+        config.reload()
+
+    # ---------- ⑦ Git 防误提交 ----------
+    gi = (paths.BASE_DIR / ".gitignore")
+    gtxt = gi.read_text(encoding="utf-8") if gi.exists() else ""
+    for pat in ("config.ini", ".env"):
+        check(f"★ .gitignore 覆盖 {pat}", pat in gtxt)
+
+    import subprocess
+    tracked = ""
+    try:
+        tracked = subprocess.run(["git", "ls-files"], cwd=str(paths.BASE_DIR),
+                                 capture_output=True, text=True, timeout=20).stdout
+        suspicious = []
+        for rel in tracked.splitlines():
+            f = paths.BASE_DIR / rel
+            if not f.is_file() or f.stat().st_size > 2 * 1024 * 1024:
+                continue
+            try:
+                txt = f.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            for rx in (r"sk-[A-Za-z0-9]{20,}", r"(?i)bearer\s+[A-Za-z0-9_\-]{20,}",
+                       r"(?i)api[_-]?key\s*[:=]\s*[\"']?[A-Za-z0-9_\-]{20,}"):
+                import re as _re
+                if _re.search(rx, txt):
+                    suspicious.append((rel, rx[:20]))
+        check("★ 已跟踪文件中没有明显真实凭据", not suspicious, str(suspicious[:3]))
+    except (OSError, subprocess.SubprocessError) as exc:
+        skip("已跟踪文件凭据扫描", f"无法执行 git：{exc}")
+
+    check("config.ini 不在已跟踪列表（真凭据不会进仓库）",
+          "config.ini" not in (tracked if isinstance(tracked, str) else ""),
+          "config.ini 被跟踪了！")
+
 def test_import_security() -> None:
     """文件摄入边界：路径穿越 / ZIP 炸弹 / 特殊文件 / 落盘碰撞。
 
@@ -2501,6 +2655,7 @@ def main() -> int:
         # 测试不依赖外部 AI 服务：provider 用内存态覆盖（persist=False，不碰 config.ini）
         config.update({"AI": {"provider": "offline"}}, persist=False)
 
+        test_secret_redaction(ctx)
         test_import_security()
         test_archive_ssrf()
         test_ssrf_guard(ctx)

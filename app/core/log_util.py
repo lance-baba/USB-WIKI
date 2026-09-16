@@ -11,6 +11,29 @@ _LOGGER_NAME = "wikiusb"
 _configured = False
 
 
+class _RedactingFormatter(logging.Formatter):
+    """把**每一条日志**都过一遍脱敏。
+
+    为什么放在 Formatter 而不是逐个 log 调用点：日志路径太分散，
+    逐个改必然漏（第三方异常回显、proxy 报错、debug dump…）。
+    收口在这里，任何来源的字符串都会被清洗。
+    """
+
+    def format(self, record: logging.LogRecord) -> str:  # noqa: D102
+        try:
+            from . import redact  # noqa: PLC0415 - 延迟导入避免环
+
+            record.msg = redact.sanitize_text(str(record.msg))
+            if record.args:
+                record.args = tuple(
+                    redact.sanitize_text(a) if isinstance(a, str) else a
+                    for a in record.args
+                )
+            return redact.sanitize_text(super().format(record))
+        except Exception:  # noqa: BLE001 - 脱敏失败不能影响日志本身
+            return super().format(record)
+
+
 class _SafeStreamHandler(logging.StreamHandler):
     """控制台编码不兼容时（老式 CP936 终端）退化为可读转义，绝不抛 UnicodeEncodeError。"""
 
@@ -76,5 +99,14 @@ def setup(level: str = "INFO") -> logging.Logger:
     return logger
 
 
+def _attach_redacting_formatter(logger: logging.Logger) -> None:
+    """给所有 handler 挂上脱敏 Formatter（只挂一次）。"""
+    for h in logger.handlers:
+        if not isinstance(h.formatter, _RedactingFormatter):
+            h.setFormatter(_RedactingFormatter("%(message)s"))
+
+
 def get_logger() -> logging.Logger:
-    return setup()
+    logger = setup()
+    _attach_redacting_formatter(logger)      # 所有日志过一遍脱敏
+    return logger
