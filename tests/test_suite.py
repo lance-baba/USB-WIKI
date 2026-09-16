@@ -3455,6 +3455,10 @@ def main() -> int:
         test_no_absolute_paths()
         from tests.test_converters import run as run_converter_tests
         run_converter_tests(check)
+        # 发布完整性校验器自身也要被回归：一个永远返回「可交付」的校验器
+        # 比没有校验器更危险 —— 这里用负向构造逼它必须报错。
+        from tests.test_release_verify import run as run_release_verify_tests
+        run_release_verify_tests(check)
         test_port_probe()
         test_signature_guard()
         test_wal_self_heal()

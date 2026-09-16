@@ -118,7 +118,7 @@ Wiki-USB/
 ├── 启动-Windows.bat            # Windows 入口（UTF-8 编码锁死 + 内置环境静默呼出）
 ├── 启动-macOS.command          # macOS 入口（权限与依赖检测）
 ├── 启动-Linux.sh               # Linux 入口
-├── setup_runtime_windows.py    # 嵌入式运行时安装器 / 体检器
+├── setup_runtime_windows.py    # 嵌入式运行时安装器 / 体检器 / 发布校验器 / 垃圾清理
 ├── config.ini                  # 主配置（明文；首次运行自动生成）
 ├── requirements.txt
 ├── runtime/                    # [仅 Windows 发布版] 嵌入式 Python 3.11 + 预编译依赖
@@ -207,7 +207,11 @@ embedding_dim = 512
 python tests/test_suite.py     # 切片/检索/网关/主题分组/破坏性/数据安全/原子写/结构升级/安全边界
                                # 末行输出 TOTAL/PASS/SKIP/FAIL；离线时网络用例记 SKIP，总数不变
 python tests/smoke_core.py     # 核心链路冒烟（4 组查询）
-python setup_runtime_windows.py --check    # 发布前运行时体检
+python setup_runtime_windows.py --check           # 运行时体检（解释器 / _pth / 依赖包能否跑起来）
+python setup_runtime_windows.py --verify          # 发布完整性校验（答「这个 U 盘能不能交付」）
+python setup_runtime_windows.py --verify --json   # 同上，输出 JSON 供 CI 消费
+python setup_runtime_windows.py --clean           # 清理工程垃圾（__pycache__ / .pyc）
+python setup_runtime_windows.py --clean --dry-run # 只预览将被清除的内容，不实际删除
 ```
 
 测试覆盖 TC-01 / 03 / 04 / 05 的可自动化等价场景；

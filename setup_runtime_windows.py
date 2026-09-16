@@ -10,7 +10,9 @@
     python setup_runtime_windows.py                # 精简安装（约 65MB，需联网一次）
     python setup_runtime_windows.py --dev           # 开发安装：用 requirements.txt 浮动区间
     python setup_runtime_windows.py --with-onnx    # 同时启用本地 ONNX 嵌入引擎
-    python setup_runtime_windows.py --check        # 仅体检现有运行时
+    python setup_runtime_windows.py --check        # 体检现有运行时**能否跑起来**
+    python setup_runtime_windows.py --verify       # 发布完整性校验：答「这个 U 盘能否交付」
+    python setup_runtime_windows.py --verify --json # 同上，输出 JSON 供 CI 消费
 
 依赖来源：
     发布构建默认读取 requirements-release.lock（== 精确锁定、可复现）；
@@ -22,7 +24,10 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -242,9 +247,212 @@ def check() -> int:
     return 0 if ok else 1
 
 
+# =====================================================================
+# 发布完整性校验：回答「这个 U 盘内容能不能直接交付给用户」
+#
+# 与 check() 的区别 —— 两者职责不重叠，别合并：
+#   check()  体检 **运行时能不能跑起来**（python.exe / _pth / 依赖包）
+#   verify() 校验 **交付完整性**（文件齐不齐 / 资产在不在 / 是否偷偷依赖外网）
+# Portable 发布的实际门槛是后者：跑得起来 ≠ 可以交付。
+# =====================================================================
+
+VERIFY_ROOT_FILES = [
+    "README.md", "LICENSE", "config.ini",
+    "requirements.txt", "requirements-release.lock",
+    "setup_runtime_windows.py",
+]
+VERIFY_LAUNCHERS = ["启动-Windows.bat", "启动-macOS.command", "启动-Linux.sh"]
+VERIFY_DIRS = [
+    "app", "app/core", "app/api", "app/web",
+    "data", "data/notes", "data/originals",
+    "docs", "tests",
+]
+VERIFY_APP_PY = ["app/launcher.py", "app/server.py", "app/version.py"]
+# server.py 模块化后的七个域模块（app/api），缺一个即某组 API 全挂
+VERIFY_API_MODULES = [
+    f"app/api/{m}.py"
+    for m in ("system", "config", "diagnostics", "search", "ask", "library", "capture")
+]
+# 前端拆分产物（index.html 壳 + app.css + app.js），三者缺一不可
+VERIFY_WEB_ASSETS = ["app/web/index.html", "app/web/app.css", "app/web/app.js"]
+
+# 前端资产里**不允许**出现的外部引用 —— 零 CDN 是 Portable 的立身之本。
+# 只匹配「加载语义」的外链（src=/href= 与 CSS url()），
+# 不误伤 JS 字符串里出现的普通 https:// 文本（那不是资源引用）。
+_EXTERNAL_URL_RE = re.compile(r"""(?:src|href)\s*=\s*["']\s*(?:https?:)?//""", re.I)
+_CSS_IMPORT_URL_RE = re.compile(r"""url\(\s*["']?\s*(?:https?:)?//""", re.I)
+_WEB_SCAN_SUFFIX = {".html", ".css", ".js"}
+# 遍历源目录时跳过的子树：runtime 体量大且为官方发行包自带，
+# data 是用户真相源只可能含用户自己的文件。
+_JUNK_SKIP_TREES = {"runtime", "data", ".git", ".venv", "node_modules"}
+
+OK = "✅"
+BAD = "❌"
+WARN = "⚠"
+
+
+def _exists(rel: str) -> bool:
+    return (BASE / rel).exists()
+
+
+def _scan_external_refs() -> list[str]:
+    """前端资产里残留的外部资源引用 —— 有任一处即违反「完全离线」。"""
+    hits: list[str] = []
+    web = BASE / "app" / "web"
+    if not web.exists():
+        return hits
+    for f in sorted(web.rglob("*")):
+        if not f.is_file() or f.suffix.lower() not in _WEB_SCAN_SUFFIX:
+            continue
+        try:
+            text = f.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        for lineno, line in enumerate(text.splitlines(), 1):
+            if _EXTERNAL_URL_RE.search(line) or _CSS_IMPORT_URL_RE.search(line):
+                hits.append(f"{f.relative_to(web)}:{lineno}")
+    return hits
+
+
+def _scan_build_junk() -> list[str]:
+    """工程垃圾：__pycache__ 目录与 .pyc/.pyo/.DS_Store/Thumbs.db。
+
+    只报告不删除 —— 清理是 ``--clean`` 的职责，这里避免职责重叠。
+    """
+    junk: list[str] = []
+    for root, dirs, files in os.walk(BASE):
+        rel = Path(root).relative_to(BASE)
+        parts = rel.parts
+        if parts and parts[0] in _JUNK_SKIP_TREES:
+            dirs[:] = []
+            continue
+        for d in list(dirs):
+            if d == "__pycache__":
+                junk.append(str(rel / d) if str(rel) != "." else d)
+                dirs.remove(d)                      # prune，不递归进去
+        for fn in files:
+            if fn.endswith((".pyc", ".pyo")) or fn in (".DS_Store", "Thumbs.db"):
+                junk.append(str(rel / fn) if str(rel) != "." else fn)
+    return junk
+
+
+def verify(*, as_json: bool = False) -> int:
+    """发布完整性校验：文件齐不齐、资产在不在、有没有偷偷依赖外网。
+
+    *as_json* 为真时输出结构化结果供 CI 消费；否则输出人类可读报告。
+    退出码一致：0 = 可交付，1 = 存在阻断项（缺文件或外链）。
+    """
+    missing: list[str] = []
+    warns: list[str] = []
+    rows: list[tuple[str, str, str]] = []
+
+    def row(title: str, status: str, detail: str) -> None:
+        rows.append((title, status, detail))
+        if not as_json:
+            print(f"  {title:<10}: {status} {detail}")
+
+    def group(title: str, rels: list[str]) -> None:
+        miss = [r for r in rels if not _exists(r)]
+        if miss:
+            missing.extend(miss)
+            shown = ", ".join(miss[:3]) + ("…" if len(miss) > 3 else "")
+            row(title, BAD, f"缺 {len(miss)} 项 -> {shown}")
+        else:
+            row(title, OK, f"{len(rels)} 项齐全")
+
+    if not as_json:
+        print("=" * 66)
+        print("  Wiki-USB 发布完整性校验")
+        print("=" * 66)
+        print(f"  发布根目录 : {BASE}")
+        print(f"  校验平台   : {platform.system()} ({os.name})")
+        print("-" * 66)
+
+    group("根文件", VERIFY_ROOT_FILES)
+    group("启动脚本", VERIFY_LAUNCHERS)
+    group("目录骨架", VERIFY_DIRS)
+    group("应用核心", VERIFY_APP_PY)
+    group("API 模块", VERIFY_API_MODULES)
+    group("前端资产", VERIFY_WEB_ASSETS)
+
+    # data/cache.db 是**可重建的衍生索引**（MD 才是真相源），缺失只警告不阻断
+    if not _exists("data/cache.db"):
+        warns.append("data/cache.db 未生成 —— 首次启动会自动重建，不影响发布")
+        row("索引缓存", WARN, "未生成（首次启动自动重建，非阻断）")
+    else:
+        row("索引缓存", OK, "已存在")
+
+    docs = sorted((BASE / "docs").glob("*.md")) if _exists("docs") else []
+    if len(docs) < 4:
+        warns.append(f"docs/ 下 .md 仅 {len(docs)} 篇，文档四件套可能不全")
+        row("文档", WARN, f"仅 {len(docs)} 篇")
+    else:
+        row("文档", OK, f"{len(docs)} 篇")
+
+    # 嵌入式运行时：Windows 发布必需；macOS / Linux 走宿主 Python（PRD 设计如此）
+    if os.name == "nt":
+        rt_items = ("python.exe", "python311._pth", "Lib/site-packages")
+        rt_miss = [p for p in rt_items if not (EMBED_DIR / p).exists()]
+        if rt_miss:
+            missing.extend(f"runtime/python-3.11-embed/{p}" for p in rt_miss)
+            row("运行时", BAD, f"缺 {', '.join(rt_miss)}，请先执行安装")
+        else:
+            row("运行时", OK, "python.exe + _pth + site-packages")
+    elif EMBED_PY.exists():
+        row("运行时", OK, "存在")
+    else:
+        row("运行时", WARN, "未打包（非 Windows 由宿主 Python 运行，正常）")
+
+    # 离线自包含：Portable 的底线 —— U 盘拔出网络也必须完整可用
+    ext = _scan_external_refs()
+    if ext:
+        missing.extend(f"外链引用 {h}" for h in ext)
+        row("离线自包含", BAD, f"前端残留 {len(ext)} 处外链 -> {', '.join(ext[:3])}")
+    else:
+        row("离线自包含", OK, "前端无 CDN / 外部资源引用")
+
+    junk = _scan_build_junk()
+    if junk:
+        warns.append(f"{len(junk)} 项工程垃圾未清理")
+        row("发布清洁度", WARN, f"{len(junk)} 项垃圾（__pycache__/.pyc），建议 --clean")
+    else:
+        row("发布清洁度", OK, "无构建残留")
+
+    deliverable = not missing
+
+    if as_json:
+        print(json.dumps({
+            "deliverable": deliverable,
+            "root": str(BASE),
+            "platform": platform.system(),
+            "missing": missing,
+            "warnings": warns,
+            "checks": [{"name": n, "status": s, "detail": d} for n, s, d in rows],
+        }, ensure_ascii=False, indent=2))
+        return 0 if deliverable else 1
+
+    print("=" * 66)
+    if missing:
+        print(f"  结论：{BAD} 不可交付 —— 缺失 {len(missing)} 项")
+        for m in missing[:10]:
+            print(f"        - {m}")
+        if len(missing) > 10:
+            print(f"        … 其余 {len(missing) - 10} 项")
+    else:
+        print(f"  结论：{OK} 可直接交付")
+    for w in warns:
+        print(f"  提示：{WARN} {w}")
+    print("=" * 66)
+    return 0 if deliverable else 1
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Wiki-USB Windows 嵌入式运行时安装器")
-    ap.add_argument("--check", action="store_true", help="仅体检，不做任何修改")
+    ap.add_argument("--check", action="store_true", help="仅体检现有运行时能否跑起来")
+    ap.add_argument("--verify", action="store_true",
+                    help="发布完整性校验：文件/资产/启动脚本齐不齐、是否残留外链（答「能否交付」）")
+    ap.add_argument("--json", action="store_true",
+                    help="以 JSON 输出校验结果（配合 --verify，便于 CI 消费）")
     ap.add_argument("--with-onnx", action="store_true", help="额外下载本地 ONNX 嵌入模型")
     ap.add_argument("--no-mirror", action="store_true", help="不使用清华 PyPI 镜像")
     ap.add_argument("--dev", action="store_true",
@@ -254,6 +462,9 @@ def main() -> int:
 
     if args.check:
         return check()
+
+    if args.verify:
+        return verify(as_json=args.json)
 
     if os.name != "nt":
         print("[setup] 提示：本脚本用于生成 Windows 发布版。")
