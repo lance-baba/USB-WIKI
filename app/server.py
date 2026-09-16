@@ -17,11 +17,11 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from .core import (archiver, config, crawler, paths,
-                   redact as redact_mod, search as search_mod,
+from .core import (archiver, crawler, paths,
+                   redact as redact_mod,
                    security as security_mod)
 from .api import (ask as api_ask, config as api_config, diagnostics as api_diagnostics,
-                  search as api_search, system as api_system)
+                  library as api_library, search as api_search, system as api_system)
 from .core.context import AppContext, get_ctx
 from .core.log_util import get_logger
 
@@ -371,20 +371,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         if api_ask.handle_get(self, path):
             return
-
-        if path == "/api/notes":
-            limit = int((q.get("limit") or ["200"])[0])
-            return self._send_json(
-                {"code": 200, "data": search_mod.rank_documents(self.ctx.db, limit=limit)}
-            )
-
-        if path == "/api/notes/content":
-            rel = (q.get("path") or [""])[0]
-            return self._note_content(rel)
-
-        if path == "/api/notes/original":
-            rel = (q.get("path") or [""])[0]
-            return self._note_original(rel)
+        if api_library.handle_get(self, path):
+            return
 
         if path == "/api/capture/duplicate":
             target = (q.get("url") or [""])[0]
@@ -394,11 +382,6 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json(
                 {"ok": True, "data": {"duplicate": bool(found), "existing": found or None}}
             )
-
-        if path == "/api/import/formats":
-            from .core import converters  # noqa: PLC0415
-
-            return self._send_json({"code": 200, "data": converters.supported_extensions()})
 
         return self._send_json({"code": 404, "message": "接口不存在"}, 404)
 
@@ -412,6 +395,8 @@ class Handler(BaseHTTPRequestHandler):
         if api_config.handle_post(self, path):
             return
         if api_ask.handle_post(self, path):
+            return
+        if api_library.handle_post(self, path):
             return
 
         if path == "/api/capture/url":
@@ -430,161 +415,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json(result.to_dict(), 409)
             return self._send_json(result.to_dict(), 200 if result.ok else 500)
 
-        if path == "/api/notes/save":
-            body = self._read_json()
-            result = crawler.save_manual_note(
-                str(body.get("title") or ""),
-                str(body.get("content") or ""),
-                db=self.ctx.db,
-                embedder=self.ctx.embedder,
-            )
-            return self._send_json(result.to_dict(), 200 if result.ok else 400)
-
-        if path == "/api/notes/import":
-            return self._import_notes()
-
         return self._send_json({"code": 404, "message": "接口不存在"}, 404)
-
-    # ------------------------------------------------------------------
-    def _import_notes(self) -> None:
-        """批量导入文件（拖拽上传落点）。
-
-        载荷支持两种编码：
-        * ``content``          纯文本（.md/.txt 等文本类格式）
-        * ``content_base64``   二进制（.docx/.pdf/.xlsx 等），前端按需选用
-        """
-        import base64
-
-        body = self._read_json()
-        items = body.get("files")
-        if not isinstance(items, list) or not items:
-            items = [{
-                "filename": body.get("filename"),
-                "content": body.get("content"),
-                "content_base64": body.get("content_base64"),
-            }]
-
-        if len(items) > 200:
-            return self._send_json({"code": 400, "message": "单次最多导入 200 个文件"}, 400)
-
-        results = []
-        for it in items:
-            if not isinstance(it, dict):
-                continue
-            fname = str(it.get("filename") or "")
-            b64 = it.get("content_base64")
-            if isinstance(b64, str) and b64.strip():
-                try:
-                    data = base64.b64decode(b64, validate=False)
-                except Exception as exc:  # noqa: BLE001
-                    results.append({"ok": False, "filename": fname,
-                                    "message": f"base64 解码失败：{exc}", "file_path": "",
-                                    "title": "", "char_count": 0})
-                    continue
-            else:
-                data = str(it.get("content") or "").encode("utf-8")
-
-            r = crawler.import_document(
-                fname, data, db=self.ctx.db, embedder=self.ctx.embedder
-            )
-            results.append({
-                "ok": r.ok, "filename": fname, "message": r.message,
-                "file_path": r.file_path, "title": r.title, "char_count": r.char_count,
-                "extractor": r.used,
-            })
-
-        ok_n = sum(1 for r in results if r["ok"])
-        return self._send_json({
-            "code": 200,
-            "message": f"导入完成：成功 {ok_n} / {len(results)}",
-            "data": {"results": results, "ok": ok_n, "total": len(results)},
-        })
-
-    def _note_content(self, rel: str) -> None:
-        if not rel:
-            return self._send_json({"code": 400, "message": "缺少 path 参数"}, 400)
-        try:
-            target = paths.abs_from_data(rel)
-        except Exception:  # noqa: BLE001
-            return self._send_json({"code": 400, "message": "非法路径"}, 400)
-        # 防路径穿越：必须落在 data/ 之下
-        try:
-            target.resolve().relative_to(paths.DATA_DIR.resolve())
-        except ValueError:
-            return self._send_json({"code": 403, "message": "越权访问被拒绝"}, 403)
-        if not target.is_file():
-            return self._send_json({"code": 404, "message": "文件不存在"}, 404)
-        try:
-            text = target.read_text(encoding="utf-8", errors="replace")
-        except OSError as exc:
-            return self._send_json({"code": 500, "message": f"读取失败：{exc}"}, 500)
-
-        # 附带原件信息，供前端「原版预览」决定用原生查看器还是沙箱 iframe
-        orig = crawler.find_original(rel)
-        original = None
-        if orig is not None:
-            ext = orig.suffix.lower()
-            try:
-                size = orig.stat().st_size
-            except OSError:
-                size = 0
-            original = {
-                "path": paths.rel_to_data(orig),
-                "name": orig.name,
-                "ext": ext,
-                "size": size,
-                "inline": ext in self.INLINE_TYPES,
-                "kind": {"pdf": "pdf", ".html": "html", ".htm": "html"}.get(ext, ext.lstrip(".")),
-            }
-        return self._send_json(
-            {
-                "code": 200,
-                "data": {
-                    "path": rel,
-                    "content": text,
-                    "size": target.stat().st_size,
-                    "original": original,
-                },
-            }
-        )
-
-    def _note_original(self, rel: str) -> None:
-        """返回笔记对应的**原件**（导入的 PDF/Office、剪藏的原始 HTML）。"""
-        if not rel:
-            return self._send_json({"code": 400, "message": "缺少 path 参数"}, 400)
-        try:
-            orig = crawler.find_original(rel)
-        except Exception:  # noqa: BLE001
-            orig = None
-        if orig is None:
-            return self._send_json({"code": 404, "message": "该笔记没有留存原件"}, 404)
-        # 二次防线：解析后必须仍在 data/originals 之下
-        try:
-            orig.resolve().relative_to(paths.ORIGINALS_DIR.resolve())
-        except (ValueError, OSError):
-            return self._send_json({"code": 403, "message": "越权访问被拒绝"}, 403)
-
-        ext = orig.suffix.lower()
-        ctype = self.INLINE_TYPES.get(ext) or mimetypes.guess_type(str(orig))[0] \
-            or "application/octet-stream"
-        if ctype.startswith("text/"):
-            ctype += "; charset=utf-8"
-        inline = (self.query_flag("download") != "1") and ext in self.INLINE_TYPES
-
-        # 剪藏的原网页：判定它是「离线存档」还是「旧存档」。
-        # - 已本地化（HTML 里引用了本地资源池）：**不注入 base** ——
-        #   根相对路径天然指向本服务，浏览时零外部请求，真正离线可用。
-        # - 未本地化（旧存档）：保持原有的联网行为，避免存量页面退化成裸 HTML。
-        if inline and ext in (".html", ".htm"):
-            try:
-                text = orig.read_text(encoding="utf-8", errors="replace")
-                if archiver.ASSET_URL_PREFIX not in text:
-                    text = crawler.inject_base_href(text, crawler.source_url_of(rel))
-                return self._send_buffer(text.encode("utf-8"), ctype, True, orig.name)
-            except OSError:
-                pass   # 读失败则退回按原样流式发送
-
-        return self._send_file_range(orig, ctype, inline)
 
     def _serve_static(self, file: Path) -> None:
         try:
