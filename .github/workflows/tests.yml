@@ -166,9 +166,13 @@ jobs:
               raise SystemExit(f"嵌入式运行时不存在: {exe}")
 
           env = {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
+          # ⚠ 不要用 subprocess.PIPE：没人读管道时，子进程日志写满 64KB 系统缓冲
+          # 就会阻塞在 write 上，表现为「优雅退出永远等不到」。
+          # 上一版就是这么超时的 —— 重定向到文件，既没有缓冲问题，失败时还能看日志。
+          logf = open("portable-smoke.log", "wb")
           proc = subprocess.Popen(
               [exe, "app/launcher.py", "--no-browser", "--port", "28902"],
-              env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+              env=env, stdout=logf, stderr=subprocess.STDOUT,
           )
           ok = False
           try:
@@ -203,7 +207,14 @@ jobs:
               c.getresponse().read()
               c.close()
 
-              proc.wait(timeout=30)
+              try:
+                  proc.wait(timeout=90)
+              except subprocess.TimeoutExpired:
+                  logf.flush()
+                  print("=== 进程未在 90s 内退出，末尾日志 ===")
+                  print(open("portable-smoke.log", encoding="utf-8", errors="replace")
+                        .read()[-2500:])
+                  raise SystemExit("优雅退出超时（服务未退出）")
               if proc.returncode != 0:
                   raise SystemExit(f"优雅退出返回码异常: {proc.returncode}")
               print("进程已退出，返回码 0")
