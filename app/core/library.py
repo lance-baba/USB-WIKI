@@ -74,6 +74,29 @@ class DataFormatTooNewError(RuntimeError):
         )
 
 
+class ManifestCorruptedError(RuntimeError):
+    """library.json **存在但无法解析**。
+
+    ⚠「已有资料 + manifest 损坏」与「空白新库」完全不是一回事，
+    绝不能解析失败 → 当新库 → 自动生成新 manifest（那会丢掉 library_id
+    并掩盖真实状态）。恢复必须走**显式**的 :meth:`Library.repair_manifest`。
+    """
+
+    code = "MANIFEST_CORRUPTED"
+
+    def __init__(self, detail: str = "") -> None:
+        self.detail = detail
+        super().__init__(
+            "library.json 已损坏，为保护资料未做任何修改。"
+            "请修复该文件，或显式调用 repair_manifest() 重建"
+            + (f"（{detail}）" if detail else "")
+        )
+
+
+# 历史 USB-WIKI 资料库：有 notes/originals/assets 等资料结构，但没有 manifest。
+LEGACY_DATA_FORMAT = 0
+
+
 @dataclass
 class Library:
     """资料库句柄。所有路径都是**相对 Library 根**推导出来的。"""
@@ -112,20 +135,29 @@ class Library:
 
     # ---- manifest ----
     def read_manifest(self) -> dict:
-        """读 library.json；不存在或损坏时返回空 dict（由 ensure 决定怎么建）。"""
+        """读 library.json。
+
+        * 不存在 → 返回 ``{}``（是否是空白新库由 :meth:`ensure` 结合资料判断）
+        * **存在但损坏 → 抛** :class:`ManifestCorruptedError`，绝不静默当新库
+        """
         p = self.manifest_path
         if not p.exists():
             return {}
         try:
             data = json.loads(p.read_text(encoding="utf-8"))
-            return data if isinstance(data, dict) else {}
         except (OSError, ValueError) as exc:
-            log.warning("library.json 无法解析（将重新生成）: %s", exc)
-            return {}
+            raise ManifestCorruptedError(str(exc)[:120]) from exc
+        if not isinstance(data, dict):
+            raise ManifestCorruptedError("顶层不是 JSON 对象")
+        return data
 
-    def write_manifest(self, *, created_by: str) -> dict:
-        """写入 / 更新 library.json。**只放格式识别所需的最小信息。**"""
-        cur = self.read_manifest()
+    def write_manifest(self, *, created_by: str, force: bool = False) -> dict:
+        """写入 / 更新 library.json。**只放格式识别所需的最小信息。**
+
+        :param force: 显式重建（仅限 :meth:`repair_manifest` 调用）。
+            损坏的 manifest 不能被常规写入路径悄悄覆盖。
+        """
+        cur = {} if force else self.read_manifest()
         data = {
             "format": LIBRARY_FORMAT,
             "data_version": DATA_FORMAT_VERSION,
@@ -133,6 +165,11 @@ class Library:
             "created_at": cur.get("created_at") or datetime.now().isoformat(timespec="seconds"),
             "library_id": cur.get("library_id") or uuid.uuid4().hex[:16],
         }
+        # 保留当前程序不认识的未知字段：读取可忽略，但**写回时不得丢弃**，
+        # 否则「新版程序读一次 → 未知字段被抹掉」就成了一种静默降级。
+        for k, v in cur.items():
+            if k not in data:
+                data[k] = v
         # 原子写：manifest 也是用户资料的一部分，写坏等于资料库打不开
         from . import atomic_io  # noqa: PLC0415
 
@@ -141,15 +178,49 @@ class Library:
         )
         return data
 
+    def repair_manifest(self, *, created_by: str) -> dict:
+        """**显式**重建损坏的 manifest（供将来「修复资料库」UI 调用）。
+
+        ⚠ 绝不允许由 :meth:`ensure` 自动触发 —— 自动重建会生成新的
+        ``library_id`` 并掩盖「资料库曾经损坏」这一事实。
+        """
+        log.warning("显式重建 library.json（repair_manifest），created_by=%s", created_by)
+        return self.write_manifest(created_by=created_by, force=True)
+
+    def _has_permanent_data(self) -> bool:
+        """永久目录里是否已有任何资料（用于区分空白新库 / Legacy V0）。"""
+        for d in PERMANENT_DIRS:
+            p = self.root / d
+            if p.is_dir() and any(p.iterdir()):
+                return True
+        return False
+
     def ensure(self, *, created_by: str) -> dict:
         """确保目录齐备 + manifest 存在 + **格式版本兼容**。
 
-        遇到比自己新的资料格式直接拒绝（:class:`DataFormatTooNewError`）。
+        三种互斥的入口状态（严格区分，见 Data Contract）：
+
+        * ``library.json`` 损坏 → :class:`ManifestCorruptedError`（**先于任何写操作**）
+        * 无 manifest 但已有资料 → Legacy Format 0，安全接管为 V1（幂等）
+        * 无 manifest 且空目录 → 全新 V1
         """
-        for d in PERMANENT_DIRS:
-            (self.root / d).mkdir(parents=True, exist_ok=True)
+        # ① 先读 manifest：损坏必须在**任何 mkdir/写操作之前**失败
         m = self.read_manifest()
 
+        # ② 再建目录
+        for d in PERMANENT_DIRS:
+            (self.root / d).mkdir(parents=True, exist_ok=True)
+
+        # ③ 无 manifest：区分空白新库 / Legacy V0
+        if not m:
+            if self._has_permanent_data():
+                log.info("检测到无 manifest 的历史资料库（Data Format %d），安全接管为 V1",
+                         LEGACY_DATA_FORMAT)
+                # 只新增 library.json；notes/originals/assets/snapshots 一律不动
+                return self.write_manifest(created_by=created_by)
+            return self.write_manifest(created_by=created_by)
+
+        # ④ 有效 manifest：检查兼容性，然后**原样返回，绝不回写**
         ver = m.get("data_version")
         if isinstance(ver, int) and ver > DATA_FORMAT_VERSION:
             raise DataFormatTooNewError(ver, DATA_FORMAT_VERSION)
@@ -157,10 +228,9 @@ class Library:
         if fmt and fmt != LIBRARY_FORMAT:
             # 不是我们的资料库（用户指错了目录）—— 不擅自改动
             raise ValueError(f"该目录不是 USB-WIKI 资料库（format={fmt!r}）")
-
-        if not m:
-            return self.write_manifest(created_by=created_by)
         # 版本更旧：留给将来的 migration（本轮不动）
+        # ⚠ 未知字段 / 未来字段：读取时忽略即可，**不得读一次就把文件重写成
+        #   当前程序的简化格式**（否则旧程序+新 manifest 会静默降级）。
         return m
 
     # ---- 相对路径（永久 metadata 只允许相对路径）----

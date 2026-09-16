@@ -222,7 +222,7 @@ def test_crawler(ctx) -> None:
         # SSRF 策略拒绝属**环境问题**：某些网络/代理会把公网域名解析成非公网地址
         # （本机实测 example.com → 198.18.0.120），此时拒绝是**正确行为**，
         # 不该算被测对象失败 → 六条一起记 SKIP。判断必须放在第一条 check 之前。
-        if "公网地址" in r1.message:
+        if "出于安全考虑已拒绝" in r1.message:   # 覆盖 NOT_PUBLIC 与 MIXED 两种文案
             for _n in NET_CASES:
                 skip(_n, "目标被 SSRF 策略拒绝（当前网络解析到非公网地址）")
             bad = crawler.capture_url("ftp://x", db=None)
@@ -247,7 +247,8 @@ def test_crawler(ctx) -> None:
         # 非公网地址（本机实测 example.com → 198.18.0.120），此时拒绝是正确行为，
         # 不该算被测对象失败 → 记 SKIP。
         net_err = (not r2.ok) and any(
-            k in r2.message for k in ("urlopen error", "ProxyError", "Tunnel connection", "HTTP 0")
+            k in r2.message for k in ("urlopen error", "ProxyError", "Tunnel connection",
+                                      "HTTP 0", "出于安全考虑已拒绝")
         )
         if net_err:
             for _n in NET_CASES[3:]:
@@ -801,6 +802,153 @@ def test_original_preview(ctx) -> None:
     check("HTML 允许内联预览（沙箱 iframe）", Handler.INLINE_TYPES.get(".html") == "text/html")
     check("Office 文档不内联（走下载）", ".docx" not in Handler.INLINE_TYPES)
 
+
+def test_manifest_recovery() -> None:
+    """Data Contract 收尾：manifest 损坏与 legacy library 的安全接管。
+
+    五种入口状态**严格互斥、不得混淆**：
+      ① 空目录 + 无 manifest        → 新建 V1
+      ② 有资料 + 无 manifest        → Legacy Format 0 → 安全接管为 V1（幂等）
+      ③ manifest 损坏 + 有资料      → MANIFEST_CORRUPTED，永久资料一字不动
+      ④ manifest 损坏 + 空目录      → 仍是 MANIFEST_CORRUPTED（有文件就不是新库）
+      ⑤ 未来 data_version           → 拒绝写入
+
+    另外：**读取 manifest 绝不回写文件**（未知字段不得被当前程序抹掉）。
+    """
+    section("Data Contract 收尾（manifest 损坏 / legacy 接管 / 幂等）")
+    import hashlib
+    import json
+    import shutil
+    import tempfile
+
+    from app.core.library import (DATA_FORMAT_VERSION, LIBRARY_FORMAT, MANIFEST_NAME,
+                                  Library, ManifestCorruptedError)
+
+    tmp = Path(tempfile.mkdtemp(prefix="wikiusb_mani_"))
+
+    def sha_tree(root: Path) -> dict:
+        out = {}
+        for f in sorted(root.rglob("*")):
+            if f.is_file() and f.name != MANIFEST_NAME:
+                out[f.relative_to(root).as_posix()] = hashlib.sha256(f.read_bytes()).hexdigest()
+        return out
+
+    def corrupt(lib: Library, extra: str = "") -> None:
+        lib.manifest_path.write_text("{ this is not json !!!" + extra, encoding="utf-8")
+
+    # ---------- A. 空目录 + 无 manifest → 新建 V1 ----------
+    libA = Library(tmp / "A")
+    m = libA.ensure(created_by=APP_VERSION)
+    check("A 空目录 → 创建 V1 manifest",
+          m["format"] == LIBRARY_FORMAT and m["data_version"] == DATA_FORMAT_VERSION,
+          str(m))
+
+    # ---------- B. 已有资料 + 无 manifest → Legacy V0 接管 ----------
+    libB = Library(tmp / "B")
+    libB.notes_dir.mkdir(parents=True)
+    (libB.notes_dir / "n1.md").write_text("# n1\n", encoding="utf-8")
+    libB.originals_dir.mkdir(parents=True)
+    (libB.originals_dir / "o1.pdf").write_bytes(b"%PDF-1.4 legacy")
+    libB.assets_dir.mkdir(parents=True)
+    (libB.assets_dir / "img.png").write_bytes(b"\x89PNG")
+    before = sha_tree(libB.root)
+    m2 = libB.ensure(created_by=APP_VERSION)
+    check("B 有资料但无 manifest → 识别 Legacy V0 并接管为 V1",
+          m2["data_version"] == DATA_FORMAT_VERSION and libB.manifest_path.exists(),
+          str(m2))
+    check("B 接管只新增 library.json（notes/originals/assets 未动）",
+          sha_tree(libB.root) == before)
+
+    # ---------- E. V0→V1 幂等：再打开不重写 ----------
+    first_bytes = libB.manifest_path.read_bytes()
+    m2b = libB.ensure(created_by=APP_VERSION)
+    check("E 幂等：再次打开 library_id/created_at 不变",
+          m2b["library_id"] == m2["library_id"] and m2b["created_at"] == m2["created_at"])
+    check("E 幂等：manifest 文件字节未被回写", libB.manifest_path.read_bytes() == first_bytes)
+
+    # ---------- C. 损坏 manifest + 已有资料 → MANIFEST_CORRUPTED ----------
+    libC = Library(tmp / "C")
+    libC.ensure(created_by=APP_VERSION)
+    (libC.notes_dir / "keep.md").write_text("# 保留\n", encoding="utf-8")
+    (libC.originals_dir / "keep.pdf").write_bytes(b"%PDF-1.4 keep")
+    before_c = sha_tree(libC.root)
+    corrupt(libC)
+    got = None
+    try:
+        libC.ensure(created_by=APP_VERSION)
+    except ManifestCorruptedError:
+        got = "MANIFEST_CORRUPTED"
+    check("C ★ 损坏 manifest + 已有资料 → MANIFEST_CORRUPTED", got == "MANIFEST_CORRUPTED", str(got))
+    check("C ★ 永久资料完全不动", sha_tree(libC.root) == before_c)
+    check("C manifest 文件本身未被覆盖", libC.manifest_path.read_text(encoding="utf-8").startswith("{ this"))
+    # 显式修复接口可用（且不碰永久资料）
+    fixed = libC.repair_manifest(created_by=APP_VERSION)
+    check("C repair_manifest 显式修复后可正常打开",
+          fixed["format"] == LIBRARY_FORMAT and libC.ensure(created_by=APP_VERSION)["format"] == LIBRARY_FORMAT)
+
+    # ---------- D. 损坏 manifest + 空目录 → 仍是损坏（有文件就不是新库）----------
+    libD = Library(tmp / "D")
+    libD.root.mkdir(parents=True)
+    corrupt(libD)
+    got = None
+    try:
+        libD.ensure(created_by=APP_VERSION)
+    except ManifestCorruptedError:
+        got = "MANIFEST_CORRUPTED"
+    check("D ★ 损坏 manifest + 空目录 → 仍 MANIFEST_CORRUPTED",
+          got == "MANIFEST_CORRUPTED", str(got))
+    check("D 空目录未被自动初始化", not (libD.root / "notes").exists())
+
+    # ---------- G. 未来 data_version / 未知字段 ----------
+    libG = Library(tmp / "G")
+    libG.ensure(created_by=APP_VERSION)
+    future = {"format": LIBRARY_FORMAT, "data_version": DATA_FORMAT_VERSION + 1,
+              "created_by": "9.9.9", "some_future_field": {"a": 1}}
+    libG.manifest_path.write_text(json.dumps(future, ensure_ascii=False), encoding="utf-8")
+    got = None
+    try:
+        libG.ensure(created_by=APP_VERSION)
+    except Exception as exc:  # noqa: BLE001
+        got = type(exc).__name__
+    check("G ★ 未来 data_version → 拒绝写入", got == "DataFormatTooNewError", str(got))
+
+    # 未知字段：读取忽略但**不回写**
+    libU = Library(tmp / "U")
+    libU.ensure(created_by=APP_VERSION)
+    with_unknown = {"format": LIBRARY_FORMAT, "data_version": DATA_FORMAT_VERSION,
+                    "created_by": APP_VERSION, "created_at": "2020-01-01T00:00:00",
+                    "library_id": "stable-id-1234", "some_future_field": {"a": 1}}
+    libU.manifest_path.write_text(json.dumps(with_unknown, ensure_ascii=False, indent=2), encoding="utf-8")
+    raw_before = libU.manifest_path.read_bytes()
+    mU = libU.ensure(created_by=APP_VERSION)
+    check("★ 未知字段读取可忽略且**不触发回写**",
+          mU.get("some_future_field") == {"a": 1}
+          and libU.manifest_path.read_bytes() == raw_before)
+    check("★ 未知字段在显式写入时被保留（不被简化格式抹掉）",
+          libU.write_manifest(created_by=APP_VERSION).get("some_future_field") == {"a": 1})
+
+    # ---------- H. legacy 升级前后永久资料 SHA256 一致（含 snapshots）----------
+    libH = Library(tmp / "H")
+    for d in ("notes", "originals", "assets", "snapshots"):
+        (libH.root / d).mkdir(parents=True)
+    (libH.root / "notes" / "h.md").write_text("x" * 500, encoding="utf-8")
+    (libH.root / "originals" / "h.bin").write_bytes(b"\x00" * 100)
+    (libH.root / "assets" / "h.css").write_bytes(b"body{}" * 10)
+    (libH.root / "snapshots" / "h.html").write_bytes(b"<html>" * 5)
+    before_h = sha_tree(libH.root)
+    check("H legacy（无 manifest）被识别", libH.ensure(created_by=APP_VERSION)["data_version"] == DATA_FORMAT_VERSION)
+    check("★ H legacy 接管前后永久资料 SHA256 完全一致", sha_tree(libH.root) == before_h)
+
+    # ---------- F. V1 Library 整体复制后正常打开（cheap 再验一次）----------
+    libF_src = Library(tmp / "F")
+    libF_src.ensure(created_by=APP_VERSION)
+    (libF_src.notes_dir / "f.md").write_text("f\n", encoding="utf-8")
+    libF_dst = Library(tmp / "F2" / "moved")
+    shutil.copytree(libF_src.root, libF_dst.root)
+    check("F V1 Library 整体复制后正常打开（幂等）",
+          libF_dst.ensure(created_by=APP_VERSION)["library_id"] == libF_src.read_manifest()["library_id"])
+
+    shutil.rmtree(tmp, ignore_errors=True)
 
 def test_library_contract() -> None:
     """Data Contract V1：Library 与 App 的边界 + 恢复能力。
@@ -2936,6 +3084,7 @@ def main() -> int:
         # 测试不依赖外部 AI 服务：provider 用内存态覆盖（persist=False，不碰 config.ini）
         config.update({"AI": {"provider": "offline"}}, persist=False)
 
+        test_manifest_recovery()
         test_library_contract()
         test_single_version_source(ctx)
         from tests.test_rag_regression import run as _run_rag
