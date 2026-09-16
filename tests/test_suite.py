@@ -801,6 +801,215 @@ def test_original_preview(ctx) -> None:
     check("Office 文档不内联（走下载）", ".docx" not in Handler.INLINE_TYPES)
 
 
+def test_import_security() -> None:
+    """文件摄入边界：路径穿越 / ZIP 炸弹 / 特殊文件 / 落盘碰撞。
+
+    覆盖范围刻意不止「`../` 能不能逃逸」：**压缩容器、文件名、落盘路径、
+    资源耗尽一起收口**，否则很容易只修了 Zip Slip，ZIP Bomb 仍然存在。
+
+    两层防护都要有：声明值预检查 + 读取时按**实际**输出字节限流
+    （`ZipInfo.file_size` 是攻击者可写的，不能只信它）。
+    """
+    section("文件摄入边界（路径穿越 / ZIP 炸弹 / 特殊文件）")
+    import io
+    import zipfile
+
+    from app.core import crawler, file_guard as FG, paths
+    from tests import test_converters as TC
+
+    def code_of(fn, *a, **kw):
+        """执行并把 FileGuardError 的错误码返回；正常返回 None。"""
+        try:
+            fn(*a, **kw)
+            return None
+        except FG.FileGuardError as exc:
+            return exc.code
+
+    # ---------- ① 正常容器**不得**被误杀（先保证不误伤正常文件）----------
+    normal = [("DOCX", getattr(TC, "make_docx", None)),
+              ("PPTX", getattr(TC, "make_pptx", None)),
+              ("XLSX", getattr(TC, "make_xlsx", None)),
+              ("EPUB", getattr(TC, "make_epub", None))]
+    for label, maker in normal:
+        if maker is None:
+            skip(f"正常 {label} 通过容器检查", "无样例构造器")
+            continue
+        data = maker()
+        got = code_of(FG.check_archive, zipfile.ZipFile(io.BytesIO(data)), FG.ArchiveLimits())
+        check(f"★ 正常 {label} 通过容器检查（默认限制不误伤）", got is None, str(got))
+        try:
+            with zipfile.ZipFile(io.BytesIO(data)) as _z:
+                ents = len(_z.infolist())
+                mx = max((i.file_size for i in _z.infolist()), default=0)
+            print(f"      （{label}: {ents} entries, 最大 entry {mx} 字节）")
+        except Exception:  # noqa: BLE001
+            pass
+
+    # ---------- ② 路径穿越：Windows 一等场景 ----------
+    root = paths.ORIGINALS_DIR
+
+    TRAVERSAL = [
+        "../evil", "../../evil", "..\\evil", "..\\..\\evil",
+        "/absolute/path", "C:\\Windows\\win.ini", "C:/Windows/win.ini",
+        "\\\\server\\share\\x", "//server/share/x",
+        "a/../../b", "./../x", "..\\../x", "sub\\..\\..\\x",
+    ]
+    bad = [n for n in TRAVERSAL if code_of(FG.validate_archive_entry, n) != "PATH_TRAVERSAL"]
+    check("★ ZIP entry 名：全部穿越写法被拒（含 Windows 反斜杠/盘符/UNC）",
+          not bad, str(bad))
+
+    # 「重复分隔符」这类写法本身不逃逸（`....` 只是名为点点的目录），
+    # 关键是**判定后仍落在根内** —— 这比「见 .. 就拒」更准确。
+    WEIRD_BUT_SAFE = ["....//x", "a//b.png", "./x.png"]
+    esc = []
+    for n2 in WEIRD_BUT_SAFE:
+        try:
+            r = FG.safe_join(root, n2)
+            if not r.is_relative_to(root.resolve()):
+                esc.append(n2)
+        except FG.FileGuardError:
+            pass          # 拒绝也可以接受，只要不逃逸
+    check("★ 重复分隔符等怪异写法不会逃逸根目录", not esc, str(esc))
+
+    bad2 = [n for n in TRAVERSAL if code_of(FG.safe_join, root, n) != "PATH_TRAVERSAL"]
+    check("★ safe_join 用**解析级**判定拒绝全部穿越写法", not bad2, str(bad2))
+    check("safe_join 对正常名放行且确实落在根内",
+          FG.safe_join(root, "ok.png").is_relative_to(root.resolve()))
+    check("safe_filename 把穿越名塌缩成末段",
+          FG.safe_filename("../../evil.txt") == "evil.txt"
+          and FG.safe_filename("..\\..\\evil.txt") == "evil.txt",
+          FG.safe_filename("..\\..\\evil.txt"))
+    check("safe_filename 处理保留设备名与 NUL",
+          FG.safe_filename("con.txt") == "_con.txt" and "\x00" not in FG.safe_filename("a\x00b.txt"))
+    check("safe_filename 归一化全角伪装",
+          FG.safe_filename("ｎｏｒｍａｌ.txt") == "normal.txt")
+
+    # ---------- ③ 容器炸弹：声明值预检查 ----------
+    def bomb(entries, compress=zipfile.ZIP_DEFLATED):
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", compress) as z:
+            for name, payload in entries:
+                z.writestr(name, payload)
+        buf.seek(0)
+        return buf
+
+    LIM = FG.ArchiveLimits()
+
+    got = code_of(FG.check_archive, zipfile.ZipFile(bomb([(f"f{i}.xml", b"x") for i in range(50)])),
+                  FG.ArchiveLimits(max_entries=10))
+    check("★ 超出 entry 数量上限被拒", got == "ARCHIVE_TOO_MANY_ENTRIES", str(got))
+
+    got = code_of(FG.check_archive, zipfile.ZipFile(bomb([("a.xml", b"x" * 5000)])),
+                  FG.ArchiveLimits(max_entry_bytes=1000))
+    check("★ 单 entry 超限被拒", got == "ARCHIVE_ENTRY_TOO_LARGE", str(got))
+
+    got = code_of(FG.check_archive, zipfile.ZipFile(bomb([("a.xml", b"x" * 3000), ("b.xml", b"y" * 3000)])),
+                  FG.ArchiveLimits(max_entry_bytes=10 ** 6, max_total_bytes=4000,
+                                   max_ratio=10 ** 9))
+    check("★ 声明总量超限被拒", got == "ARCHIVE_TOTAL_TOO_LARGE", str(got))
+
+    got = code_of(FG.check_archive, zipfile.ZipFile(bomb([("a.xml", b"\0" * 200000)])),
+                  FG.ArchiveLimits(max_ratio=5))
+    check("★ 压缩比异常（疑似炸弹）被拒", got == "ARCHIVE_RATIO_TOO_HIGH", str(got))
+
+    # ---------- ④ 特殊文件（symlink）----------
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        info = zipfile.ZipInfo("link")
+        info.external_attr = (0o120777 << 16)      # S_IFLNK
+        z.writestr(info, "target")
+    buf.seek(0)
+    got = code_of(FG.check_archive, zipfile.ZipFile(buf))
+    check("★ 符号链接 entry 被拒（没有理由从 Office/EPUB 恢复 symlink）",
+          got == "ARCHIVE_SPECIAL_FILE", str(got))
+
+    # ---------- ⑤ 重复条目名 ----------
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("word/document.xml", "<a/>")
+        z.writestr("word/document.xml", "<b/>")
+    buf.seek(0)
+    got = code_of(FG.check_archive, zipfile.ZipFile(buf))
+    check("★ 重复同名 entry 被拒（不依赖 zip 库对「后者」的模糊选择）",
+          got in ("ARCHIVE_DUPLICATE_ENTRY", None) and got != None, str(got))
+
+    # ---------- ⑥ 第二层：实际读取限流（不信声明值）----------
+    zb = zipfile.ZipFile(bomb([("big.xml", b"x" * 20000)]))
+    got = code_of(FG.bounded_read, zb, "big.xml", FG.ArchiveLimits(read_chunk=1024), cap=100)
+    check("★ 实际输出字节超限立即停止（第二层防护）",
+          got == "ARCHIVE_ENTRY_TOO_LARGE", str(got))
+    check("第二层放行正常大小",
+          FG.bounded_read(zb, "big.xml", FG.ArchiveLimits(), cap=10 ** 6) == b"x" * 20000)
+
+    # ---------- ⑦ 端到端：危险容器整体拒绝，不产出半残结果 ----------
+    # 与网页归档不同：容器内部结构被判危险时**整体拒绝**，不「跳过坏 entry
+    # 然后继续生成一个半残的 DOCX」。
+    from app.core import converters
+    evil = bomb([("word/document.xml", b"<w/>"), ("../../escape.xml", b"<x/>")])
+    raised, err, ok = "", "", None
+    try:
+        res = converters.convert(evil.getvalue(), "evil.docx")
+        ok, err = res.ok, (res.error or "")
+    except FG.FileGuardError as exc:
+        raised = exc.code
+    except Exception as exc:  # noqa: BLE001
+        raised = f"其它异常:{type(exc).__name__}"
+
+    # 两种形态都可接受，但**必须整体失败**：
+    # 与网页归档不同，容器内部结构被判危险时不该「跳过坏 entry 继续生成半残 DOCX」。
+    rejected = (raised == "PATH_TRAVERSAL") or (ok is False)
+    check("★ 含穿越 entry 的 DOCX：整体拒绝（不生成半残结果）",
+          rejected, f"raised={raised} ok={ok}")
+    check("★ 拒绝原因可读（不是裸异常名）",
+          bool(err) or raised == "PATH_TRAVERSAL", f"error={err[:80]!r}")
+
+    # ---------- ⑧ 落盘：文件名穿越 + 撞名不覆盖 ----------
+    got = code_of(crawler.save_original, "../../escape", ".pdf", b"%PDF-1.4 x")
+    # safe_filename 会先把 stem 塌缩成单段 → 不会抛错，但要保证**没有落到根之外**
+    outside = list(paths.DATA_DIR.parent.glob("escape*"))
+    check("★ 穿越文件名不会在允许目录之外产生文件", not outside, str(outside[:3]))
+
+    p1 = crawler.save_original("collide", ".pdf", b"%PDF-1.4 one")
+    p2 = crawler.save_original("collide", ".pdf", b"%PDF-1.4 two")
+    check("★ 同名原件不静默覆盖（第二次另存）", p1 != p2 and p1 and p2, f"{p1} vs {p2}")
+    check("两份原件内容都在",
+          paths.abs_from_data(p1).read_bytes() == b"%PDF-1.4 one"
+          and paths.abs_from_data(p2).read_bytes() == b"%PDF-1.4 two")
+
+    # ---------- ⑨ 普通文件大小闸门（不只有 ZIP 要限）----------
+    check("★ 普通文件超限返回 FILE_TOO_LARGE（不是 MemoryError/500）",
+          code_of(FG.check_file_size, 10 ** 9, FG.ImportLimits(max_file_bytes=1000))
+          == "FILE_TOO_LARGE")
+    check("普通文件在限内放行",
+          code_of(FG.check_file_size, 500, FG.ImportLimits(max_file_bytes=1000)) is None)
+
+    # ---------- ⑩ 错误码是人话（前端可用）----------
+    check("每个错误码都有中文说明",
+          all(c in FG.REASON_TEXT for c in (
+              "PATH_TRAVERSAL", "FILE_TOO_LARGE", "ARCHIVE_TOO_MANY_ENTRIES",
+              "ARCHIVE_ENTRY_TOO_LARGE", "ARCHIVE_TOTAL_TOO_LARGE",
+              "ARCHIVE_RATIO_TOO_HIGH", "ARCHIVE_SPECIAL_FILE",
+              "ARCHIVE_DUPLICATE_ENTRY", "INVALID_FILENAME")))
+
+    # ---------- ⑪ 边界集中，没有旁路 ----------
+    csrc = (paths.CORE_DIR / "converters.py").read_text(encoding="utf-8")
+    check("★ 所有 ZIP 打开都经 _open_zip（含安全检查）",
+          csrc.count("zipfile.ZipFile(io.BytesIO(data))") == 1
+          and csrc.count("_open_zip(data)") >= 4,
+          f"原生打开 {csrc.count('zipfile.ZipFile(io.BytesIO(data))')} 处")
+    check("★ converters 不再直接用 z.read() 读 entry（改走限流）",
+          "z.read(path)" not in csrc)
+    check("★ 原件落盘走 safe_join（不自己写 ../ 判断）",
+          "file_guard.safe_join(" in (paths.CORE_DIR / "crawler.py").read_text(encoding="utf-8"))
+
+    # ---------- 清理本测试产生的原件 ----------
+    for rel in (p1, p2):
+        try:
+            if rel:
+                paths.abs_from_data(rel).unlink()
+        except OSError:
+            pass
+
 def test_archive_ssrf() -> None:
     """离线归档：资源下载必须与正文抓取受同一条安全闸门管控。
 
@@ -2292,6 +2501,7 @@ def main() -> int:
         # 测试不依赖外部 AI 服务：provider 用内存态覆盖（persist=False，不碰 config.ini）
         config.update({"AI": {"provider": "offline"}}, persist=False)
 
+        test_import_security()
         test_archive_ssrf()
         test_ssrf_guard(ctx)
         test_lifecycle_shutdown()

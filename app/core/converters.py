@@ -19,10 +19,12 @@ import io
 import json
 import re
 import zipfile
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
+from . import config, file_guard
 from .log_util import get_logger
 
 log = get_logger()
@@ -348,9 +350,35 @@ def _h_eml(data: bytes, name: str, warnings: list[str]) -> ConversionResult:
 # ==========================================================================
 # 三、OOXML（docx / pptx / xlsx）—— 纯标准库解析
 # ==========================================================================
+def archive_limits() -> file_guard.ArchiveLimits:
+    """容器限制从配置读，默认保守（避免散落在代码里）。"""
+    return file_guard.ArchiveLimits(
+        max_entries=config.get_int("IMPORT", "max_archive_entries", 5000),
+        max_entry_bytes=config.get_int("IMPORT", "max_archive_entry_mb", 50) * 1024 * 1024,
+        max_total_bytes=config.get_int("IMPORT", "max_archive_total_mb", 200) * 1024 * 1024,
+        max_ratio=config.get_int("IMPORT", "max_compression_ratio", 100),
+    )
+
+
+@contextmanager
+def _open_zip(data: bytes):
+    """打开 ZIP 容器，并**先做中央目录安全检查**再交给调用方。
+
+    所有容器格式（docx / pptx / xlsx / epub）都必须经这里打开 ——
+    边界集中一处，避免以后新增格式时漏加限制。
+
+    安全检查包括：entry 数量、单 entry 声明大小、声明总量、压缩比、
+    重复条目名、符号链接等特殊文件、entry 名是否逃逸。
+    """
+    with zipfile.ZipFile(io.BytesIO(data)) as z:
+        file_guard.check_archive(z, archive_limits())
+        yield z
+
+
 def _zip_read(z: zipfile.ZipFile, path: str) -> bytes | None:
     try:
-        return z.read(path)
+        # 第二层防护：不信任 ZipInfo.file_size，边读边数**实际**输出字节
+        return file_guard.bounded_read(z, path, archive_limits())
     except (KeyError, zipfile.BadZipFile):
         return None
 
@@ -416,7 +444,7 @@ def _docx_table(el) -> list[str]:
 
 def _h_docx(data: bytes, name: str, warnings: list[str]) -> ConversionResult:
     try:
-        with zipfile.ZipFile(io.BytesIO(data)) as z:
+        with _open_zip(data) as z:
             xml = _zip_read(z, "word/document.xml")
             title = _docx_props(z) or _clean_title(name)
     except zipfile.BadZipFile:
@@ -460,7 +488,7 @@ def _h_docx(data: bytes, name: str, warnings: list[str]) -> ConversionResult:
 
 def _h_pptx(data: bytes, name: str, warnings: list[str]) -> ConversionResult:
     try:
-        with zipfile.ZipFile(io.BytesIO(data)) as z:
+        with _open_zip(data) as z:
             names = [n for n in z.namelist() if re.fullmatch(r"ppt/slides/slide\d+\.xml", n)]
             if not names:
                 return ConversionResult(False, error=f"{name} 中没有幻灯片")
@@ -523,7 +551,7 @@ def _col_index(ref: str) -> int:
 
 def _h_xlsx(data: bytes, name: str, warnings: list[str]) -> ConversionResult:
     try:
-        with zipfile.ZipFile(io.BytesIO(data)) as z:
+        with _open_zip(data) as z:
             shared: list[str] = []
             raw = _zip_read(z, "xl/sharedStrings.xml")
             if raw:
@@ -652,7 +680,7 @@ def _h_xlsx(data: bytes, name: str, warnings: list[str]) -> ConversionResult:
 # ==========================================================================
 def _h_epub(data: bytes, name: str, warnings: list[str]) -> ConversionResult:
     try:
-        with zipfile.ZipFile(io.BytesIO(data)) as z:
+        with _open_zip(data) as z:
             container = _zip_read(z, "META-INF/container.xml")
             opf_path = ""
             if container:

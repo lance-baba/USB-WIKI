@@ -16,7 +16,8 @@ from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import urlparse
 
-from . import analyzer, archiver, atomic_io, config, net_guard as _net_guard, net_util, paths
+from . import (analyzer, archiver, atomic_io, config, file_guard,
+                   net_guard as _net_guard, net_util, paths)
 from .log_util import get_logger
 
 log = get_logger()
@@ -643,9 +644,22 @@ def save_original(stem: str, ext: str, data: bytes) -> str:
         return ""
     try:
         paths.ORIGINALS_DIR.mkdir(parents=True, exist_ok=True)
-        target = paths.ORIGINALS_DIR / f"{stem}{ext}"
+        # ⚠ stem 来自**用户上传的文件名** → 必须先清洗再解析级校验，
+        # 否则 `../../evil` / `C:\Windows\x` / UNC 都能写出允许目录之外。
+        safe_stem = file_guard.safe_filename(stem, default="original")
+        target = file_guard.safe_join(paths.ORIGINALS_DIR, f"{safe_stem}{ext}")
+        # 撞名不静默覆盖：同名导入保留两份（此前已抓到过「同一秒覆盖」的真实 bug）
+        if target.exists():
+            for _i in range(2, 100):
+                cand = target.with_name(f"{target.stem}-{_i}{ext}")
+                if not cand.exists():
+                    target = cand
+                    break
         atomic_io.atomic_write_bytes(target, data)
         return f"originals/{target.name}"
+    except file_guard.FileGuardError as exc:
+        log.warning("原件文件名被安全策略拒绝 %s%s: %s", stem, ext, exc.code)
+        return ""
     except OSError as exc:
         log.warning("原文件留存失败 %s%s: %s", stem, ext, exc)
         return ""

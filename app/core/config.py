@@ -65,6 +65,18 @@ ai_summary = 1
 # 1 = 允许：召回更多，但引用可能不相关，自行权衡。
 allow_semantic_only = 0
 
+[IMPORT]
+# 文件摄入边界。默认值保守，同时保证正常 DOCX/PPTX/XLSX/EPUB 能打开。
+# 普通文件（PDF/CSV/JSON/Markdown/HTML…）单文件上限 —— 攻击者不需要 ZIP，
+# 直接扔超大文本也能打爆处理流程。
+max_file_mb = 50
+# 压缩容器（OOXML / EPUB）限制。两层防护：
+# 1) 中央目录预检查这些声明值；2) 读取时再按实际输出字节限流。
+max_archive_entries = 5000
+max_archive_entry_mb = 50
+max_archive_total_mb = 200
+max_compression_ratio = 100
+
 [CRAWLER]
 # 是否允许抓取**非公网**地址（局域网 / 内网 / 本机）。
 # 默认 0：只允许解析结果为公网地址的目标，且逐跳校验重定向（防 SSRF）。
