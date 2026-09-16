@@ -21,6 +21,7 @@ from .core import (archiver, config, crawler, graph as graph_mod, paths,
                    redact as redact_mod, search as search_mod,
                    security as security_mod,
                    topics as topics_mod)
+from .api import config as api_config, diagnostics as api_diagnostics, system as api_system
 from .core.context import AppContext, get_ctx
 from .core.log_util import get_logger
 
@@ -359,8 +360,13 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/healthz":
             return self._send_json({"ok": True, "ts": time.time()})
 
-        if path == "/api/status":
-            return self._send_json({"code": 200, "data": self.ctx.status()})
+        # ---- 业务 API：薄分发到各域模块（协议零变更）----
+        if api_system.handle_get(self, path):
+            return
+        if api_config.handle_get(self, path):
+            return
+        if api_diagnostics.handle_get(self, path):
+            return
 
         if path == "/api/notes":
             limit = int((q.get("limit") or ["200"])[0])
@@ -375,15 +381,6 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/notes/original":
             rel = (q.get("path") or [""])[0]
             return self._note_original(rel)
-
-        # 前端在抓取前先问一次「这个网页是不是已经存过」，
-        # 以便弹出「打开已有 / 更新已有 / 另存为新版本 / 取消」。
-        # 注意：后端在 capture 时**自己也会再查一次** —— 前端判断不可信。
-        # 只读系统诊断：Core 层 collect() 的薄包装，不做任何修复动作
-        if path == "/api/diagnostics":
-            from .core import diagnostics  # noqa: PLC0415
-
-            return self._send_json({"code": 200, "data": diagnostics.collect()})
 
         if path == "/api/capture/duplicate":
             target = (q.get("url") or [""])[0]
@@ -433,20 +430,6 @@ class Handler(BaseHTTPRequestHandler):
                 }
             )
 
-        if path == "/api/config":
-            # ⚠ 此前这里直接返回 config.as_dict() —— 把**明文 api_key**
-            # 通过 HTTP 发出去了。设置页读取只能拿到脱敏值（sk-****abcd），
-            # 是否已配置用单独的 *_set 字段表达。
-            masked = redact_mod.mask_config(config.as_dict())
-            for _sec, _items in masked.items():
-                if isinstance(_items, dict):
-                    for _k in list(_items):
-                        if redact_mod.is_secret_key(_k):
-                            _items[f"{_k}_set"] = bool(
-                                config.get_str(_sec, _k, "")
-                            )
-            return self._send_json({"code": 200, "data": masked})
-
         if path == "/api/import/formats":
             from .core import converters  # noqa: PLC0415
 
@@ -466,6 +449,12 @@ class Handler(BaseHTTPRequestHandler):
     # ------------------------------------------------------------------
     def _route_post(self) -> None:
         path = self._path_only()
+
+        # ---- 业务 API：薄分发到各域模块（协议零变更）----
+        if api_system.handle_post(self, path):
+            return
+        if api_config.handle_post(self, path):
+            return
 
         if path == "/api/chat/completions":
             return self._chat()
@@ -498,34 +487,6 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/notes/import":
             return self._import_notes()
-
-        if path == "/api/system/rebuild-index":
-            self._read_json()
-            threading.Thread(
-                target=self._rebuild_worker, name="rebuild-index", daemon=True
-            ).start()
-            return self._send_json(
-                {"code": 202, "message": "索引全量重建任务已在后台启动"}
-            )
-
-        if path == "/api/system/rebuild-vectors":
-            self._read_json()
-            threading.Thread(
-                target=self._rebuild_worker, kwargs={"recreate_vec": True},
-                name="rebuild-vectors", daemon=True,
-            ).start()
-            return self._send_json({"code": 202, "message": "向量索引重建任务已在后台启动"})
-
-        if path == "/api/system/shutdown":
-            self._read_json()
-            self._send_json({"code": 200, "message": "正在安全退出，请稍候…"})
-            threading.Timer(0.3, self.server.request_shutdown).start()  # type: ignore[attr-defined]
-            return
-
-        if path == "/api/config":
-            body = self._read_json()
-            updated = config.update(body.get("data") or body, persist=True)
-            return self._send_json({"code": 200, "message": "配置已保存", "data": updated})
 
         if path == "/api/ai/test":
             body = self._read_json()
@@ -562,13 +523,6 @@ class Handler(BaseHTTPRequestHandler):
             )
         finally:
             self._sse_end()
-
-    def _rebuild_worker(self, recreate_vec: bool = False) -> None:
-        try:
-            report = self.ctx.rebuild_index(recreate_vec=recreate_vec)
-            log.info("重建任务完成: %s", report)
-        except Exception as exc:  # noqa: BLE001
-            log.error("重建任务异常: %s", exc)
 
     def _import_notes(self) -> None:
         """批量导入文件（拖拽上传落点）。
