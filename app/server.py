@@ -17,11 +17,12 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from .core import (archiver, crawler, paths,
+from .core import (archiver, paths,
                    redact as redact_mod,
                    security as security_mod)
-from .api import (ask as api_ask, config as api_config, diagnostics as api_diagnostics,
-                  library as api_library, search as api_search, system as api_system)
+from .api import (ask as api_ask, capture as api_capture, config as api_config,
+                  diagnostics as api_diagnostics, library as api_library,
+                  search as api_search, system as api_system)
 from .core.context import AppContext, get_ctx
 from .core.log_util import get_logger
 
@@ -373,15 +374,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         if api_library.handle_get(self, path):
             return
-
-        if path == "/api/capture/duplicate":
-            target = (q.get("url") or [""])[0]
-            from .core import indexer as _indexer  # noqa: PLC0415
-
-            found = _indexer.find_by_normalized_url(self.ctx.db, target)
-            return self._send_json(
-                {"ok": True, "data": {"duplicate": bool(found), "existing": found or None}}
-            )
+        if api_capture.handle_get(self, path):
+            return
 
         return self._send_json({"code": 404, "message": "接口不存在"}, 404)
 
@@ -398,22 +392,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         if api_library.handle_post(self, path):
             return
-
-        if path == "/api/capture/url":
-            body = self._read_json()
-            url = str(body.get("url") or "").strip()
-            # on_duplicate: abort(默认) / update / new —— 由用户在弹窗里选择后带上。
-            # 不给就按 abort 处理：宁可让调用方显式表态，也不默默产生重复笔记。
-            on_dup = str(body.get("on_duplicate") or "abort").strip().lower()
-            if on_dup not in ("abort", "update", "new"):
-                on_dup = "abort"
-            result = crawler.capture_url(
-                url, db=self.ctx.db, embedder=self.ctx.embedder, on_duplicate=on_dup
-            )
-            if result.status == "duplicate":
-                # 不是服务端错误，而是一个**需要用户决策**的正常状态
-                return self._send_json(result.to_dict(), 409)
-            return self._send_json(result.to_dict(), 200 if result.ok else 500)
+        if api_capture.handle_post(self, path):
+            return
 
         return self._send_json({"code": 404, "message": "接口不存在"}, 404)
 

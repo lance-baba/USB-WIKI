@@ -2595,9 +2595,9 @@ def test_duplicate_url_detection(ctx) -> None:
         sig = _inspect.signature(crawler.capture_url)
         check("★ capture_url 默认策略是 abort（调用方不表态就不会产生重复）",
               sig.parameters["on_duplicate"].default == "abort")
-        srv_src = (paths.CORE_DIR.parent / "server.py").read_text(encoding="utf-8")
+        cap_src = (paths.BASE_DIR / "app" / "api" / "capture.py").read_text(encoding="utf-8")
         check("★ 服务端自己做判重（同时提供 /api/capture/duplicate 预检）",
-              '"/api/capture/duplicate"' in srv_src and "find_by_normalized_url" in srv_src)
+              '"/api/capture/duplicate"' in cap_src and "find_by_normalized_url" in cap_src)
 
         # ---------- ⑥ 路由归属：GET 预检必须真的挂在 GET 路由上 ----------
         # 这条来自一次真实事故：`/api/capture/duplicate` 被误插进 `_route_post`，
