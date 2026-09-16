@@ -18,7 +18,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from .core import (archiver, config, crawler, graph as graph_mod, paths,
-                   search as search_mod, topics as topics_mod)
+                   search as search_mod, security as security_mod,
+                   topics as topics_mod)
 from .core.context import AppContext, get_ctx
 from .core.log_util import get_logger
 
@@ -46,7 +47,9 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
-        self.send_header("Access-Control-Allow-Origin", "*")
+        # 刻意**不发任何 CORS 头**：浏览器因此读不到跨源响应体。
+        # 要开放跨域读取只能靠 Access-Control-Allow-Origin，而本服务
+        # 装着用户全部私人笔记，默认不对外开放。
         self.end_headers()
         try:
             self.wfile.write(body)
@@ -226,7 +229,6 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-cache, no-transform")
         self.send_header("X-Accel-Buffering", "no")
         self.send_header("Transfer-Encoding", "chunked")
-        self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
 
     def _sse_write(self, text: str) -> bool:
@@ -249,20 +251,51 @@ class Handler(BaseHTTPRequestHandler):
     # 路由
     # ------------------------------------------------------------------
     def do_OPTIONS(self):  # noqa: N802
-        self.send_response(204)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        """不提供 CORS 预检：本服务不对外开放跨域访问。"""
+        self.send_response(403)
         self.send_header("Content-Length", "0")
         self.end_headers()
 
+    # ------------------------------------------------------------------
+    def _guard(self) -> bool:
+        """请求安全闸门。放行返回 True；拒绝时已写好响应并返回 False。
+
+        判据见 ``core/security.py``（Host 校验 + Fetch Metadata + 同源判定）。
+        刻意**不要求所有请求都带 Origin** —— 本地 CLI / 诊断工具本来就不发它。
+        """
+        ok, reason = security_mod.check_request(
+            self.command,
+            self.headers,
+            port=self.server.server_address[1] if self.server.server_address else 0,
+            allow_lan=bool(getattr(self.server, "allow_lan", False)),
+        )
+        if ok:
+            return True
+        log.warning(
+            "已拒绝请求 %s %s：%s（Host=%s Origin=%s Sec-Fetch-Site=%s）",
+            self.command, self.path, reason,
+            self.headers.get("Host"), self.headers.get("Origin"),
+            self.headers.get("Sec-Fetch-Site"),
+        )
+        self._send_json(
+            {"ok": False, "error": {"code": reason,
+                                    "message": security_mod.REASON_TEXT.get(reason, "已拒绝"),
+                                    "details": {}}},
+            403,
+        )
+        return False
+
     def do_GET(self):  # noqa: N802
+        if not self._guard():
+            return
         try:
             self._route_get()
         except Exception as exc:  # noqa: BLE001
             self._fail(exc, "GET")
 
     def do_POST(self):  # noqa: N802
+        if not self._guard():
+            return
         try:
             self._route_post()
         except ValueError as exc:
@@ -644,10 +677,12 @@ class Server(ThreadingHTTPServer):
     # Windows 上 SO_REUSEADDR 允许抢占已占用端口，必须关闭以让 bind 真实失败
     allow_reuse_address = os.name != "nt"
 
-    def __init__(self, addr, ctx: AppContext, on_shutdown=None) -> None:
+    def __init__(self, addr, ctx: AppContext, on_shutdown=None, allow_lan: bool = False) -> None:
         super().__init__(addr, Handler)
         self.ctx = ctx
         self.on_shutdown = on_shutdown
+        # 未显式开启 LAN 时，Host 校验只接受回环地址（防 DNS rebinding）
+        self.allow_lan = bool(allow_lan)
         self._shutdown_started = threading.Event()
         Handler.ctx = ctx
 

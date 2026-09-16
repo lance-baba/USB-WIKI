@@ -749,6 +749,137 @@ def test_original_preview(ctx) -> None:
     check("Office 文档不内联（走下载）", ".docx" not in Handler.INLINE_TYPES)
 
 
+def test_localhost_security(ctx) -> None:
+    """Localhost 安全边界：Host 校验 + Fetch Metadata + 同源判定。
+
+    威胁模型：本服务**没有登录鉴权、却装着用户全部私人笔记**。发布后真实会遇到
+    ① DNS rebinding（恶意域名解析到 127.0.0.1）② 恶意网页跨站读取本地 API。
+
+    ⚠ 一条关键设计约束（用户明确要求）：**不能要求所有请求都带 Origin** ——
+    本地 CLI / curl / 诊断脚本本来就不发 Origin，强制要求会直接打断它们。
+    因此判据是「只在出现**浏览器特征信号**时才拒绝」。
+    """
+    section("Localhost 安全边界（Host / Fetch Metadata / 同源）")
+    import http.client
+    import threading
+    import time
+
+    from app.core import security as sec
+
+    # ---------- 纯函数：回环判定 ----------
+    for h in ("127.0.0.1", "127.0.0.5", "localhost", "::1", "[::1]"):
+        check(f"回环地址识别：{h}", sec.is_loopback(h))
+    for h in ("0.0.0.0", "192.168.1.10", "evil.com", "localhost.evil.com", ""):
+        check(f"非回环地址识别：{h or '(空)'}", not sec.is_loopback(h))
+
+    # ---------- 纯函数：Host 校验（防 DNS rebinding）----------
+    check("Host 为回环 → 放行",
+          sec.host_allowed("127.0.0.1:28765"))
+    check("Host 为恶意域名 → 拒绝（DNS rebinding）",
+          not sec.host_allowed("evil.com:28765"))
+    check("Host 形如 localhost.evil.com 也拒绝（不做后缀匹配）",
+          not sec.host_allowed("localhost.evil.com"))
+    check("Host 缺失 → 拒绝", not sec.host_allowed(""))
+    check("显式 LAN 模式下才接受非回环 Host",
+          sec.host_allowed("192.168.1.10:28765", allow_lan=True)
+          and not sec.host_allowed("192.168.1.10:28765", allow_lan=False))
+
+    # ---------- 纯函数：跨站判定 ----------
+    P = {"port": 28765}
+
+    def hdr(**kw):
+        return {k.replace("_", "-"): v for k, v in kw.items()}
+
+    ok, _ = sec.check_request("GET", hdr(Host="127.0.0.1:28765"), **P)
+    check("★ 无 Origin / 无 Fetch Metadata → 放行（保护本地 CLI 与诊断工具）", ok)
+
+    ok, reason = sec.check_request(
+        "GET", hdr(Host="127.0.0.1:28765", **{"Sec-Fetch-Site": "cross-site"}), **P)
+    check("★ 跨站请求（no-cors，无 Origin）→ 拒绝", not ok and reason == sec.REASON_CROSS_SITE, reason)
+
+    ok, reason = sec.check_request(
+        "GET", hdr(Host="127.0.0.1:28765", Origin="https://evil.com"), **P)
+    check("★ 第三方 Origin 读取 → 拒绝", not ok and reason == sec.REASON_CROSS_ORIGIN, reason)
+
+    ok, _ = sec.check_request(
+        "GET", hdr(Host="127.0.0.1:28765", Origin="http://127.0.0.1:28765"), **P)
+    check("同源 Origin → 放行", ok)
+    ok, _ = sec.check_request(
+        "GET", hdr(Host="localhost:28765", Origin="http://localhost:28765"), **P)
+    check("localhost 同源 → 放行", ok)
+
+    ok, reason = sec.check_request(
+        "GET", hdr(Host="127.0.0.1:28765", Origin="http://localhost:3000"), **P)
+    check("其它 localhost 端口（同 site 不同源）→ 拒绝", not ok and reason == sec.REASON_CROSS_ORIGIN, reason)
+
+    ok, reason = sec.check_request("GET", hdr(Host="evil.com:28765"), **P)
+    check("恶意 Host 优先被拒", not ok and reason == sec.REASON_HOST, reason)
+
+    ok, reason = sec.check_request(
+        "POST", hdr(Host="127.0.0.1:28765", **{"Content-Type": "application/x-www-form-urlencoded"}), **P)
+    check("★ 表单类 Content-Type 的 POST → 拒绝（挡 CSRF）",
+          not ok and reason == sec.REASON_CONTENT_TYPE, reason)
+    ok, _ = sec.check_request(
+        "POST", hdr(Host="127.0.0.1:28765", **{"Content-Type": "application/json"}), **P)
+    check("JSON POST → 放行", ok)
+    ok, _ = sec.check_request("POST", hdr(Host="127.0.0.1:28765"), **P)
+    check("无 body 的裸 POST（如 shutdown）→ 放行", ok)
+
+    # ---------- 静态断言：不再对外发 CORS ----------
+    src = (paths.CORE_DIR.parent / "server.py").read_text(encoding="utf-8")
+    code = "\n".join(ln for ln in src.splitlines() if not ln.strip().startswith("#"))
+    check("响应头里不再出现 Access-Control-Allow-Origin（默认关闭跨域读取）",
+          "Access-Control-Allow-Origin" not in code)
+    check("跨域预检不再以 204 放行", "Access-Control-Allow-Methods" not in code)
+    check("Host 拒绝路径会写结构化错误（code/message/details）", "REASON_TEXT" in src)
+
+    # ---------- 真实 HTTP 集成测试 ----------
+    from app.server import Server
+
+    srv = Server(("127.0.0.1", 0), ctx, allow_lan=False)
+    port = srv.server_address[1]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    time.sleep(0.4)
+
+    def raw_get(host_header=None, extra: dict | None = None) -> int:
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=6)
+        conn.putrequest("GET", "/api/status", skip_host=True, skip_accept_encoding=True)
+        conn.putheader("Host", host_header or f"127.0.0.1:{port}")
+        for k, v in (extra or {}).items():
+            conn.putheader(k, v)
+        conn.endheaders()
+        resp = conn.getresponse()
+        resp.read()
+        code = resp.status
+        conn.close()
+        return code
+
+    try:
+        check("集成：本机普通请求 → 200", raw_get() == 200, str(raw_get()))
+        check("集成：恶意 Host → 403", raw_get("evil.com") == 403)
+        check("集成：第三方 Origin → 403",
+              raw_get(extra={"Origin": "https://evil.com"}) == 403)
+        check("集成：Sec-Fetch-Site: cross-site → 403",
+              raw_get(extra={"Sec-Fetch-Site": "cross-site"}) == 403)
+        check("集成：同源 Origin → 200",
+              raw_get(extra={"Origin": f"http://127.0.0.1:{port}"}) == 200)
+        check("集成：OPTIONS 预检 → 403",
+              _options_code(port) == 403)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def _options_code(port: int) -> int:
+    import http.client
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=6)
+    conn.request("OPTIONS", "/api/status", headers={"Host": f"127.0.0.1:{port}"})
+    resp = conn.getresponse()
+    resp.read()
+    code = resp.status
+    conn.close()
+    return code
+
 def test_schema_compatibility(ctx) -> None:
     """索引结构版本兼容：只读探测 → 判版本 → 决定动作（**不做 migration framework**）。
 
@@ -1391,6 +1522,7 @@ def main() -> int:
         # 测试不依赖外部 AI 服务：provider 用内存态覆盖（persist=False，不碰 config.ini）
         config.update({"AI": {"provider": "offline"}}, persist=False)
 
+        test_localhost_security(ctx)
         test_schema_compatibility(ctx)
         test_atomic_io()
         test_inject_budget(ctx)

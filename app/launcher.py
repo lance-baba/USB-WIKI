@@ -128,6 +128,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--port", type=int, default=None, help="起始端口（默认读 config.ini）")
     parser.add_argument("--no-browser", action="store_true", help="不自动打开浏览器")
     parser.add_argument("--no-sync", action="store_true", help="不启动外部文件增量同步")
+    parser.add_argument(
+        "--allow-lan", action="store_true",
+        help="显式允许把本服务暴露到局域网（默认只监听回环，见 README 安全说明）",
+    )
     args = parser.parse_args(argv if argv is not None else sys.argv[1:])
 
     # 让 ctrl-C 生效（即使被批处理脚本套了一层）
@@ -142,6 +146,25 @@ def main(argv: list[str] | None = None) -> int:
     paths.ensure_dirs()
 
     host = args.host or config.get_str("SYSTEM", "host", "127.0.0.1")
+
+    # 非回环地址必须**显式**开启 —— 否则用户可能因为改了 config.ini 里的 host，
+    # 在不知情的情况下把装着全部私人笔记的服务暴露给整个局域网。
+    from app.core import security as _security  # noqa: PLC0415
+
+    if not _security.is_loopback(host) and not args.allow_lan:
+        print(
+            f"\n  拒绝监听 {host}：该地址会向本机之外暴露整个知识库。"
+            "\n  本服务没有登录鉴权，默认只允许本机访问。"
+            "\n  确实需要时请显式加上 --allow-lan，并自行确保网络环境可信。\n",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    if not _security.is_loopback(host):
+        print(
+            f"\n  ⚠️  已按 --allow-lan 监听 {host}：**同一局域网内的任何人都能访问**"
+            "\n     你的全部笔记与 API Key 配置。请确认当前网络可信。\n",
+            file=sys.stderr,
+        )
     start_port = args.port or config.get_int("SYSTEM", "port", 28765)
 
     # 1) 端口探测与避让
@@ -195,7 +218,8 @@ def main(argv: list[str] | None = None) -> int:
         sys.exit(2)
     # 3) 先起服务框架（此时 /api/status 返回 ready:false，前端显示初始化中）
     try:
-        server = Server((host, port), ctx, on_shutdown=on_exit)
+        server = Server((host, port), ctx, on_shutdown=on_exit,
+                        allow_lan=bool(args.allow_lan or not _security.is_loopback(host)))
     except OSError as exc:
         log.error("服务绑定失败: %s", exc)
         print(f"\n  [启动失败] 无法绑定 {host}:{port} —— {exc}\n", file=sys.stderr)
