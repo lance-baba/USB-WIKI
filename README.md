@@ -129,7 +129,15 @@ Wiki-USB/
 │   └── models/                 # 本地 ONNX 嵌入模型（可选）
 ├── app/
 │   ├── launcher.py             # 自愈启动器：端口避让 / WAL 自愈 / 优雅退出钩子
-│   ├── server.py               # 标准库 HTTP 服务与路由分发（含 SSE）
+│   ├── server.py               # 标准库 HTTP 服务与路由分发（含 SSE 传输层）
+│   ├── api/                    # 业务 API 域模块（薄分发，协议零变更）
+│   │   ├── system.py           # /api/status · /api/system/{rebuild-index,rebuild-vectors,shutdown}
+│   │   ├── config.py           # /api/config（GET 脱敏 · POST 保存）
+│   │   ├── diagnostics.py      # /api/diagnostics
+│   │   ├── search.py           # /api/search · /api/topics · /api/graph
+│   │   ├── ask.py              # /api/chat/completions(SSE) · /api/ai/test · /api/ollama/models
+│   │   ├── library.py          # /api/notes* · /api/notes/import · /api/import/formats
+│   │   └── capture.py          # /api/capture/{url,duplicate}
 │   ├── core/
 │   │   ├── paths.py            # 相对路径解析（杜绝盘符绑定）
 │   │   ├── config.py           # config.ini 读写与默认模板
