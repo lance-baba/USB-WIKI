@@ -2918,7 +2918,18 @@ def main() -> int:
             ctx.gateway.embedder = ctx.embedder
         if ctx.db.embedding_dim != 512 or not ctx.db.vec_table_ready:
             ctx.db.embedding_dim = 512
-            assert ctx.db.recreate_vec_table(512), "向量表重建失败"
+            if not ctx.db.recreate_vec_table(512):
+                # 失败必须给出可定位的上下文，而不是一句裸 assert
+                diag = {
+                    "db_path": str(ctx.db.path),
+                    "embedding_dim": ctx.db.embedding_dim,
+                    "vec_available": ctx.db.vec_available,
+                    "vec_error": getattr(ctx.db, "_vec_error", None),
+                    "sqlite": __import__("sqlite3").sqlite_version,
+                    "vec_table_exists": bool(ctx.db.query_one(
+                        "SELECT name FROM sqlite_master WHERE type='table' AND name='chunks_vec'")),
+                }
+                raise AssertionError(f"向量表重建失败: {diag}")
         ctx.db.signature_mismatch = None
 
         # 测试不依赖外部 AI 服务：provider 用内存态覆盖（persist=False，不碰 config.ini）
