@@ -952,8 +952,9 @@ def test_library_contract() -> None:
     try:
         __import__("os").environ["WIKIUSB_LIBRARY"] = str(tmp / "EnvLib")
         got = lib_mod.detect_library_root(Path("X:/base"))
-        check("   环境变量生效", got == Path(__import__("os").environ["WIKIUSB_LIBRARY"]),
-              str(got))
+        # Windows 上 resolve() 可能返回短路径名形式（RUNNER~1），不能与原始字符串严格相等
+        expected = Path(__import__("os").environ["WIKIUSB_LIBRARY"]).resolve()
+        check("   环境变量生效", got == expected, f"{got} vs {expected}")
     finally:
         __import__("os").environ.pop("WIKIUSB_LIBRARY", None)
 
