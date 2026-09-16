@@ -43,12 +43,24 @@ from app.core import (  # noqa: E402
 
 PASS: list[str] = []
 FAIL: list[str] = []
+SKIP: list[str] = []
 
 
 def check(name: str, cond: bool, detail: str = "") -> bool:
     (PASS if cond else FAIL).append(name if cond else f"{name} :: {detail}")
     print(("  ✅ " if cond else "  ❌ ") + name + ("" if cond else f"  [{detail}]"))
     return cond
+
+
+def skip(name: str, reason: str = "") -> None:
+    """登记一条**跳过**的用例。
+
+    为什么需要它：网络用例在离线时若直接 `return`，测试总数会随环境变化
+    （330 → 327），让人误以为「测试变少了」。跳过不是消失 —— 用例仍然登记，
+    TOTAL 保持恒定，只是不计入 PASS。
+    """
+    SKIP.append(f"{name} :: {reason}" if reason else name)
+    print("  ⏭ " + name + (f"  [{reason}]" if reason else ""))
 
 
 def section(t: str) -> None:
@@ -188,33 +200,55 @@ def test_index_and_search(ctx) -> None:
 def test_crawler(ctx) -> None:
     section("摄入管道 / 降级判定")
     offline = os.environ.get("WIKIUSB_SKIP_NET") == "1"
+
+    # 依赖外网的用例先**登记**好，离线时逐条记为 SKIP。
+    # 「跳过」与「不存在」是两回事：直接 return 会让 TOTAL 随环境变化。
+    NET_CASES = [
+        "短正文触发 partial_fallback 降级",
+        "降级时保留原始快照",
+        "降级文案符合 PRD 提示语",
+        "长正文走 success 分支",
+        "success 正文 ≥ 150 字",
+        "YAML 头部标记 status: success",
+    ]
+
     if offline:
-        check("（跳过网络用例）", True)
-        return
-    r1 = crawler.capture_url("https://example.com/", db=ctx.db, embedder=ctx.embedder)
-    check("短正文触发 partial_fallback 降级", r1.status == "partial_fallback", str(r1.to_dict())[:200])
-    check("降级时保留原始快照", bool(r1.snapshot_path) and paths.abs_from_data(r1.snapshot_path).exists())
-    check("降级文案符合 PRD 提示语", "前端动态渲染" in r1.message)
-
-    r2 = crawler.capture_url("https://en.wikipedia.org/wiki/Transformer_(deep_learning_architecture)",
-                             db=ctx.db, embedder=ctx.embedder)
-    # 外网/代理不可达属环境问题，不算被测对象失败 —— 标记跳过而非误报
-    net_err = (not r2.ok) and any(
-        k in r2.message for k in ("urlopen error", "ProxyError", "Tunnel connection", "HTTP 0")
-    )
-    if net_err:
-        check("（跳过）长文 success 分支 —— 外网/代理不可达", True, r2.message[:80])
+        for _n in NET_CASES:
+            skip(_n, "离线模式（WIKIUSB_SKIP_NET=1）")
     else:
-        check("长正文走 success 分支", r2.status == "success", str(r2.to_dict())[:200])
-        check("success 正文 ≥ 150 字", r2.char_count >= 150, str(r2.char_count))
-        md = paths.abs_from_data(r2.file_path).read_text(encoding="utf-8")
-        check("YAML 头部标记 status: success", "status: \"success\"" in md or "status: success" in md)
+        r1 = crawler.capture_url("https://example.com/", db=ctx.db, embedder=ctx.embedder)
+        check(NET_CASES[0], r1.status == "partial_fallback", str(r1.to_dict())[:200])
+        check(NET_CASES[1], bool(r1.snapshot_path) and paths.abs_from_data(r1.snapshot_path).exists())
+        check(NET_CASES[2], "前端动态渲染" in r1.message)
 
+        r2 = crawler.capture_url(
+            "https://en.wikipedia.org/wiki/Transformer_(deep_learning_architecture)",
+            db=ctx.db, embedder=ctx.embedder,
+        )
+        # 外网/代理不可达属**环境问题**，不是被测对象失败 —— 记 SKIP 而非 FAIL，
+        # 但三条仍然登记，保证总数不变。
+        net_err = (not r2.ok) and any(
+            k in r2.message for k in ("urlopen error", "ProxyError", "Tunnel connection", "HTTP 0")
+        )
+        if net_err:
+            for _n in NET_CASES[3:]:
+                skip(_n, "外网/代理不可达")
+        else:
+            check(NET_CASES[3], r2.status == "success", str(r2.to_dict())[:200])
+            check(NET_CASES[4], r2.char_count >= 150, str(r2.char_count))
+            md = paths.abs_from_data(r2.file_path).read_text(encoding="utf-8")
+            check(NET_CASES[5], "status: \"success\"" in md or "status: success" in md)
+
+    # 以下两条**不需要外网**，离线时也必须跑 —— 此前它们跟着一起 return 掉了，
+    # 白丢两条覆盖。
     bad = crawler.capture_url("ftp://x", db=None)
     check("非法协议被拒绝", not bad.ok and "http" in bad.message)
 
-    note = crawler.save_manual_note("手工测试笔记", "手工录入的注意力机制要点。", db=ctx.db, embedder=ctx.embedder)
+    note = crawler.save_manual_note(
+        "手工测试笔记", "手工录入的注意力机制要点。", db=ctx.db, embedder=ctx.embedder
+    )
     check("剪贴板录入通道可用", note.ok and paths.abs_from_data(note.file_path).exists())
+
 
 
 def test_gateway(ctx) -> None:
@@ -1707,7 +1741,11 @@ def main() -> int:
         print(f"  ❌ 真实知识库被改动！{real_before} -> {real_after}")
 
     print("\n" + "=" * 74)
-    print(f"  通过 {len(PASS)} 项   失败 {len(FAIL)} 项")
+    total = len(PASS) + len(SKIP) + len(FAIL)
+    print(f"  通过 {len(PASS)} 项   失败 {len(FAIL)} 项   跳过 {len(SKIP)} 项")
+    # 机器可读的稳定格式：TOTAL 恒定（跳过也算登记），便于 CI 与文档引用，
+    # 不必在 README / 测试报告 / changelog 里手写数字。
+    print(f"  TOTAL={total} PASS={len(PASS)} SKIP={len(SKIP)} FAIL={len(FAIL)}")
     if FAIL:
         print("\n  失败明细：")
         for f in FAIL:
