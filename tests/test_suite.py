@@ -3324,6 +3324,108 @@ def test_no_absolute_paths() -> None:
           probe.exists() and "[AI]" in probe.read_text(encoding="utf-8"), str(probe))
 
 
+def test_portable_containment() -> None:
+    """便携性红线：运行时不得把任何数据写到 U 盘（项目根）之外。
+
+    分工 —— 刻意与既有用例错开，不重复覆盖：
+      * 原子写（同目录临时文件 / os.replace / 失败保原）→ test_atomic_io
+      * 文件名安全（穿越 / 保留设备名 / 全角伪装）      → safe_filename 用例
+      * 源码不含硬编码盘符                              → test_no_absolute_paths
+    本用例补的是前三者都没管的那一层：**整个应用运行期间，是否把用户数据
+    落到了 AppData / 系统临时目录 / 用户主目录**。这是 Portable 的本质
+    —— 拔盘即走，不在宿主机器上留一粒尘埃。
+    """
+    import re as _re
+    import tempfile as _tf
+    import uuid as _uuid
+
+    section("便携性 / 写入不外泄")
+
+    # ---------- ① 源码写路径红线（静态）----------
+    # 豁免不是「懒得改」，每一条都有明确正当理由且仅限该文件。
+    exempt = {
+        "paths.py": "解析 WIKIUSB_* 环境变量指向的根（含 ~ 展开）",
+        "library.py": "解析用户自行指定的外部资料库路径",
+        "file_guard.py": "safe_join 把含 ~ 的 root 解析成绝对路径",
+        "crawler.py": "查找宿主已安装的 Chrome 可执行文件（只读，非落盘）",
+    }
+
+    # 必须「取完整调用参数」再判断：atomic_io.mkstemp(..., dir=target.parent)
+    # 是**跨行**书写的，按行匹配会漏掉 dir= 而误报，故用 re.S 取整个括号内容。
+    call_checks = [
+        (r"(?<![\w.])mkstemp\(", "mkstemp 不带 dir=（会落到系统临时目录）"),
+        (r"(?<![\w.])NamedTemporaryFile\(", "NamedTemporaryFile 不带 dir="),
+    ]
+    temp_viol: list[str] = []
+    for f in sorted((ROOT / "app").rglob("*.py")):
+        if f.name in exempt:
+            continue
+        txt = f.read_text(encoding="utf-8", errors="replace")
+        for call_pat, why in call_checks:
+            for m in _re.finditer(call_pat + r"(.*?\))", txt, _re.S):
+                if "dir=" not in m.group(1):
+                    temp_viol.append(f"{f.relative_to(ROOT)} -> {why}")
+        if _re.search(r"tempfile\.gettempdir", txt):
+            temp_viol.append(f"{f.relative_to(ROOT)} -> 系统临时目录")
+    check("★ 临时文件一律创建在项目内（静态红线）",
+          not temp_viol, "; ".join(dict.fromkeys(temp_viol))[:240])
+
+    appdata_viol: list[str] = []
+    for f in sorted((ROOT / "app").rglob("*.py")):
+        if f.name in exempt:
+            continue
+        if _re.search(r"LOCALAPPDATA|APPDATA", f.read_text(encoding="utf-8", errors="replace")):
+            appdata_viol.append(str(f.relative_to(ROOT)))
+    check("★ 源码不引用 AppData / LOCALAPPDATA 作为落盘位置",
+          not appdata_viol, "; ".join(appdata_viol))
+
+    # ---------- ② 运行时写入落点（动态探针）----------
+    # 写一个肉眼可辨的唯一标记，再去宿主侧找它 —— 找得到即说明外泄。
+    token = f"wiki-usb-containment-{_uuid.uuid4().hex}"
+    from app.core import atomic_io
+
+    target = paths.NOTES_DIR / f"{token}.md"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        atomic_io.atomic_write_text(target, f"# {token}\n\ncontainment probe\n")
+        check("★ 笔记落在项目数据根内",
+              target.exists() and token in target.read_text(encoding="utf-8"), str(target))
+
+        hosts: list[Path] = [Path(_tf.gettempdir()), Path.home()]
+        for var in ("LOCALAPPDATA", "APPDATA"):
+            val = os.environ.get(var)
+            if val:
+                hosts.append(Path(val))
+
+        leaks: list[str] = []
+        max_dirs, max_files = 60, 3000
+        for base in hosts:
+            if not base.exists():
+                continue
+            seen_dirs = seen_files = 0
+            for dirpath, dirnames, filenames in os.walk(base):
+                seen_dirs += 1
+                # 只看 base 顶层与其一级子目录 —— 泄漏不会藏在更深处，
+                # 深挖会把整个用户目录遍历一遍，慢且容易触发杀软。
+                if seen_dirs > max_dirs or len(Path(dirpath).relative_to(base).parts) >= 2:
+                    dirnames[:] = []
+                for name in filenames:
+                    if token in name:
+                        leaks.append(str(Path(dirpath) / name))
+                    seen_files += 1
+                    if seen_files >= max_files:
+                        break
+                if seen_files >= max_files:
+                    break
+        check("★ 宿主侧（临时目录/主目录/AppData）不出现同一份数据",
+              not leaks, "; ".join(leaks[:3]))
+    finally:
+        try:
+            target.unlink()
+        except OSError:
+            pass
+
+
 # ==========================================================================
 def _isolate_data_dir() -> Path:
     """把测试用到的**一切数据路径**重定向到临时目录，并断言没有漏网之鱼。
@@ -3453,6 +3555,7 @@ def main() -> int:
         test_console_encoding_guard()
         test_offline_assets()
         test_no_absolute_paths()
+        test_portable_containment()
         from tests.test_converters import run as run_converter_tests
         run_converter_tests(check)
         # 发布完整性校验器自身也要被回归：一个永远返回「可交付」的校验器
