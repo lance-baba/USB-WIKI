@@ -68,7 +68,14 @@ log = get_logger()
 ALLOWED_SCHEMES = ("http", "https")
 
 MAX_REDIRECTS = 5
-DEFAULT_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) WikiUSB/1.3"
+def _ua() -> str:
+    """User-Agent 里的版本也来自单一源（此前这里硬编码 WikiUSB/1.3）。"""
+    from ..version import USER_AGENT_TOKEN  # noqa: PLC0415 - 避免导入环
+
+    return f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) {USER_AGENT_TOKEN}"
+
+
+DEFAULT_UA = _ua()
 
 # 拒绝原因码（不含敏感信息，可安全回给用户）
 R_SCHEME = "SCHEME_NOT_ALLOWED"

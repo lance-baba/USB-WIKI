@@ -101,10 +101,13 @@ def _install_exit_hooks(on_exit) -> None:
 
 
 def _banner(host: str, port: int, ctx_report: dict | None) -> str:
+    # 版本来自单一源 app/version.py —— 这里不再硬编码
+    from app.version import APP_NAME, APP_NAME_CN, APP_VERSION  # noqa: PLC0415
+
     lines = [
         "",
         "  ╔══════════════════════════════════════════════════════╗",
-        "  ║   Wiki-USB  ·  随身第二大脑（独立版 v1.2）           ║",
+        f"  ║   {APP_NAME}  ·  {APP_NAME_CN} v{APP_VERSION}",
         "  ╚══════════════════════════════════════════════════════╝",
         f"   控制台地址： http://{host}:{port}",
         f"   数据目录　： {paths.DATA_DIR}",

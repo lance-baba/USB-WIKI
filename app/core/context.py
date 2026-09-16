@@ -162,7 +162,15 @@ class AppContext:
                 self.syncer.start()
 
             self.started_at = time.time()
+            # 两个版本**语义不同，分开返回**：
+            # app_version = 用户拿到的软件版本（三段式）
+            # schema_version = cache.db 的结构兼容版本
+            # 只给一个模糊的 "version" 会让以后排障分不清是哪个。
+            from app.version import APP_VERSION  # noqa: PLC0415
+
             self.boot_report = {
+                "app_version": APP_VERSION,
+                "schema_version": migrations_mod.CURRENT_SCHEMA_VERSION,
                 "wal_self_healed": healed,
                 "embedding_source": resolved.source,
                 "embedding_dim": actual_dim,
@@ -215,6 +223,8 @@ class AppContext:
         sig = self.db.get_signature()
         gw_state = self.gateway.state if self.gateway else None
         return {
+            "app_version": __import__("app.version", fromlist=["x"]).APP_VERSION,
+            "schema_version": migrations_mod.CURRENT_SCHEMA_VERSION,
             "ready": True,
             "port": self.port,
             "uptime": round(time.time() - (self.started_at or time.time()), 1),

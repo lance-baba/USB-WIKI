@@ -306,7 +306,7 @@
 <body>
 <div id="app">
   <header>
-    <div class="brand"><b>Wiki-USB</b><small>随身第二大脑 · v1.2</small></div>
+    <div class="brand"><b>Wiki-USB</b><small>随身第二大脑 · <span id="appVer">…</span></small></div>
     <div class="chips" id="chips">
       <span class="chip off" id="chipReady">初始化中…</span>
       <span class="chip off" id="chipEmbed">嵌入引擎 —</span>
@@ -623,7 +623,14 @@ function renderAlerts(d) {
   $$("#alerts .alert button").forEach(b => b.onclick = e => e.target.parentElement.remove());
 }
 
+function fillAppVersion(d) {
+  // 版本来自 /api/status（后端单一源 app/version.py），前端不自己硬编码
+  const el = document.getElementById('appVer');
+  if (el && d && d.app_version) el.textContent = 'v' + d.app_version;
+}
+
 function renderStats(d) {
+  fillAppVersion(d);
   if (!d || !d.ready) return;
   const emb = d.embedding || {}, ai = d.ai || {}, db = d.db || {}, syn = d.sync || {};
   const rows = [

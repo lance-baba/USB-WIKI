@@ -801,6 +801,117 @@ def test_original_preview(ctx) -> None:
     check("Office 文档不内联（走下载）", ".docx" not in Handler.INLINE_TYPES)
 
 
+def test_single_version_source(ctx) -> None:
+    """单一应用版本源：消灭 launcher / server / 前端各写一份的问题。
+
+    ⚠ 关键：**App Version 与 Schema Version 语义完全不同，必须分离**。
+    App Version 是用户拿到的软件版本（三段式 MAJOR.MINOR.PATCH）；
+    Schema Version 是 cache.db 的结构兼容版本（允许两段）。
+
+    `1.3.0 → 1.3.1` 可能只修 UI Bug，索引结构一个字没变 → Schema 不动。
+    若写成 `SCHEMA_VERSION = APP_VERSION`，「只修 UI」就会变成一次全库重建。
+    """
+    section("单一应用版本源（App / Schema 分离）")
+    import re
+
+    from app import version as V
+    from app.core import migrations as M
+
+    def code_only(text: str) -> str:
+        """只保留**可执行代码**：剥掉文档串与注释。
+
+        静态断言必须排除说明文字 —— 否则「注释里写了『此前硬编码 v1.2』」
+        会被当成仍然存在硬编码（这几条断言一开始就是这么误报的）。
+        """
+        t = re.sub('"""' + '.*?' + '"""', '', text, flags=re.S)
+        t = re.sub("'" * 3 + '.*?' + "'" * 3, '', t, flags=re.S)
+        return chr(10).join(ln.split(chr(35), 1)[0] for ln in t.splitlines())
+
+    # ---------- ① 版本源存在且格式规范 ----------
+    check("app/version.py 提供 APP_VERSION", bool(V.APP_VERSION))
+    check("App Version 是标准三段式 MAJOR.MINOR.PATCH",
+          bool(re.fullmatch(r"\d+\.\d+\.\d+", V.APP_VERSION)), V.APP_VERSION)
+    check("Schema Version 允许两段（不强制三段）",
+          bool(re.fullmatch(r"\d+(\.\d+)?", M.CURRENT_SCHEMA_VERSION)),
+          M.CURRENT_SCHEMA_VERSION)
+
+    # ---------- ② 两者独立演进 ----------
+    check("★ App Version 与 Schema Version 是**不同的常量**",
+          not hasattr(version_module_has_alias := V, "SCHEMA_VERSION"),
+          "app/version.py 不应包含 SCHEMA_VERSION")
+    vsrc = code_only((paths.BASE_DIR / "app" / "version.py").read_text(encoding="utf-8"))
+    check("★ 版本源里没有把 SCHEMA 与 APP 绑在一起",
+          "SCHEMA_VERSION = APP_VERSION" not in vsrc
+          and "SCHEMA_VERSION =" not in vsrc)
+    msrc = code_only((paths.CORE_DIR / "migrations.py").read_text(encoding="utf-8"))
+    check("★ migrations 不反向引用 APP_VERSION（Schema 不跟随软件版本）",
+          "APP_VERSION" not in msrc)
+
+    # 模拟「只改 App Version」不影响 Schema 判定
+    real_app = V.APP_VERSION
+    try:
+        V.APP_VERSION = "9.9.9"
+        check("★ 改 App Version 不影响 schema 判定",
+              M.needs_migration(paths.CACHE_DB) in
+              (M.FRESH, M.OK, M.UPGRADE, M.DOWNGRADE, M.UNKNOWN),
+              str(M.needs_migration(paths.CACHE_DB)))
+    finally:
+        V.APP_VERSION = real_app
+
+    # ---------- ③ 派生形式都来自同一常量 ----------
+    check("User-Agent token 派生自版本源", V.USER_AGENT_TOKEN == f"WikiUSB/{V.APP_VERSION}")
+    check("Git tag 派生自版本源", V.version_tag() == f"v{V.APP_VERSION}")
+    check("发布包名派生自版本源", V.release_zip_name() == f"USB-WIKI-v{V.APP_VERSION}-win-x64.zip")
+    check("BUILD_INFO 结构派生自版本源",
+          V.build_info(commit="x")["version"] == V.APP_VERSION)
+
+    # ---------- ④ launcher / server 显示值来自同一源 ----------
+    lsrc = code_only((paths.BASE_DIR / "app" / "launcher.py").read_text(encoding="utf-8"))
+    check("★ launcher 横幅引用版本源（不再硬编码）",
+          "from app.version import" in lsrc and "APP_VERSION" in lsrc)
+    check("launcher 不再出现旧的 v1.2 硬编码", "v1.2" not in lsrc)
+
+    ssrc = code_only((paths.BASE_DIR / "app" / "server.py").read_text(encoding="utf-8"))
+    check("★ HTTP Server 头引用版本源",
+          "USER_AGENT_TOKEN" in ssrc and '"WikiUSB/1.2"' not in ssrc)
+    check("server 不再硬编码 WikiUSB/1.2", "WikiUSB/1.2" not in ssrc)
+
+    nsrc = code_only((paths.CORE_DIR / "net_guard.py").read_text(encoding="utf-8"))
+    check("★ User-Agent 引用版本源", "USER_AGENT_TOKEN" in nsrc)
+    check("net_guard 不再硬编码 WikiUSB/1.3", "WikiUSB/1.3" not in nsrc)
+
+    hsrc = (paths.BASE_DIR / "app" / "web" / "index.html").read_text(encoding="utf-8")
+    check("★ 前端品牌栏不再硬编码版本（改为从 /api/status 取）",
+          "v1.2" not in hsrc and "appVer" in hsrc)
+
+    # ---------- ⑤ /api/status 返回两个版本 ----------
+    rep = ctx.boot_report or {}
+    check("★ /api/status 提供 app_version", rep.get("app_version") == V.APP_VERSION,
+          str(rep.get("app_version")))
+    check("★ /api/status 提供 schema_version",
+          rep.get("schema_version") == M.CURRENT_SCHEMA_VERSION,
+          str(rep.get("schema_version")))
+    check("★ 两个版本字段语义分明（不合并成一个模糊 version）",
+          "app_version" in rep and "schema_version" in rep)
+
+    # ---------- ⑥ 静态 regression：运行时代码里没有旧版本残留 ----------
+    STALE = ("v1.2", "WikiUSB/1.2", "WikiUSB/1.3")
+    runtime_files = [
+        p for p in (paths.BASE_DIR / "app").rglob("*")
+        if p.suffix in (".py", ".html") and p.is_file()
+    ]
+    hits = []
+    for f in runtime_files:
+        txt = code_only(f.read_text(encoding="utf-8", errors="ignore"))
+        for s in STALE:
+            if s in txt:
+                hits.append(f"{f.relative_to(paths.BASE_DIR)}:{s}")
+    check("★ 运行时代码中不存在旧版本硬编码", not hits, str(hits[:4]))
+
+    docs = ["README.md", "CHANGELOG.md"]
+    check("文档不算运行时版本源（CHANGELOG 保留历史版本是正确的）",
+          any((paths.BASE_DIR / d).exists() for d in docs))
+
 def test_secret_redaction(ctx) -> None:
     """Secret 脱敏：明文可存本地，但绝不意外向外泄露。
 
@@ -2655,6 +2766,7 @@ def main() -> int:
         # 测试不依赖外部 AI 服务：provider 用内存态覆盖（persist=False，不碰 config.ini）
         config.update({"AI": {"provider": "offline"}}, persist=False)
 
+        test_single_version_source(ctx)
         test_secret_redaction(ctx)
         test_import_security()
         test_archive_ssrf()

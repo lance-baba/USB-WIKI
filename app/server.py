@@ -31,7 +31,10 @@ MAX_BODY = 4 * 1024 * 1024  # 4MB 请求体上限
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
-    server_version = "WikiUSB/1.2"
+    # 单一版本源：app/version.py（此前这里硬编码 "WikiUSB/1.2"）
+    from .version import USER_AGENT_TOKEN  # noqa: PLC0415
+
+    server_version = USER_AGENT_TOKEN
     sys_version = ""
 
     ctx: AppContext  # 由 Server 注入
