@@ -414,15 +414,21 @@ def trim_term_to_corpus(db: Database, term: str, cache: dict[str, bool] | None =
     if not _CJK_RUN_RE.fullmatch(term):
         return term
 
+    # 预算跟随串长：长自然语言问句里的术语可能在**最前面**，需要砍很多刀才露出来。
+    # 实测反例：「索引重建会不会改笔记文件」（12 字）里的「索引重建」在最前面，
+    # 而固定 6 刀的预算只能砍到「索引重建会不会」→ 永远命中不到，
+    # 于是这类问句在「引用必须有词法依据」的规则下会被如实判为「没找到」。
+    budget = max(6, min(24, len(term) - 1))
+
     # 先尾部修剪：问句虚词多在尾部（「…有什么用」「…怎么用」）
-    for cut in range(0, 6):
+    for cut in range(0, budget):
         cand = term[: len(term) - cut] if cut else term
         if len(cand) < 2:
             break
         if _term_exists(db, cand, cache):
             return cand
     # 再首部修剪：处理「请问台风」这类前缀缀语
-    for cut in range(1, 6):
+    for cut in range(1, budget):
         cand = term[cut:]
         if len(cand) < 2:
             break

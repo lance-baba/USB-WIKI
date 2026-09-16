@@ -2767,6 +2767,8 @@ def main() -> int:
         config.update({"AI": {"provider": "offline"}}, persist=False)
 
         test_single_version_source(ctx)
+        from tests.test_rag_regression import run as _run_rag
+        _run_rag(ctx, check, section, skip)
         test_secret_redaction(ctx)
         test_import_security()
         test_archive_ssrf()
