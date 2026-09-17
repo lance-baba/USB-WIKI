@@ -1,11 +1,22 @@
 name: tests
 
+# 触发策略（阶段划分，勿随意恢复 push.branches）
+# ==========================================================================
+# GitHub 在本项目里的定位是**代码备份 + 版本回退**，不是每次提交都做 Release 级验收。
+#
+#   普通 push main  → 不触发（只是云端备份 / commit 历史 / 出错可回退点）
+#   workflow_dispatch（手动 Run workflow） → 触发完整 5 路 CI
+#   push v* tag     → 触发完整 5 路 CI
+#
+# Full CI 的使用场合：阶段 Gate 验收 / Release Candidate / 正式 Release。
+# ⚠ 不要为了「让徽章继续绿」把 push.branches 加回来 —— 那会把「备份」和
+#   「发布验收」两件事混在一起，代价是每次改一行文档都要排一次完整矩阵。
+# ⚠ 也不要削弱下面的 5 路矩阵内容：本策略只改**何时触发**，不改**测什么**。
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
   workflow_dispatch:
+  push:
+    tags:
+      - "v*"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}

@@ -132,3 +132,42 @@ Repair Engine / Ollama 安装 / 模型下载 / GGUF / ONNX 最终策略 / 模型
 
 （`LICENSES` 汇总 / `BUILD_INFO` / `SHA256SUMS` 已在 A3 完成初版；仍**不含**模型类资源，
 待 A4 决定真正捆绑什么后再纳入同一机制。）
+
+---
+
+## 7. CI 触发策略（2026-09-17 生效）
+
+**普通 `main` push 仅作为云端备份，不触发 Full CI。**
+Full CI 仅通过 `workflow_dispatch`（手动 Run workflow）或推送 `v*` tag 触发，
+用于**阶段 Gate / Release Candidate / 正式 Release** 验收。
+
+| 动作 | 是否跑 Full CI |
+| :--- | :--- |
+| 普通 `push main` | ❌ 只作备份 / commit 历史 / 可回退点 |
+| `workflow_dispatch`（手动） | ✅ 完整 5 路 |
+| `push` `v*` tag | ✅ 完整 5 路 |
+| `pull_request` | ❌ 已移除（本项目无 PR 协作需求） |
+
+**本策略只改「何时触发」，不改「测什么」** —— 5 路矩阵内容
+（Windows Portable Runtime + Windows 3.11/3.13 + Ubuntu 3.11/3.13）不得减少或削弱。
+
+### 普通开发任务的默认流程
+
+```
+改代码 → 本地 targeted tests → （按改动范围决定是否跑本地全量）→
+git commit → git push origin/main → 结束（不等待 GitHub Actions）
+```
+
+⚠ **禁止**把「不等 CI」理解成「不测试」：普通任务**至少**要跑本次改动对应的 targeted tests；
+涉及**核心启动 / 安装 / Data Contract / security** 时，必须跑对应回归测试。
+
+### 汇报口径
+
+- 普通任务汇报：本地相关测试 PASS/FAIL、本地全量测试（如运行）、Commit SHA、
+  是否已 push、`GitHub Full CI：本任务未要求，未运行`。
+- 只有**阶段 Gate** 才汇报 5 路 CI 结果。
+
+### 不在本策略内（不要顺手做）
+
+新 CI 架构 / Fast CI / nightly CI / PR gate / branch protection / Release workflow /
+GitHub Release / tag 自动发布 / artifact 上传。
