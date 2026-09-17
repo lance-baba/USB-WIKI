@@ -17,7 +17,6 @@
 from __future__ import annotations
 
 import hashlib
-import importlib.util
 import json
 import shutil
 import subprocess
@@ -57,11 +56,8 @@ def _runtime_present() -> bool:
 
 
 def _load_install():
-    spec = importlib.util.spec_from_file_location(
-        "install_windows_a2", REPO / "scripts" / "install_windows.py")
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
+    # 统一走夹具的加载器（注册 sys.modules + 不落 __pycache__），避免与 A3 两套加载方式漂移
+    return fx.load_installer()
 
 
 def _sha256_tree(root: Path) -> str:
