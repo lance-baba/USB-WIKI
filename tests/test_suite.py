@@ -3667,6 +3667,13 @@ def main() -> int:
         test_archive_ssrf()
         test_ssrf_guard(ctx)
         test_lifecycle_shutdown()
+        # A1：发布构建 + SSD 安装骨架（临时目录，零真实 LOCALAPPDATA/Documents 写入）
+        from tests.test_distribution_a1 import run_a1_tests
+        run_a1_tests()
+        from tests.test_distribution_a1 import PASS as _a1p, FAIL as _a1f, SKIP as _a1s
+        PASS.extend(_a1p)
+        FAIL.extend(_a1f)
+        SKIP.extend(_a1s)
         test_duplicate_url_detection(ctx)
         test_localhost_security(ctx)
         test_static_assets_serving(ctx)

@@ -9,6 +9,9 @@ data/cache.db-shm
 data/wiki-usb.log
 data/temp_chrome_profile/
 
+# ---- 发布构建产物（Release Builder 生成，非源码）----
+dist/
+
 # ---- 平台相关二进制（体积大，用 setup_runtime_windows.py 重建）----
 runtime/
 
