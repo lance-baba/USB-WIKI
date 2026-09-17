@@ -3674,6 +3674,13 @@ def main() -> int:
         PASS.extend(_a1p)
         FAIL.extend(_a1f)
         SKIP.extend(_a1s)
+        # A2：Installer Hardening / 事务化安装 + 回滚（临时目录，零真实 LOCALAPPDATA/Documents 写入）
+        from tests.test_distribution_a2 import run_a2_tests
+        run_a2_tests()
+        from tests.test_distribution_a2 import PASS as _a2p, FAIL as _a2f, SKIP as _a2s
+        PASS.extend(_a2p)
+        FAIL.extend(_a2f)
+        SKIP.extend(_a2s)
         test_duplicate_url_detection(ctx)
         test_localhost_security(ctx)
         test_static_assets_serving(ctx)

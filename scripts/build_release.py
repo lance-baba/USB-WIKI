@@ -43,7 +43,12 @@ def _copytree_prune(src: Path, dst: Path) -> None:
     )
 
 
-def build(platform: str, output: Path) -> Path:
+def _fail_build(msg: str) -> "None":
+    print(f"[build] 错误：{msg}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def build(platform: str, output: Path, strict: bool = False) -> Path:
     _ensure_repo_on_path()
     from app.version import APP_VERSION            # 唯一版本源
 
@@ -57,13 +62,20 @@ def build(platform: str, output: Path) -> Path:
     rt_src = REPO / "runtime" / "python-3.11-embed"
     rt_dst = payload / "python-runtime"
 
+    # app 始终必需（缺了就没有可发布的 payload，任何模式都必须失败）
+    if not (REPO / "app").is_dir():
+        _fail_build(f"仓库 app/ 不存在，无法构建 payload：{REPO / 'app'}")
     _copytree_prune(REPO / "app", app_dst)
 
     if (rt_src / "python.exe").is_file():
         _copytree_prune(rt_src, rt_dst)
     else:
         # 开发态 checkout 可能没构建 runtime（runtime/ 已 gitignore）。
-        # 完整发布流水线会先 setup_runtime_windows.py 再 build，这里只告警、不硬失败。
+        # 普通模式只告警、不硬失败；严格模式（正式发布）必须非零退出，
+        # 避免出现「看起来成功但不可安装」的发布包。
+        if strict:
+            _fail_build(f"严格模式：未找到嵌入式 Python {rt_src}。"
+                        " 正式发布前请先 `python setup_runtime_windows.py`。")
         print(f"[build] 警告：未找到 {rt_src}，跳过 python-runtime 拷贝。"
               " 正式发布前请先 `python setup_runtime_windows.py`。", file=sys.stderr)
 
@@ -78,6 +90,8 @@ def build(platform: str, output: Path) -> Path:
         "..\\payload\\python-runtime\\python.exe install.py %*\r\n",
         encoding="utf-8",
     )
+    if not (installer_dir / "install.py").is_file():
+        _fail_build("installer/install.py 生成失败")
     return dist_root
 
 
@@ -85,14 +99,20 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="USB-WIKI Release Builder")
     ap.add_argument("--platform", default="win-x64")
     ap.add_argument("--output", default=str(REPO / "dist"), help="dist 根目录")
+    ap.add_argument("--strict", action="store_true",
+                    help="严格模式：缺 app/嵌入式 runtime/installer 时非零退出"
+                         "（用于正式发布；开发模式缺 runtime 仍可构建）")
     args = ap.parse_args()
     out = Path(args.output).resolve()
-    root = build(args.platform, out)
+    root = build(args.platform, out, strict=args.strict)
     rt_ok = (root / "payload" / "python-runtime" / "python.exe").is_file()
-    print(f"BUILD OK -> {root}")
+    print(f"BUILD OK -> {root}" + ("  [strict]" if args.strict else ""))
     print(f"  payload/app/             { (root/'payload'/'app').is_dir() }")
     print(f"  payload/python-runtime/  { rt_ok }")
     print(f"  installer/install.py     { (root/'installer'/'install.py').is_file() }")
+    if args.strict and not rt_ok:
+        # 双保险：严格模式绝不允许产出缺 runtime 的发布包
+        _fail_build("严格模式产出缺少 python-runtime，发布包不可安装")
     return 0
 
 
