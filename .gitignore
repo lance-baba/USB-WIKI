@@ -15,6 +15,15 @@ dist/
 # ---- 平台相关二进制（体积大，用 setup_runtime_windows.py 重建）----
 runtime/
 
+# ---- vendor 缓存（取件字节，绝不入库）----
+# bundled embedding 模型字节（model.onnx / tokenizer.json 等）由
+# scripts/fetch_embedding_resource.py 按 resources/embedding/default.json 契约
+# **取件**到 vendor/cache/embedding/。这些字节（约 24MB）一律不进 Git，
+# 否则 clone 膨胀且校验和失去意义；CI / 维护者构建前必须先 取件。
+# 注意：vendor/licenses/ 下的**许可原文**是源码、必须入库（见下），
+# 只忽略 vendor/cache/ 这一棵下载树。
+vendor/cache/
+
 # ---- 含明文密钥的本地配置 ----
 config.ini
 

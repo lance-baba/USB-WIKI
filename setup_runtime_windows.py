@@ -3,13 +3,18 @@
 做四件事：
   1. 下载官方 **python-3.11 embeddable** amd64 包并解压到 ``runtime/python-3.11-embed``
   2. 修补 ``python311._pth`` —— 解除 ``import site`` 注释并追加 ``./Lib/site-packages``
-  3. 用内置解释器引导 pip，并把**核心依赖**装进 ``Lib/site-packages``（约 65MB）
-  4. 可选：``--with-onnx`` 额外安装 onnxruntime（+140MB）并下载本地 ONNX 嵌入模型
+  3. 用内置解释器引导 pip，并把**全部运行依赖**装进 ``Lib/site-packages``
+     —— 含 onnxruntime / tokenizers（V1 标准依赖，随 lock 精确锁定）
+
+⚠ 模型字节**不在这里下载**。资源获取是 maintainer 侧的独立动作：
+
+    python scripts/fetch_embedding_resource.py     # 按契约取件 + 校验 → vendor/cache/embedding/
+
+这样「取资源」与「构建 Release」是两个动作，客户安装阶段 0 联网。
 
 用法：
-    python setup_runtime_windows.py                # 精简安装（约 65MB，需联网一次）
+    python setup_runtime_windows.py                # 标准安装（需联网一次）
     python setup_runtime_windows.py --dev           # 开发安装：用 requirements.txt 浮动区间
-    python setup_runtime_windows.py --with-onnx    # 同时启用本地 ONNX 嵌入引擎
     python setup_runtime_windows.py --check        # 体检现有运行时**能否跑起来**
     python setup_runtime_windows.py --verify       # 发布完整性校验：答「这个 U 盘能否交付」
     python setup_runtime_windows.py --verify --json # 同上，输出 JSON 供 CI 消费
@@ -48,9 +53,10 @@ EMBED_URL = (
 )
 GETPIP_URL = "https://bootstrap.pypa.io/get-pip.py"
 MIRROR_INDEX = "https://pypi.tuna.tsinghua.edu.cn/simple"
-ONNX_MODEL_URL = (
-    "https://huggingface.co/BAAI/bge-small-zh-v1.5/resolve/main/onnx/model_quantized.onnx"
-)
+# ⚠ 这里**不再**有 ONNX 模型下载 URL。模型字节改由「资源契约 + maintainer 取件」提供：
+#      resources/embedding/default.json（pin revision / sha256 / size）
+#      scripts/fetch_embedding_resource.py → vendor/cache/embedding/（gitignored）
+#   构建 Release 时只做本地拷贝；客户安装 0 联网。见 docs/EMBEDDING_ARTIFACT_SELECTION.md。
 
 # 依赖清单：两份，职责不同（见 docs/DEPENDENCY_LOCK.md）
 #   requirements.txt            —— 直接依赖 + 兼容区间，用于开发安装（浮动解析）
@@ -60,11 +66,9 @@ ONNX_MODEL_URL = (
 REQ_FILE: Path = BASE / "requirements.txt"
 LOCK_FILE: Path = BASE / "requirements-release.lock"
 
-# 可选重型依赖：仅在 --with-onnx 时安装。
-# onnxruntime + numpy 约 +140MB，且缺少模型文件时**不提供任何能力**，
-# 因此默认不随发布包分发，以守住「精简优先」的体积目标。
-# requirements.txt 中对应行是注释状态，这里是它的可执行形态。
-ONNX_REQUIREMENTS = ["onnxruntime>=1.17"]
+# onnxruntime / tokenizers 已是 **V1 标准运行依赖**（写在 requirements.txt 里，
+# 由 lock 精确锁定），随 runtime 一起安装 —— 不再有「可选 ONNX 步骤」。
+# 体积影响实测见 docs/EMBEDDING_ARTIFACT_SELECTION.md。
 
 
 def load_requirements(path: Path | None = None) -> list[str]:
@@ -177,27 +181,33 @@ def step3_install_deps(mirror: bool, dev: bool = False) -> None:
     log("依赖安装完成")
 
 
-def step4_onnx(mirror: bool) -> None:
-    """可选：安装 onnxruntime 并下载本地 ONNX 嵌入模型。"""
-    cmd = [str(EMBED_PY), "-m", "pip", "install", "--no-warn-script-location",
-           "--disable-pip-version-check", *ONNX_REQUIREMENTS]
-    if mirror:
-        cmd += ["-i", MIRROR_INDEX]
-    log("安装可选依赖（onnxruntime，约 +140MB）：" + " ".join(ONNX_REQUIREMENTS))
-    if subprocess.run(cmd, cwd=str(EMBED_DIR)).returncode != 0:
-        log("⚠ onnxruntime 安装失败，将保持降级嵌入源（不影响启动）")
-        return
+def check_embedding_resource() -> tuple[bool, str]:
+    """检查随包嵌入资源**字节**是否已就位（只读，不联网）。
 
-    models = RUNTIME / "models"
-    models.mkdir(parents=True, exist_ok=True)
-    target = models / "bge-small-zh-q4.onnx"
-    if target.exists():
-        log(f"ONNX 模型已存在：{target.name}（{target.stat().st_size/1e6:.1f} MB）")
-        return
+    资源取回是 maintainer 侧的独立动作（scripts/fetch_embedding_resource.py）；
+    这里只回答「构建 Release 时会不会因为缺件而失败」。
+    """
+    import json
+
+    contract = BASE / "resources" / "embedding" / "default.json"
+    cache = BASE / "vendor" / "cache" / "embedding"
+    if not contract.is_file():
+        return False, "缺少资源契约 resources/embedding/default.json"
     try:
-        _download(ONNX_MODEL_URL, target, "bge-small-zh ONNX 模型")
-    except SystemExit as exc:
-        log(f"模型下载失败（不影响启动，可稍后重试）：{exc}")
+        data = json.loads(contract.read_text(encoding="utf-8"))
+    except ValueError as exc:
+        return False, f"资源契约无法解析：{exc}"
+    want = {
+        "model.onnx": int(data.get("artifact_size") or 0),
+    }
+    for name, rec in (data.get("tokenizer_files") or {}).items():
+        want[name] = int(rec.get("size") or 0)
+    missing = [n for n, size in want.items()
+               if not (cache / n).is_file() or (cache / n).stat().st_size != size]
+    if missing:
+        return False, (f"vendor/cache/embedding 缺件或尺寸不符：{', '.join(sorted(missing))}"
+                       "（先跑 scripts/fetch_embedding_resource.py）")
+    return True, f"{data.get('id')}（{len(want)} 个文件已就位）"
 
 
 def check() -> int:
@@ -227,17 +237,15 @@ def check() -> int:
         )
         print(subprocess.run([str(EMBED_PY), "-c", probe], capture_output=True,
                              text=True).stdout, end="")
-        for mod in ("sqlite_vec", "trafilatura", "lxml", "yaml"):
+        for mod in ("sqlite_vec", "trafilatura", "lxml", "yaml",
+                    "onnxruntime", "tokenizers"):
             r = subprocess.run([str(EMBED_PY), "-c", f"import {mod}"],
                                capture_output=True, text=True)
             print(f"  {mod:<11}: {'✅' if r.returncode == 0 else '❌ 未安装'}")
             ok = ok and r.returncode == 0
-        onnx = subprocess.run([str(EMBED_PY), "-c", "import onnxruntime"],
-                              capture_output=True, text=True)
-        print(f"  onnxruntime: {'✅ 已安装' if onnx.returncode == 0 else '⚠ 未安装（可选，加 --with-onnx）'}")
 
-    model = RUNTIME / "models" / "bge-small-zh-q4.onnx"
-    print(f"  ONNX 模型  : {'✅' if model.exists() else '⚠ 未下载（将降级嵌入源）'}")
+    res_ok, res_msg = check_embedding_resource()
+    print(f"  嵌入资源    : {'✅ ' if res_ok else '⚠ '}{res_msg}")
     web = BASE / "app" / "web"
     print(f"  离线前端   : {'✅' if (web / 'index.html').exists() else '❌'} index.html"
           f" ，{'✅' if (web / 'app.css').exists() else '❌'} app.css"
@@ -549,7 +557,8 @@ def main() -> int:
                     help="清理工程垃圾（__pycache__/.pyc/编辑器残留），不动 runtime/ 与 data/")
     ap.add_argument("--dry-run", action="store_true",
                     help="配合 --clean：只预览将被清除的内容，不实际删除")
-    ap.add_argument("--with-onnx", action="store_true", help="额外下载本地 ONNX 嵌入模型")
+    # ⚠ `--with-onnx` 已移除：onnxruntime / tokenizers 是 V1 标准运行依赖，随 lock 安装；
+    #   模型字节由 scripts/fetch_embedding_resource.py 单独取回（maintainer 侧动作）。
     ap.add_argument("--no-mirror", action="store_true", help="不使用清华 PyPI 镜像")
     ap.add_argument("--dev", action="store_true",
                    help="开发安装：用 requirements.txt 的浮动区间而非 release lock")
@@ -580,10 +589,11 @@ def main() -> int:
         shutil.rmtree(SITE_PACKAGES, ignore_errors=True)
         log("已清空旧的 site-packages（--force）")
     step3_install_deps(mirror=not args.no_mirror, dev=args.dev)
-    if args.with_onnx:
-        step4_onnx(mirror=not args.no_mirror)
-    else:
-        log("已跳过 onnxruntime 与 ONNX 模型（需要时加 --with-onnx）")
+    # 模型字节不在这里下载（那是 maintainer 的取件动作，见 scripts/fetch_embedding_resource.py）；
+    # 这里只提示「构建 Release 前要不要先取件」，不在安装路径上联网。
+    res_ok, res_msg = check_embedding_resource()
+    log(("嵌入资源：" + res_msg) if res_ok
+        else ("⚠ " + res_msg + "（不加也能跑，但 build_release.py --strict 会失败）"))
 
     print()
     return check()

@@ -853,7 +853,8 @@ const CFG_SCHEMA = [
     desc: "把问题变成向量做语义匹配。这一组程序会自己适配，基本不用碰。",
     fields: [
       { key: "embedding_source", label: "向量嵌入来源", type: "select",
-        tip: "local_onnx 用内置模型（需 --with-onnx 安装）；ollama 借本机 Ollama 算；api 用云端算。选错会自动降级，不会崩。",
+        tip: "local_onnx 用随包自带的本地模型（bge-small-zh-v1.5，开箱可用、不联网）；"
+             + "ollama 借本机 Ollama 算；api 用云端算。本机没有嵌入能力时会自动降级为纯词法检索，不会崩。",
         options: [["local_onnx", "本地 ONNX"], ["ollama", "本地 Ollama"], ["api", "云端 API"]] },
       { key: "embedding_model_name", label: "嵌入模型名", type: "ollama-model",
         tip: "用 Ollama 做嵌入时，从下拉里选（推荐 nomic-embed-text / bge-m3 这类 embedding 专用模型，别选 chat 模型）。用 local_onnx / api 时会自动变回手动填写。" },

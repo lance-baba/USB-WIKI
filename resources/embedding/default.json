@@ -1,0 +1,57 @@
+{
+  "format_version": 1,
+  "id": "bge-small-zh-v1.5-int8",
+  "base_model": "BAAI/bge-small-zh-v1.5",
+  "base_model_revision": "7999e1d3359715c523056ef9478215996d62a620",
+  "artifact_source": "Xenova/bge-small-zh-v1.5",
+  "artifact_revision": "75c43b069aac4d136ba6bc1122f995fedcfd2781",
+  "artifact_file": "onnx/model_int8.onnx",
+  "artifact_sha256": "b9837c19ce154ff0726d398ee77abbc03a7faf0476c6f93016c84e531be7ebb5",
+  "artifact_size": 23903394,
+  "precision": "int8",
+  "dimension": 512,
+  "pooling": "cls",
+  "normalize": true,
+  "max_length": 512,
+  "_comment_pooling": "取 last_hidden_state 的 CLS（token 0）再 L2 归一化；依据 base model 官方 1_Pooling/config.json 的 pooling_mode_cls_token=true",
+  "license": {
+    "basis": "derived_from_base_model",
+    "base_model_license": "MIT",
+    "conversion_repository_license": "unspecified",
+    "_comment": "转换仓库 Xenova/bge-small-zh-v1.5 自身未声明 license；权重来自 MIT 的 base model，故按 MIT 记录并保留完整链路。不得把转换仓库硬标为 MIT。"
+  },
+  "local_files": {
+    "model": "model.onnx",
+    "tokenizer": "tokenizer.json"
+  },
+  "tokenizer_files": {
+    "tokenizer.json": {
+      "source": "Xenova/bge-small-zh-v1.5",
+      "revision": "75c43b069aac4d136ba6bc1122f995fedcfd2781",
+      "repo_path": "tokenizer.json",
+      "sha256": "48cea5d44424912a6fd1ea647bf4fe50b55ab8b1e5879c3275f80e339e8fae26",
+      "size": 439125
+    },
+    "tokenizer_config.json": {
+      "source": "Xenova/bge-small-zh-v1.5",
+      "revision": "75c43b069aac4d136ba6bc1122f995fedcfd2781",
+      "repo_path": "tokenizer_config.json",
+      "sha256": "e6f3b96db926a37d4039995fbf5ad17de158dfb8f6343d607e4dbaad18d75f5a",
+      "size": 367
+    },
+    "special_tokens_map.json": {
+      "source": "Xenova/bge-small-zh-v1.5",
+      "revision": "75c43b069aac4d136ba6bc1122f995fedcfd2781",
+      "repo_path": "special_tokens_map.json",
+      "sha256": "b6d346be366a7d1d48332dbc9fdf3bf8960b5d879522b7799ddba59e76237ee3",
+      "size": 125
+    },
+    "vocab.txt": {
+      "source": "Xenova/bge-small-zh-v1.5",
+      "revision": "75c43b069aac4d136ba6bc1122f995fedcfd2781",
+      "repo_path": "vocab.txt",
+      "sha256": "45bbac6b341c319adc98a532532882e91a9cefc0329aa57bac9ae761c27b291c",
+      "size": 109540
+    }
+  }
+}

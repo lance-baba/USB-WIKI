@@ -22,6 +22,10 @@ class AppContext:
     db: db_mod.Database | None = None
     embedder: embedder_mod.BaseEmbedder | None = None
     embedder_source: str = "none"
+    #: 随包嵌入资源（仅 local_onnx 时有值）—— 供 BUILD_INFO / diagnostics 复用
+    embedding_resource: object | None = None
+    #: 没用到「配置指定的嵌入源」时的原因（diagnostics 的 fallback_reason）
+    embedding_fallback_reason: str = ""
     gateway: llm.Gateway | None = None
     syncer: sync.NoteSyncer | None = None
     warnings: list[str] = field(default_factory=list)   # 需用户行动 → 界面告警条
@@ -77,6 +81,8 @@ class AppContext:
             )
             self.embedder = resolved.embedder
             self.embedder_source = resolved.source
+            self.embedding_resource = resolved.resource
+            self.embedding_fallback_reason = resolved.fallback_reason
             self.warnings.extend(resolved.warnings)
             self.notes.extend(resolved.notes)
 
@@ -125,9 +131,20 @@ class AppContext:
                     self._needs_full_rebuild = False
 
             # 6) 向量空间签名守卫
-            model_name = config.get_str("AI", "embedding_model_name", "bge-small-zh-q4")
+            #    bundled local_onnx 用**资源自身的 id** 作为 model 段（不再读配置里的
+            #    embedding_model_name —— 那个键是给 ollama / api 嵌入源用的），
+            #    并带上 artifact / tokenizer 的 SHA256 与精度：只记「模型名 + 维度」
+            #    区分不了「同名但字节换了」的 artifact。
             if self.embedder is not None:
-                mismatch = self.db.check_signature(resolved.source, model_name, actual_dim)
+                sig_model = (resolved.resource.id if resolved.resource is not None
+                             else config.get_str("AI", "embedding_model_name", ""))
+                try:
+                    extra = self.embedder.signature_extra() or {}
+                except Exception as exc:  # noqa: BLE001 - 只影响签名粒度
+                    log.debug("读取嵌入签名附加字段失败: %s", exc)
+                    extra = {}
+                mismatch = self.db.check_signature(resolved.source, sig_model,
+                                                   actual_dim, extra=extra)
                 if mismatch:
                     self.warnings.append(mismatch + "，需点击「全量重建索引」")
                     self.db.signature_mismatch = mismatch
@@ -137,7 +154,8 @@ class AppContext:
                 stored_dim = self.db.get_meta(db_mod.META_VEC_DIM)
                 if stored_dim and stored_dim != str(self.db.embedding_dim):
                     self.db.signature_mismatch = (
-                        f"向量嵌入暂不可用（本机缺少 onnxruntime，Ollama 也未在线），"
+                        "向量嵌入暂不可用"
+                        f"（{resolved.fallback_reason or '本机没有可用的嵌入源'}），"
                         f"已退化为纯 FTS5 词法检索；原 {stored_dim} 维向量索引已保留，"
                         f"恢复嵌入源后自动恢复向量召回"
                     )
@@ -174,6 +192,9 @@ class AppContext:
                 "wal_self_healed": healed,
                 "embedding_source": resolved.source,
                 "embedding_dim": actual_dim,
+                # 随包资源 id（未启用时为 None）+ 未用上配置来源的原因
+                "embedding_id": getattr(resolved.resource, "id", None),
+                "embedding_fallback_reason": resolved.fallback_reason,
                 "vec_ready": bool(self.db.vec_table_ready and not self.db.signature_mismatch),
                 "boot_ms": int((time.time() - t0) * 1000),
                 "warnings": list(self.warnings),
@@ -266,6 +287,11 @@ class AppContext:
                 "source": self.embedder_source,
                 "dim": getattr(self.embedder, "dim", None),
                 "signature": sig,
+                # 随包资源身份（未启用时 None）—— 用户能看出「用的是哪一个 artifact」
+                "id": getattr(self.embedding_resource, "id", None),
+                "precision": getattr(self.embedding_resource, "precision", None),
+                "artifact_sha256": (getattr(self.embedding_resource, "artifact_sha256", "") or "")[:16] or None,
+                "fallback_reason": self.embedding_fallback_reason or None,
             },
             "ai": {
                 "provider_mode": config.get_str("AI", "provider", "auto"),

@@ -174,6 +174,12 @@ def _copy_to_staging(payload: Path, staging: Path) -> None:
     staging.mkdir(parents=True, exist_ok=True)
     shutil.copytree(payload / "app", staging / "app")
     shutil.copytree(payload / "python-runtime", staging / "runtime")
+    # 随包嵌入资源 → App/resources/embedding/（**属于 App，不属于 Library**）
+    #   → 可重装 / 可覆盖 / 可 rollback / 可从 U 盘恢复；Library 完全不受影响。
+    #   资源目录缺失不阻断安装：那是「未随包」的正常状态，运行时会降级为纯 FTS。
+    emb_src = payload / "embedding"
+    if emb_src.is_dir():
+        shutil.copytree(emb_src, staging / "resources" / "embedding")
 
 
 def _write_launcher(app_dir: Path, library_target: Path) -> None:

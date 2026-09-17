@@ -3702,6 +3702,14 @@ def main() -> int:
         PASS.extend(_a41p)
         FAIL.extend(_a41f)
         SKIP.extend(_a41s)
+        # A4.2b：bundled embedding 集成（tokenizer parity / 嵌入 / RAG regression /
+        #        降级 / 介质改字节 / 重装恢复 / signature）
+        from tests.test_embedding_a42b import run_a42b_tests
+        run_a42b_tests()
+        from tests.test_embedding_a42b import PASS as _a42p, FAIL as _a42f, SKIP as _a42s
+        PASS.extend(_a42p)
+        FAIL.extend(_a42f)
+        SKIP.extend(_a42s)
         test_duplicate_url_detection(ctx)
         test_localhost_security(ctx)
         test_static_assets_serving(ctx)

@@ -26,6 +26,8 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import shutil
 import sys
 from pathlib import Path
@@ -83,6 +85,101 @@ def _stage_payload(dist_root: Path) -> bool:
     return False
 
 
+#: 嵌入资源：取件（maintainer）与构建（builder）是两个动作，构建**绝不联网**
+EMBEDDING_CONTRACT = REPO / "resources" / "embedding" / "default.json"
+EMBEDDING_CACHE = REPO / "vendor" / "cache" / "embedding"
+
+#: stable 判定码（与 strict Gate 的错误码一一对应）
+EMB_OK = "ok"
+EMB_ARTIFACT_MISSING = "EMBEDDING_ARTIFACT_MISSING"
+EMB_METADATA_INVALID = "EMBEDDING_METADATA_INVALID"
+EMB_HASH_MISMATCH = "EMBEDDING_HASH_MISMATCH"
+EMB_TOKENIZER_MISSING = "EMBEDDING_TOKENIZER_MISSING"
+EMB_LICENSE_MISSING = "EMBEDDING_LICENSE_MISSING"
+
+
+def _sha256_file(path: Path, chunk: int = 1 << 20) -> str:
+    h = hashlib.sha256()
+    with Path(path).open("rb") as fh:
+        while True:
+            b = fh.read(chunk)
+            if not b:
+                break
+            h.update(b)
+    return h.hexdigest()
+
+
+def _stage_embedding(dist_root: Path) -> dict:
+    """把随包嵌入资源拷进 ``payload/embedding/``（**只做本地拷贝**）。
+
+    返回 ``{staged, code, reason, id, build_info}``。
+    构建期做一次**全量 SHA256**：构建不是每次启动，24MB 的一次性校验值得付；
+    运行时则刻意不重算（见 app/core/embedder.py 的 load_embedding_resource）。
+    """
+    report: dict = {"staged": False, "code": EMB_OK, "reason": "",
+                    "id": None, "build_info": None}
+
+    if not EMBEDDING_CONTRACT.is_file():
+        report.update(code=EMB_METADATA_INVALID,
+                      reason=f"缺少资源契约 {EMBEDDING_CONTRACT.name}")
+        return report
+    try:
+        contract = json.loads(EMBEDDING_CONTRACT.read_text(encoding="utf-8"))
+    except ValueError as exc:
+        report.update(code=EMB_METADATA_INVALID, reason=f"资源契约无法解析：{exc}")
+        return report
+    if contract.get("format_version") != 1:
+        report.update(code=EMB_METADATA_INVALID, reason="资源契约 format_version 不受支持")
+        return report
+
+    local = contract.get("local_files") or {}
+    model_name = Path(str(local.get("model") or "model.onnx")).name
+    tok_name = Path(str(local.get("tokenizer") or "tokenizer.json")).name
+    wanted: dict[str, str] = {model_name: str(contract.get("artifact_sha256") or "")}
+    for name, rec in (contract.get("tokenizer_files") or {}).items():
+        wanted[name] = str(rec.get("sha256") or "")
+
+    missing = [n for n in wanted if not (EMBEDDING_CACHE / n).is_file()]
+    if missing:
+        report.update(code=EMB_ARTIFACT_MISSING,
+                      reason=(f"vendor/cache/embedding 缺件：{', '.join(sorted(missing))}"
+                              "（先跑 scripts/fetch_embedding_resource.py）"))
+        return report
+    if tok_name not in wanted or not (EMBEDDING_CACHE / tok_name).is_file():
+        report.update(code=EMB_TOKENIZER_MISSING, reason=f"缺少 tokenizer 文件 {tok_name}")
+        return report
+
+    dest = dist_root / "payload" / "embedding"
+    dest.mkdir(parents=True, exist_ok=True)
+    for name in sorted(wanted):
+        src = EMBEDDING_CACHE / name
+        actual = _sha256_file(src)
+        if actual != wanted[name].lower():
+            report.update(code=EMB_HASH_MISMATCH,
+                          reason=f"{name}：SHA256 与契约不符（期望 {wanted[name][:16]}…，"
+                                 f"实际 {actual[:16]}…）")
+            return report
+        shutil.copy2(src, dest / name)
+    # 契约本体（运行时按 artifact.json 解析，不猜文件名）
+    shutil.copy2(EMBEDDING_CONTRACT, dest / "artifact.json")
+
+    report.update(
+        staged=True, id=contract.get("id"),
+        build_info={
+            "id": contract.get("id"),
+            "base_model": contract.get("base_model"),
+            "artifact_source": contract.get("artifact_source"),
+            "artifact_revision": contract.get("artifact_revision"),
+            "precision": contract.get("precision"),
+            "dimension": contract.get("dimension"),
+            "artifact_sha256": str(contract.get("artifact_sha256") or "").lower(),
+            "tokenizer_sha256": str(((contract.get("tokenizer_files") or {}).get(tok_name) or {})
+                                    .get("sha256") or "").lower(),
+        },
+    )
+    return report
+
+
 def _stage_installer(dist_root: Path) -> None:
     installer_dir = dist_root / "installer"
     installer_dir.mkdir(parents=True, exist_ok=True)
@@ -132,14 +229,15 @@ def _version_sources() -> dict:
             "data_format_version": DATA_FORMAT_VERSION}
 
 
-def _build_info(root: Path, platform: str, rt_ok: bool) -> dict:
+def _build_info(root: Path, platform: str, rt_ok: bool,
+                embedding: dict | None = None) -> dict:
     import release_integrity as ri                              # noqa: PLC0415
 
     lock = REPO / "requirements-release.lock"
     lock_sha = ri.sha256_file(lock) if lock.is_file() else None
     py_ver = ri.resolve_python_version(root / "payload" / "python-runtime") if rt_ok else None
     versions = _version_sources()
-    return ri.build_info(
+    info = ri.build_info(
         platform=platform,
         commit=ri.resolve_git_commit(REPO),
         python_version=py_ver,
@@ -147,6 +245,9 @@ def _build_info(root: Path, platform: str, rt_ok: bool) -> dict:
         schema_version=versions["schema_version"],
         data_format_version=versions["data_format_version"],
     )
+    # §18：随包嵌入资源身份。只记「是什么字节」，**不记任何绝对路径**。
+    info["embedding"] = embedding
+    return info
 
 
 def build(platform: str, output: Path, strict: bool = False) -> Path:
@@ -182,8 +283,18 @@ def build(platform: str, output: Path, strict: bool = False) -> Path:
         python_version=ri.resolve_python_version(dist_root / "payload" / "python-runtime"),
     )
 
-    # 2) BUILD_INFO
-    info = _build_info(dist_root, platform, rt_ok)
+    # 1.5) 随包嵌入资源（**只做本地拷贝**，缺件绝不联网现下）
+    emb = _stage_embedding(dist_root)
+    if emb["staged"]:
+        # 2) BUILD_INFO 带上 embedding 块（§18）
+        info = _build_info(dist_root, platform, rt_ok, emb["build_info"])
+    else:
+        info = _build_info(dist_root, platform, rt_ok, None)
+        msg = (f"[build] 嵌入资源未随包：{emb['code']} —— {emb['reason']}")
+        if strict:
+            print(msg, file=sys.stderr)
+        else:
+            print(msg + "（非 strict：允许不带嵌入资源）", file=sys.stderr)
     ri.write_build_info(dist_root, info)
 
     # 3) RELEASE_MANIFEST → 4) SHA256SUMS（同一套枚举，单一出口）
@@ -194,7 +305,7 @@ def build(platform: str, output: Path, strict: bool = False) -> Path:
     check = ri.verify_media(dist_root)
 
     if strict:
-        _strict_gate(dist_root, rt_ok, info, licenses, manifest, check, doc_count)
+        _strict_gate(dist_root, rt_ok, info, licenses, manifest, check, doc_count, emb)
 
     print(f"{'BUILD OK' if strict else 'DEV BUILD OK（非正式发布）'} -> {dist_root}")
     print(f"  发布格式版本           {ri.FORMAT_VERSION}")
@@ -225,7 +336,7 @@ def build(platform: str, output: Path, strict: bool = False) -> Path:
 
 
 def _strict_gate(dist_root: Path, rt_ok: bool, info: dict, licenses: dict,
-                 manifest: dict, check, doc_count: int) -> None:
+                 manifest: dict, check, doc_count: int, emb: dict) -> None:
     """正式发布的完整门禁 —— 任一条件不满足即非零退出。
 
     每个条件带**稳定错误码**，便于 CI / 售后按码定位（不用去解析中文描述）：
@@ -237,6 +348,9 @@ def _strict_gate(dist_root: Path, rt_ok: bool, info: dict, licenses: dict,
         **LICENSE_TEXT_MISSING** —— 随包运行依赖只有元数据、缺许可原文
         **VENDOR_LICENSE_INVALID** —— vendor 许可原文库缺件/被改动
         LICENSE_REVIEW_REQUIRED_REMAINING —— 仍有无法确认许可的组件
+        **EMBEDDING_ARTIFACT_MISSING / EMBEDDING_METADATA_INVALID /
+        EMBEDDING_HASH_MISMATCH / EMBEDDING_TOKENIZER_MISSING /
+        EMBEDDING_LICENSE_MISSING** —— 随包嵌入资源不可用
     """
     problems: list[tuple[str, str]] = []
 
@@ -285,6 +399,28 @@ def _strict_gate(dist_root: Path, rt_ok: bool, info: dict, licenses: dict,
          "LICENSE_REVIEW_REQUIRED_REMAINING",
          f"{summary.get('review_required')} 个组件许可待人工复核"
          "（LICENSE_REVIEW_REQUIRED，V1 发布前必须清零）")
+
+    # ---- A4.2b：随包嵌入资源（V1 标准能力，缺件即拒绝发布）----
+    #   ⚠ 这里**永远不会**联网补件：取件是 maintainer 的独立动作。
+    #     构建内偷偷下载会让「构建可复现」失效，也会让客户安装阶段的网络假设失真。
+    emb_code = emb.get("code") or EMB_OK
+    need(emb_code == EMB_OK and bool(emb.get("staged")),
+         emb_code or EMB_ARTIFACT_MISSING,
+         f"随包嵌入资源不可用：{emb.get('reason') or '未知原因'}"
+         "（先跑 scripts/fetch_embedding_resource.py）")
+    need((dist_root / "payload" / "embedding" / "artifact.json").is_file(),
+         EMB_METADATA_INVALID, "payload/embedding/artifact.json 缺失（运行时按它解析资源）")
+    need((dist_root / "payload" / "embedding" / "model.onnx").is_file(),
+         EMB_ARTIFACT_MISSING, "payload/embedding/model.onnx 缺失")
+    need((dist_root / "payload" / "embedding" / "tokenizer.json").is_file(),
+         EMB_TOKENIZER_MISSING, "payload/embedding/tokenizer.json 缺失")
+    need(bool(info.get("embedding")),
+         EMB_METADATA_INVALID, "BUILD_INFO.embedding 缺失（资源身份不可追溯）")
+    # 模型许可必须随 Release 保留：BAAI MIT 原文 + PROVENANCE（如实记录「转换产物」关系）
+    model_lic = dist_root / "LICENSES" / "models" / "bge-small-zh-v1.5"
+    need((model_lic / "LICENSE").is_file() and (model_lic / "PROVENANCE.json").is_file(),
+         EMB_LICENSE_MISSING,
+         "LICENSES/models/bge-small-zh-v1.5/ 缺 LICENSE 或 PROVENANCE.json（base model MIT 声明必须随 Release 保留）")
 
     need(bool(manifest.get("files")), "MANIFEST_EMPTY", "RELEASE_MANIFEST 为空")
     need((dist_root / "SHA256SUMS").is_file(),

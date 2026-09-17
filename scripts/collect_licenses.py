@@ -36,6 +36,9 @@ LICENSES_DIRNAME = "LICENSES"
 THIRD_PARTY_JSON = "THIRD_PARTY.json"
 THIRD_PARTY_NOTICES = "THIRD_PARTY_NOTICES.txt"
 PACKAGES_DIRNAME = "packages"
+#: 随包**模型**的许可目录（与 Python 包的 packages/ 分开：许可关系不同 ——
+#  模型的许可来自 base model，转换仓库常不声明，必须分开如实记录）
+MODELS_DIRNAME = "models"
 
 #: 源码侧许可原文库（KB 级纯文本，可进 Git）；构建时只读本地
 VENDOR_SUBDIR = ("vendor", "licenses")
@@ -305,6 +308,7 @@ def collect(runtime_dir: Path, lock_path: Path, root: Path,
 
     packages: list[dict] = []
     vendor_problems: list[str] = []
+    model_problems: list[str] = []
 
     if site_packages.is_dir():
         for info_dir in sorted(site_packages.glob("*.dist-info")):
@@ -330,8 +334,11 @@ def collect(runtime_dir: Path, lock_path: Path, root: Path,
             "review_status": STATUS_OK,
         })
 
+    # 随包模型的许可（与 Python 包分开记录；同样只做本地拷贝）
+    models = _collect_model_licenses(lic_root, root, model_problems)
+
     complete = (bool(packages) and site_packages.is_dir()
-                and not vendor_problems)
+                and not vendor_problems and not model_problems)
 
     present = {norm_name(p["package"]) for p in packages}
     locked_missing = sorted(n for n in locked if n not in present)
@@ -370,8 +377,11 @@ def collect(runtime_dir: Path, lock_path: Path, root: Path,
             "locked_missing": locked_missing,
             "version_mismatch": version_mismatch,
             "vendor_problems": vendor_problems,
+            "models": len(models),
+            "model_problems": model_problems,
         },
         "packages": packages,
+        "models": models,
     }
 
     (lic_root / THIRD_PARTY_JSON).write_text(
@@ -460,6 +470,71 @@ def _one_package(info_dir: Path, pkg_root: Path, locked: dict[str, str], root: P
     return entry
 
 
+def _collect_model_licenses(lic_root: Path, root: Path,
+                            problems: list[str]) -> list[dict]:
+    """拷贝随包模型的许可原文 → ``LICENSES/models/<model>/``。
+
+    与 Python 包分开处理的原因：模型许可的**来源关系**更复杂 ——
+    许可来自 base model（BAAI，MIT），而社区转换仓库常常不声明 license。
+    因此这里逐字段如实记录（base / conversion 分列），**不把转换仓库硬标成 MIT**。
+
+    ⚠ 同样只用本地 vendor/ 里的字节，构建时不联网。
+    """
+    out: list[dict] = []
+    src_root = Path(__file__).resolve().parents[1] / "vendor" / "licenses"
+    for entry in sorted(src_root.iterdir()) if src_root.is_dir() else []:
+        prov_path = entry / "PROVENANCE.json"
+        if not entry.is_dir() or not prov_path.is_file():
+            continue
+        try:
+            prov = json.loads(prov_path.read_text(encoding="utf-8"))
+        except Exception as exc:  # noqa: BLE001
+            problems.append(f"模型许可 {entry.name}: PROVENANCE.json 无法解析（{exc}）")
+            continue
+        if prov.get("kind") != "bundled_model":
+            continue          # 其它 vendor 条目是 Python 包，走 packages/ 那条路
+
+        dest = lic_root / MODELS_DIRNAME / entry.name
+        dest.mkdir(parents=True, exist_ok=True)
+        copied = []
+        for item in prov.get("files") or []:
+            name = str(item.get("name") or "")
+            src = entry / name
+            if not src.is_file():
+                problems.append(f"模型许可 {entry.name}: 缺 {name}")
+                continue
+            want = str(item.get("sha256") or "").lower()
+            actual = sha256_file(src)
+            if want and actual != want:
+                problems.append(
+                    f"模型许可 {entry.name}: {name} sha256 不符"
+                    f"（期望 {want[:16]}…，实际 {actual[:16]}…）")
+                continue
+            shutil.copy2(src, dest / name)
+            copied.append(dest / name)
+        shutil.copy2(prov_path, dest / "PROVENANCE.json")
+
+        base = prov.get("base_model") or {}
+        conv = prov.get("conversion_artifact") or {}
+        out.append({
+            "package": prov.get("package") or entry.name,
+            "version": conv.get("revision") or "",
+            "kind": "bundled_model",
+            # ⚠ 分开记录，不伪造
+            "license_basis": conv.get("license_basis"),
+            "base_model": base.get("id"),
+            "base_model_license": base.get("license"),
+            "conversion_source": conv.get("repository"),
+            "conversion_revision": conv.get("revision"),
+            "conversion_repository_license": conv.get("repository_license"),
+            "precision": conv.get("file"),
+            "license_texts": sorted({p.relative_to(root).as_posix() for p in copied}
+                                    | {f"{LICENSES_DIRNAME}/{MODELS_DIRNAME}/{entry.name}/PROVENANCE.json"}),
+            "review_status": STATUS_OK if copied else STATUS_REVIEW,
+        })
+    return out
+
+
 def _render_notices(packages: list[dict], inventory: dict) -> str:
     out = io.StringIO()
     out.write("Wiki-USB 第三方软件许可清单（THIRD-PARTY NOTICES）\n")
@@ -503,6 +578,21 @@ def _render_notices(packages: list[dict], inventory: dict) -> str:
         out.write("-" * 72 + "\n")
         out.write("⚠ vendor 许可原文库存在不一致（strict 构建会拒绝）：\n")
         for n in s["vendor_problems"]:
+            out.write(f"  - {n}\n")
+    if inventory.get("models"):
+        out.write("-" * 72 + "\n")
+        out.write("随包模型（许可来源分列记录，不伪造转换仓库许可）：\n")
+        for m in inventory["models"]:
+            out.write(f"{m['package']}\n")
+            out.write(f"  base model   : {m['base_model']}（{m['base_model_license']}）\n")
+            out.write(f"  转换来源     : {m['conversion_source']} @ {m['conversion_revision']}"
+                      f"（仓库许可：{m['conversion_repository_license']}）\n")
+            out.write(f"  许可依据     : {m['license_basis']}\n")
+            out.write(f"  许可原文     : {', '.join(m['license_texts'])}\n\n")
+    if s["model_problems"]:
+        out.write("-" * 72 + "\n")
+        out.write("⚠ 模型许可不完整（strict 构建会拒绝）：\n")
+        for n in s["model_problems"]:
             out.write(f"  - {n}\n")
     if s["locked_missing"]:
         out.write("-" * 72 + "\n")

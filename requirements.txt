@@ -32,20 +32,17 @@ xxhash>=3.4             # exFAT 等长编辑快速哈希（缺失时自动回退
 pdfminer.six>=20231228
 pypdf>=4.0
 
+# --- 本地语义检索（V1 标准能力，非可选）---
+# A4.2a 已选定 bundled artifact：Xenova/bge-small-zh-v1.5 的 onnx/model_int8.onnx（22.8MB）。
+# 资源文件**不进 Git**：由 scripts/fetch_embedding_resource.py 按 resources/embedding/default.json
+# 里 pin 的 revision 取到 vendor/cache/，构建时再打进 payload。
+#
+# 运行时约束：**只用 Tokenizer.from_file(本地 tokenizer.json)**，
+# 严禁 from_pretrained / 访问 HuggingFace / 客户机联网。
+#
+# 不装这两项 → local_onnx 不可用（按 A4.1 契约降级为 ollama/api/FTS），**不影响启动**。
+onnxruntime>=1.17        # ONNX 推理（CPU）
+tokenizers>=0.20         # 官方 tokenizer（Rust 实现，走 tokenizer.json 本地文件）
+
 # 说明：.docx/.pptx/.xlsx/.epub/.html/.csv/.json 等格式由标准库 zipfile+xml 解析，
 #       无需任何额外依赖。扫描件 PDF / 图片 / 音视频需要 OCR/ASR 模型，本项目不含该能力。
-
-# -----------------------------------------------------------------------------
-#  可选依赖（不随默认安装）
-# -----------------------------------------------------------------------------
-# 本地 ONNX 嵌入引擎：约 +120MB，且**缺少模型文件时不提供任何能力**，
-# 却会让发布包体积翻倍。因此默认安装（含 Windows 发布版）都不包含它。
-#
-# 不装也能正常使用——嵌入源会自动降级：
-#   local_onnx → ollama → api → 纯 FTS5 词法检索
-#
-# 需要时二选一：
-#   python setup_runtime_windows.py --with-onnx     # Windows，含模型下载
-#   pip install "onnxruntime>=1.17"                 # 其它平台
-#
-# onnxruntime>=1.17

@@ -18,9 +18,12 @@ python app/launcher.py --no-browser --port 28765
 Windows 用户如果想构建带嵌入式运行时的可分发版本：
 
 ```bash
-python setup_runtime_windows.py            # 精简版（约 122MB）
-python setup_runtime_windows.py --with-onnx # 额外带本地 ONNX 嵌入引擎（+约 120MB）
+python setup_runtime_windows.py            # 标准版（含 onnxruntime / tokenizers）
+python scripts/fetch_embedding_resource.py # **另一步**：按契约取回模型字节（大文件不进 Git）
 ```
+
+> 取件与构建是两个动作：`fetch` 可联网，`build_release.py --strict` **绝不联网**（缺件即失败）。
+> 客户安装阶段 0 联网，运行时只 `Tokenizer.from_file(本地 tokenizer.json)`。
 
 ---
 
@@ -30,11 +33,13 @@ python setup_runtime_windows.py --with-onnx # 额外带本地 ONNX 嵌入引擎�
 python tests/test_suite.py
 ```
 
-CI 会在 **Linux + Windows × Python 3.11 + 3.13** 四个组合上跑同一套测试，
-并且**故意不安装 `onnxruntime`** —— 用来验证嵌入源的降级链在缺依赖时依然正确。
+CI 会在 **Linux + Windows × Python 3.11 + 3.13** 四个组合加 Windows Portable 共 5 路上
+跑同一套测试，依赖全部来自 `requirements-release.lock`（含 `onnxruntime` / `tokenizers`）。
 
-CI 会在 **Linux + Windows × Python 3.11 + 3.13** 四个组合上跑同一套测试，
-并且**故意不安装 `onnxruntime`** —— 用来验证嵌入源的降级链在缺依赖时依然正确。
+embedding 相关用例需要模型字节（大文件不进 Git）：CI 会先跑取件脚本；
+取不到时相关用例 **SKIP**（不把「本机没取件」伪装成产品缺陷）。
+「嵌入源不可用时的降级链」由 `tests/test_embedding_a42b.py` 的 D / E 用例直接模拟验证，
+不依赖真的缺依赖。
 
 > ⚠️ **已知问题**：Windows job 在 GitHub runner 上存在尚未定位的失败
 > （本地 Windows 双环境 189/189 通过，Linux runner 亦全绿），
@@ -85,8 +90,10 @@ CI 会在 **Linux + Windows × Python 3.11 + 3.13** 四个组合上跑同一套�
 
 - 新增依赖前请先问：**它能不能用标准库替代？** 运行时体积是这个项目的核心指标之一。
 - `docs/设计与实现.md` 记录了各项依赖的体积代价。
-- 不可选的重型依赖（如 `onnxruntime`，+120MB）应保持**可选**，并在
-  `requirements.txt` 中以注释形式标出。
+- `onnxruntime` / `tokenizers` 现已转为**标准运行依赖**（本地语义检索是 V1 标准能力），
+  写在 `requirements.txt` 里并由 lock 精确锁定；新增依赖前仍请先算体积代价。
+- **模型字节不进 Git**：只在 `resources/embedding/default.json` 里 pin
+  `revision / sha256 / size`，由 `scripts/fetch_embedding_resource.py` 取回并逐文件校验。
 - 注意判据是「**要不要模型**」而不是「支持格式多不多」：`.docx` / `.pptx` / `.xlsx` / `.epub`
   都能用标准库 `zipfile` + `xml.etree` 解析，零依赖。
 

@@ -330,18 +330,26 @@ class Database:
         except (ValueError, TypeError):
             return None
 
-    def set_signature(self, source: str, model: str, dim: int) -> None:
-        self.set_meta(
-            META_EMBED_SIGNATURE,
-            json.dumps({"source": source, "model": model, "dim": int(dim)}),
-        )
+    def set_signature(self, source: str, model: str, dim: int,
+                      extra: dict | None = None) -> None:
+        payload = {"source": source, "model": model, "dim": int(dim)}
+        for k, v in (extra or {}).items():
+            if v:
+                payload[str(k)] = str(v)
+        self.set_meta(META_EMBED_SIGNATURE, json.dumps(payload))
 
-    def check_signature(self, source: str, model: str, dim: int) -> str | None:
-        """比对配置签名与库内签名，返回告警文案（None 表示一致/首次写入）。"""
+    def check_signature(self, source: str, model: str, dim: int,
+                        extra: dict | None = None) -> str | None:
+        """比对本次嵌入签名与库内签名，返回告警文案（None 表示一致/首次写入）。
+
+        *extra* 是**字节级**字段（bundled local_onnx 传 artifact / tokenizer 的
+        SHA256 与精度）。只有「模型名 + 维度」时，同一个名字换了字节的 artifact
+        会被误判为「没变」，旧向量就会静默失真。
+        """
         current = self.get_signature()
-        want = {"source": source, "model": model, "dim": int(dim)}
+        extra = {str(k): str(v) for k, v in (extra or {}).items() if v}
         if current is None:
-            self.set_signature(source, model, dim)
+            self.set_signature(source, model, dim, extra)
             return None
         if current.get("dim") != int(dim):
             return (
@@ -353,6 +361,18 @@ class Database:
                 f"嵌入模型已更换（{current.get('model')} → {model}），"
                 "向量相似度可能失真"
             )
+        changed = sorted(k for k, v in extra.items()
+                         if current.get(k) and current.get(k) != v)
+        if changed:
+            return (
+                "随包嵌入资源已更换（" + "、".join(changed) + " 与库内记录不一致），"
+                "向量相似度可能失真"
+            )
+        # A4.2b 之前写入的旧签名没有字节级字段 → 补齐，不当作 mismatch
+        if any(k not in current for k in extra):
+            merged = dict(current)
+            merged.update({k: v for k, v in extra.items() if k not in current})
+            self.set_meta(META_EMBED_SIGNATURE, json.dumps(merged))
         return None
 
     # ---------------- 事务辅助 ----------------

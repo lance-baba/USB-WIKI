@@ -1,10 +1,13 @@
 """向量嵌入源解析（PRD 3.2 / 4.4）。
 
 三个正式来源 + 一个兜底：
-* ``local_onnx`` —— 内置微型 bge-small-zh（onnxruntime CPU）
+* ``local_onnx`` —— **随包** ONNX 嵌入（bge-small-zh-v1.5 INT8，onnxruntime CPU）。
+  资源由 ``resources/embedding/artifact.json`` 描述（见 :class:`EmbeddingResource`），
+  Core 不认识发布文件名，只认识 id / 路径 / 维度 / 精度 / hash。
 * ``ollama``     —— 通过本地 Ollama 守护进程计算
 * ``api``        —— 通过 OpenAI 兼容接口 ``/embeddings`` 计算
-* ``local_hash`` —— 纯 Python 哈希向量兜底（零依赖，永不失败，召回质量有限）
+* ``local_hash`` —— 纯 Python 哈希向量兜底；**只在显式配置时启用**，绝不自动进入
+  （自动进入会覆写主源签名 →「降级 → 重建」破坏性循环）
 
 **AVX2 指令集防护**（PRD 编码阶段提示 #3）：
 ``import onnxruntime`` 在老 CPU 上会触发 SIGILL 直接杀进程，而 SIGILL 在 Python 层
@@ -17,6 +20,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import platform
 import re
@@ -24,6 +28,7 @@ import subprocess
 import sys
 import threading
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from . import net_util, paths
 from .log_util import get_logger
@@ -112,13 +117,22 @@ def _read_probe_cache():
         return None
     if data.get("python") != f"{sys.version_info.major}.{sys.version_info.minor}":
         return None
-    return (bool(data.get("ok")), str(data.get("detail") or ""))
+    # ⚠ **负结果不参与磁盘缓存**：onnxruntime 现在是本机标准运行依赖，
+    #   用户「先跑起来、后来才把引擎装上」是正常路径。若把 7 天前的
+    #   「不可用」当真，装好之后仍会被静默禁用整整一周（且没有任何提示）。
+    #   正结果照旧缓存（省掉每次冷启动的子进程开销）。
+    if not data.get("ok"):
+        return None
+    return (True, str(data.get("detail") or ""))
 
 
 def _write_probe_cache(result: tuple[bool, str]) -> None:
     import json
     import time as _t
 
+    if not result[0]:
+        # 负结果不落盘（见 _read_probe_cache 的说明）：让「装上引擎」立刻生效。
+        return
     try:
         paths.RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
         _probe_cache_path().write_text(
@@ -206,6 +220,14 @@ class BaseEmbedder:
     @property
     def signature(self) -> str:
         return f"{self.source}:{self.model}:{self.dim}"
+
+    def signature_extra(self) -> dict:
+        """签名守卫的**额外字节级**字段（默认空）。
+
+        bundled local_onnx 用它带上 artifact / tokenizer 的 SHA256 与精度 ——
+        只记「模型名 + 维度」无法区分「同一个名字但字节换了」的 artifact（§12）。
+        """
+        return {}
 
     def embed(self, texts: list[str]) -> list[list[float]]:  # pragma: no cover
         raise NotImplementedError
@@ -345,17 +367,211 @@ class ApiEmbedder(BaseEmbedder):
             return None
 
 
+# --------------------------------------------------------------------------
+# 随包嵌入资源（resources/embedding/artifact.json）
+# --------------------------------------------------------------------------
+#: 资源不可用的稳定判定码（供 diagnostics / 降级说明 / 测试使用）
+RES_OK = "ok"
+RES_MISSING_MANIFEST = "missing_manifest"       # 没有 artifact.json → 未随包
+RES_INVALID_MANIFEST = "invalid_manifest"       # 清单存在但不可解析 / 字段不合法
+RES_MISSING_MODEL = "missing_model"             # 清单在，模型文件不在
+RES_SIZE_MISMATCH = "size_mismatch"             # 模型文件大小与清单不符（廉价完整性检查）
+RES_MISSING_TOKENIZER = "missing_tokenizer"     # tokenizer.json 不在
+
+_REQUIRED_KEYS = ("id", "artifact_source", "artifact_revision", "artifact_sha256",
+                  "artifact_size", "precision", "dimension")
+
+
+@dataclass
+class EmbeddingResource:
+    """随包嵌入资源的**解析结果** —— Core 唯一认识的形态。
+
+    Core 不认识「发布文件名」，只认识这份清单描述的：id / 路径 / 维度 / 精度 / hash。
+    换 artifact = 换资源目录里的字节与清单，**不需要改代码**。
+    """
+
+    root: Path
+    id: str
+    base_model: str
+    base_model_revision: str
+    artifact_source: str
+    artifact_revision: str
+    artifact_file: str
+    artifact_sha256: str
+    artifact_size: int
+    precision: str
+    dimension: int
+    pooling: str
+    normalize: bool
+    max_length: int
+    tokenizer_files: dict
+    license: dict
+    model_filename: str
+    tokenizer_filename: str
+
+    @property
+    def model_path(self) -> Path:
+        return self.root / self.model_filename
+
+    @property
+    def tokenizer_json(self) -> Path:
+        return self.root / self.tokenizer_filename
+
+    @property
+    def declared_files(self) -> list[Path]:
+        return [self.model_path, self.tokenizer_json]
+
+    @property
+    def tokenizer_sha256(self) -> str:
+        rec = (self.tokenizer_files or {}).get(self.tokenizer_filename) or {}
+        return str(rec.get("sha256") or "")
+
+    def signature_extra(self) -> dict:
+        """写进库内签名守卫的**字节级**字段（§12）。
+
+        同 artifact 重装 → 不变；artifact 或 tokenizer 字节变化 → 必变。
+        """
+        return {
+            "artifact_sha256": self.artifact_sha256,
+            "tokenizer_sha256": self.tokenizer_sha256,
+            "precision": self.precision,
+        }
+
+    def build_info(self) -> dict:
+        """BUILD_INFO.embedding 块（不含绝对路径）。"""
+        return {
+            "id": self.id,
+            "base_model": self.base_model,
+            "artifact_source": self.artifact_source,
+            "artifact_revision": self.artifact_revision,
+            "precision": self.precision,
+            "dimension": self.dimension,
+            "artifact_sha256": self.artifact_sha256,
+            "tokenizer_sha256": self.tokenizer_sha256,
+        }
+
+
+def load_embedding_resource(root: Path | None = None
+                            ) -> tuple[EmbeddingResource | None, str, str]:
+    """解析随包嵌入资源 → (resource | None, code, reason)。
+
+    ⚠ 只做**廉价**检查（存在性 + 大小）。**不在这里重算 23MB 的 SHA256**：
+    介质完整性由 Release 的 hash Gate + 安装前校验负责，启动时无条件重算会拖慢首屏。
+    需要全量校验时用 :func:`verify_resource_files(deep=True)`（diagnostics / repair）。
+    """
+    root = Path(root) if root is not None else paths.EMBEDDING_DIR
+    manifest = root / paths.EMBEDDING_ARTIFACT_NAME
+    if not manifest.is_file():
+        return None, RES_MISSING_MANIFEST, f"未找到随包嵌入资源清单（{paths.EMBEDDING_ARTIFACT_NAME}）"
+    try:
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        return None, RES_INVALID_MANIFEST, f"资源清单无法解析：{exc}"
+    if not isinstance(data, dict) or data.get("format_version") != 1:
+        return None, RES_INVALID_MANIFEST, "资源清单 format_version 不受支持"
+    missing = [k for k in _REQUIRED_KEYS if not data.get(k)]
+    if missing:
+        return None, RES_INVALID_MANIFEST, f"资源清单缺字段：{', '.join(missing)}"
+
+    local = data.get("local_files") or {}
+    model_filename = Path(str(local.get("model") or "model.onnx")).name
+    tok_filename = Path(str(local.get("tokenizer") or "tokenizer.json")).name
+
+    res = EmbeddingResource(
+        root=root, id=str(data["id"]),
+        base_model=str(data.get("base_model") or ""),
+        base_model_revision=str(data.get("base_model_revision") or ""),
+        artifact_source=str(data["artifact_source"]),
+        artifact_revision=str(data["artifact_revision"]),
+        artifact_file=str(data.get("artifact_file") or ""),
+        artifact_sha256=str(data["artifact_sha256"]).lower(),
+        artifact_size=int(data["artifact_size"]),
+        precision=str(data["precision"]).lower(),
+        dimension=int(data["dimension"]),
+        pooling=str(data.get("pooling") or "cls").lower(),
+        normalize=bool(data.get("normalize", True)),
+        max_length=int(data.get("max_length") or 512),
+        tokenizer_files=dict(data.get("tokenizer_files") or {}),
+        license=dict(data.get("license") or {}),
+        model_filename=model_filename, tokenizer_filename=tok_filename,
+    )
+    if not res.model_path.is_file():
+        return None, RES_MISSING_MODEL, f"缺少模型文件 {model_filename}"
+    if res.model_path.stat().st_size != res.artifact_size:
+        return None, RES_SIZE_MISMATCH, (
+            f"模型文件大小与清单不符（期望 {res.artifact_size}，"
+            f"实际 {res.model_path.stat().st_size}）")
+    if not res.tokenizer_json.is_file():
+        return None, RES_MISSING_TOKENIZER, f"缺少 tokenizer 文件 {tok_filename}"
+    return res, RES_OK, ""
+
+
+def verify_resource_files(resource: EmbeddingResource, *, deep: bool = True) -> list[str]:
+    """校验资源目录里的字节（**只读**）。deep=True 时逐文件重算 SHA256。
+
+    刻意与启动路径分离：启动用 load_embedding_resource 的廉价检查，
+    全量校验交给 diagnostics / repair（§16）。
+    """
+    problems: list[str] = []
+    targets: list[tuple[Path, str]] = [(resource.model_path, resource.artifact_sha256)]
+    for name, rec in (resource.tokenizer_files or {}).items():
+        targets.append((resource.root / Path(name).name, str(rec.get("sha256") or "")))
+    for path, want in targets:
+        if not path.is_file():
+            problems.append(f"{path.name}：缺失")
+            continue
+        if deep and want:
+            actual = _sha256_file(path)
+            if actual != want:
+                problems.append(f"{path.name}：SHA256 不符（期望 {want[:16]}…，"
+                                f"实际 {actual[:16]}…）")
+    return problems
+
+
+def _sha256_file(path: Path, chunk: int = 1 << 20) -> str:
+    h = hashlib.sha256()
+    with Path(path).open("rb") as fh:
+        while True:
+            b = fh.read(chunk)
+            if not b:
+                break
+            h.update(b)
+    return h.hexdigest()
+
+
 class OnnxEmbedder(BaseEmbedder):
-    """本地 ONNX 微型嵌入（bge-small-zh-q4）。仅在探针通过且模型存在时启用。"""
+    """随包本地 ONNX 嵌入（bge-small-zh-v1.5 INT8）。
+
+    运行协议（与 A4.2a 选型时**完全一致**，不得逐处私改）：
+
+        tokenizers.Tokenizer.from_file(本地 tokenizer.json)   ← 只读本地文件
+            ↓ encode_batch（截断 max_length + padding）
+        onnxruntime（CPUExecutionProvider）
+            ↓ last_hidden_state
+        CLS（token 位置 0）
+            ↓ L2 归一化
+        artifact 声明的维度
+
+    ⚠ **没有字符级近似兜底。** 官方 tokenizer 加载失败即视为 `local_onnx`
+    不可用并按 A4.1 契约降级 —— 偷偷切到字符级编码会产出一个「看起来能用」
+    但语义错误的向量空间（旧实现正是如此，且当时用的是 mean pooling）。
+    """
 
     source = "local_onnx"
 
-    def __init__(self, model_path, dim: int = 512, model_name: str = "bge-small-zh-q4") -> None:
-        super().__init__(dim)
-        self.model_path = str(model_path)
-        self.model = model_name
+    def __init__(self, resource: EmbeddingResource) -> None:
+        super().__init__(resource.dimension)
+        self.resource = resource
+        self.model = resource.id
+        self.precision = resource.precision
         self._session = None
-        self._tokenizer = None
+        self._tok = None
+        self._np = None
+        self.io_names: dict = {}
+
+    # ------------------------------------------------------------------
+    def signature_extra(self) -> dict:
+        return self.resource.signature_extra()
 
     def _lazy(self) -> None:
         if self._session is not None:
@@ -365,58 +581,79 @@ class OnnxEmbedder(BaseEmbedder):
             import onnxruntime as ort  # type: ignore
         except BaseException as exc:  # noqa: BLE001 - 指令集非法必须在此兜住
             raise RuntimeError(f"onnxruntime 加载失败: {type(exc).__name__}: {exc}") from exc
+        try:
+            from tokenizers import Tokenizer  # type: ignore
+        except BaseException as exc:  # noqa: BLE001
+            raise RuntimeError(f"tokenizers 加载失败: {type(exc).__name__}: {exc}") from exc
+
+        # ⚠ 只允许本地文件。绝不允许 from_pretrained / 访问 HuggingFace /
+        #   调用 huggingface_hub —— 客户机必须零联网。
+        tok = Tokenizer.from_file(str(self.resource.tokenizer_json))
+        pad_id = tok.token_to_id("[PAD]")
+        tok.enable_truncation(max_length=self.resource.max_length)
+        tok.enable_padding(pad_id=pad_id if pad_id is not None else 0,
+                           pad_token="[PAD]")
 
         so = ort.SessionOptions()
         so.intra_op_num_threads = 2
         so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        self._session = ort.InferenceSession(
-            self.model_path, sess_options=so, providers=["CPUExecutionProvider"]
-        )
-        self._np = np
+        sess = ort.InferenceSession(str(self.resource.model_path), sess_options=so,
+                                    providers=["CPUExecutionProvider"])
+
+        outs = sess.get_outputs()
+        self.io_names = {
+            "inputs": [i.name for i in sess.get_inputs()],
+            "outputs": [o.name for o in outs],
+        }
+        self._np, self._tok, self._session = np, tok, sess
+
+    def probe(self) -> tuple[bool, str]:
+        """真正把 session + tokenizer 加载起来验证一次（resolve 阶段用）。
+
+        失败即 `local_onnx` 不可用 —— 不返回一个「一调用就炸」的嵌入器。
+        """
+        try:
+            self._lazy()
+            vecs = self.embed(["探针"])
+            if not vecs or not vecs[0]:
+                return False, "嵌入探针返回空向量"
+            self.dim = len(vecs[0])
+            return True, "OK"
+        except BaseException as exc:  # noqa: BLE001 - 含 SIGILL 之外的加载期异常
+            return False, f"{type(exc).__name__}: {exc}"
 
     def embed(self, texts: list[str]) -> list[list[float]]:
-        """无外置 tokenizer 时退回字符级哈希词表编码，保证接口可用。
-
-        生产发行版会在 runtime/models/ 一并放置 tokenizer.json，届时替换为
-        真实 WordPiece 编码即可，调用方无需改动。
-        """
         self._lazy()
         np = self._np
-        rows = []
-        for t in texts:
-            ids, mask = self._encode(t)
-            rows.append((ids, mask))
-        max_len = max(len(r[0]) for r in rows) if rows else 1
-        input_ids = np.zeros((len(rows), max_len), dtype=np.int64)
-        attn = np.zeros((len(rows), max_len), dtype=np.int64)
-        for i, (ids, mask) in enumerate(rows):
-            input_ids[i, :len(ids)] = ids
-            attn[i, :len(mask)] = mask
-        feed = {}
-        names = {i.name for i in self._session.get_inputs()}
+        encs = self._tok.encode_batch(list(texts))
+        ids = np.array([e.ids for e in encs], dtype=np.int64)
+        mask = np.array([e.attention_mask for e in encs], dtype=np.int64)
+        feed: dict = {}
+        names = set(self.io_names["inputs"])
         if "input_ids" in names:
-            feed["input_ids"] = input_ids
+            feed["input_ids"] = ids
         if "attention_mask" in names:
-            feed["attention_mask"] = attn
+            feed["attention_mask"] = mask
         if "token_type_ids" in names:
-            feed["token_type_ids"] = np.zeros_like(input_ids)
-        outputs = self._session.run(None, feed)
-        last = outputs[0]
-        # mean pooling
-        m = attn[:, :, None].astype("float32")
-        summed = (last * m).sum(axis=1)
-        counts = np.clip(m.sum(axis=1), 1e-9, None)
-        pooled = summed / counts
-        norms = np.linalg.norm(pooled, axis=1, keepdims=True)
-        pooled = pooled / np.clip(norms, 1e-9, None)
-        self.dim = pooled.shape[1]
-        return pooled.astype("float32").tolist()
+            feed["token_type_ids"] = np.zeros_like(ids)
 
-    def _encode(self, text: str, max_len: int = 256) -> tuple[list[int], list[int]]:
-        """字符级 ID 派生（无 tokenizer 时的确定性近似编码）。"""
-        t = (text or "")[:max_len]
-        ids = [101] + [1 + (ord(ch) % 30000) for ch in t] + [102]
-        return ids, [1] * len(ids)
+        outputs = self._session.run(None, feed)
+        last_hidden = None
+        for name, arr in zip(self.io_names["outputs"], outputs):
+            if "last_hidden_state" in name.lower():
+                last_hidden = arr
+                break
+        if last_hidden is None:
+            cand = [a for a in outputs if getattr(a, "ndim", 0) == 3]
+            if not cand:
+                raise RuntimeError("ONNX 输出里没有可取 CLS 的 3D 张量")
+            last_hidden = cand[0]
+        pooled = last_hidden[:, 0, :]                     # CLS，协议规定
+        if self.resource.normalize:
+            norms = np.linalg.norm(pooled, axis=1, keepdims=True)
+            pooled = pooled / np.clip(norms, 1e-9, None)
+        self.dim = int(pooled.shape[1])
+        return pooled.astype("float32").tolist()
 
 
 # --------------------------------------------------------------------------
@@ -433,6 +670,10 @@ class EmbedderResolution:
     source: str
     warnings: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    #: 随包资源（仅 local_onnx 时有值）—— 供 signature / BUILD_INFO / diagnostics 复用
+    resource: "EmbeddingResource | None" = None
+    #: 为什么没用到**配置指定的那个**来源（diagnostics 的 fallback_reason）
+    fallback_reason: str = ""
 
 
 def _humanize_onnx_failure(why: str) -> str:
@@ -482,24 +723,40 @@ def resolve(cfg_get, ollama_healthy=None) -> EmbedderResolution:
     ollama_host = str(cfg_get("AI", "ollama_host", "http://127.0.0.1:11434"))
     warnings: list[str] = []      # 需用户行动
     notes: list[str] = []         # 系统已自愈的过程信息，不打扰用户
+    fallback_reason = ""          # 没用到「配置指定的来源」时，这里给出人话原因
 
     if requested in ("none", "offline", "disabled", "false", "0"):
         return EmbedderResolution(None, "none", notes=["已按配置关闭向量嵌入，仅使用 FTS5 词法检索"])
 
-    # 1) local_onnx
+    # 1) local_onnx —— 随包资源（resources/embedding/artifact.json）
+    #    ⚠ 这里的每一项失败都必须**如实说明原因**并继续降级。绝不切换到
+    #      字符级近似编码：那会产出一个「看起来能用」但语义错误的向量空间。
     if requested == "local_onnx":
-        ok, why = probe_onnxruntime()
-        if ok and paths.ONNX_MODEL_FILE.exists():
-            return EmbedderResolution(
-                OnnxEmbedder(paths.ONNX_MODEL_FILE, dim, model_name), "local_onnx", notes=notes
-            )
-        if not ok:
-            notes.append(f"本地 ONNX 嵌入引擎不可用（{_humanize_onnx_failure(why)}），已按降级链继续")
+        resource, code, why = load_embedding_resource()
+        if resource is None:
+            # 清单缺失 / 不可解析 / 模型缺失 / 尺寸不符 / tokenizer 缺失
+            fallback_reason = f"随包嵌入资源不可用（{code}：{why}）"
+            notes.append(fallback_reason + "，已按降级链继续")
         else:
-            notes.append(
-                f"未找到本地模型文件 {paths.ONNX_MODEL_FILE.name}，已按降级链继续"
-                "（可用 setup_runtime_windows.py --with-onnx 下载）"
-            )
+            probe_ok, probe_why = probe_onnxruntime()
+            if not probe_ok:
+                fallback_reason = (
+                    f"本地 ONNX 嵌入引擎不可用（{_humanize_onnx_failure(probe_why)}）")
+                notes.append(fallback_reason + "，已按降级链继续")
+            else:
+                emb = OnnxEmbedder(resource)
+                loaded, load_why = emb.probe()
+                if loaded:
+                    notes.append(
+                        f"随包嵌入资源已启用：{resource.id}"
+                        f"（{resource.precision}，{resource.dimension} 维，"
+                        f"artifact {resource.artifact_sha256[:12]}…）"
+                    )
+                    return EmbedderResolution(emb, "local_onnx", warnings, notes,
+                                              resource=resource)
+                # 资源在、依赖在，但加载失败（tokenizer 损坏 / 模型不可读 / CPU 不兼容）
+                fallback_reason = f"随包嵌入资源加载失败（{load_why}）"
+                notes.append(fallback_reason + "，已按降级链继续")
         requested = "auto"
 
     # 2) ollama
@@ -537,7 +794,8 @@ def resolve(cfg_get, ollama_healthy=None) -> EmbedderResolution:
                         f"向量维度已跟随模型自动适配：{dim} → {real}（{model_name}）"
                     )
                 emb.dim = real
-            return EmbedderResolution(emb, "ollama", warnings, notes)
+            return EmbedderResolution(emb, "ollama", warnings, notes,
+                                      fallback_reason=fallback_reason)
         notes.append("Ollama 未在线，已跳过")
         if requested == "ollama":
             warnings.append("你指定使用 Ollama 嵌入源，但它当前不可用，已降级到其它来源")
@@ -550,20 +808,23 @@ def resolve(cfg_get, ollama_healthy=None) -> EmbedderResolution:
             if real != dim:
                 notes.append(f"向量维度已跟随模型自动适配：{dim} → {real}（{model_name}）")
             emb.dim = real
-        return EmbedderResolution(emb, "api", warnings, notes)
+        return EmbedderResolution(emb, "api", warnings, notes,
+                                  fallback_reason=fallback_reason)
     if requested == "api" and not api_key:
         warnings.append("你指定使用云端 API 嵌入源，但未填写 api_key")
     if requested == "auto" and not api_key:
         notes.append("未配置 api_key，已跳过云端 API 嵌入源")
 
-    # 4) 纯 Python 兜底
+    # 4) 纯 Python 兜底 —— **只在用户显式配置 `embedding_source = local_hash` 时启用**。
+    #    绝不自动进入：哈希向量会覆写主源签名，形成「降级 → 重建」的破坏性循环。
     if requested == "local_hash":
         return EmbedderResolution(HashEmbedder(dim), "local_hash", warnings, notes)
 
     warnings.append(
         "向量嵌入源全部不可用，已退化为纯 FTS5 词法检索（已有向量索引保留，恢复嵌入源后自动恢复）"
     )
-    return EmbedderResolution(None, "none", warnings, notes)
+    return EmbedderResolution(None, "none", warnings, notes,
+                              fallback_reason=fallback_reason)
 
 
 def cosine(a: list[float], b: list[float]) -> float:

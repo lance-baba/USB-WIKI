@@ -56,8 +56,33 @@ SHM_FILE: Path = DATA_DIR / "cache.db-shm"
 CHROME_PROFILE_DIR: Path = DATA_DIR / "temp_chrome_profile"
 
 RUNTIME_DIR: Path = BASE_DIR / "runtime"
-EMBED_MODELS_DIR: Path = RUNTIME_DIR / "models"
-ONNX_MODEL_FILE: Path = EMBED_MODELS_DIR / "bge-small-zh-q4.onnx"
+
+# --- 随包本地嵌入资源（属于 App，**不属于 Library**）---
+# 可随程序重装 / 覆盖 / rollback / 从 U 盘恢复；Library 不受影响。
+#
+# ⚠ **不写死任何模型文件名**。资源由 `resources/embedding/artifact.json` 描述，
+#   Core 只认识「id / artifact 路径 / tokenizer 路径 / 维度 / 精度 / hash」——
+#   换 artifact 只需换资源目录里的字节与清单，不需要改代码
+#   （此前 `ONNX_MODEL_FILE = .../bge-small-zh-q4.onnx` 把发布文件名焊死在 Core 里）。
+EMBEDDING_ARTIFACT_NAME = "artifact.json"
+
+
+def _detect_embedding_dir(base: Path) -> Path:
+    """嵌入资源目录的解析。
+
+    默认 ``<App>/resources/embedding``（安装态由安装器铺好）。
+    ``WIKIUSB_EMBEDDING_DIR`` 可覆盖：开发机指向 ``vendor/cache/embedding``，
+    测试指向临时资源目录。**该目录缺失是正常状态**（未随包 / 未取件），
+    由 embedder 报告 `local_onnx unavailable` 并按契约降级，不在这里偷偷创建。
+    """
+    env = (os.environ.get("WIKIUSB_EMBEDDING_DIR") or "").strip()
+    if env:
+        return Path(env).expanduser().resolve()
+    return (base / "resources" / "embedding").resolve()
+
+
+EMBEDDING_DIR: Path = _detect_embedding_dir(BASE_DIR)
+EMBEDDING_ARTIFACT_JSON: Path = EMBEDDING_DIR / EMBEDDING_ARTIFACT_NAME
 
 CONFIG_FILE: Path = BASE_DIR / "config.ini"
 LOG_FILE: Path = DATA_DIR / "wiki-usb.log"
@@ -67,8 +92,12 @@ NOTES_REL_PREFIX = "notes"
 
 
 def ensure_dirs() -> None:
-    """确保运行期必需的目录存在（含曾被清理过的 data 树）。"""
-    for d in (DATA_DIR, NOTES_DIR, SNAPSHOT_DIR, ORIGINALS_DIR, ASSETS_DIR, RUNTIME_DIR, EMBED_MODELS_DIR):
+    """确保运行期必需的目录存在（含曾被清理过的 data 树）。
+
+    刻意**不**创建 ``EMBEDDING_DIR``：嵌入资源是否存在是事实信息，
+    空目录会让「未随包」与「随包但文件缺失」看起来一样。
+    """
+    for d in (DATA_DIR, NOTES_DIR, SNAPSHOT_DIR, ORIGINALS_DIR, ASSETS_DIR, RUNTIME_DIR):
         d.mkdir(parents=True, exist_ok=True)
 
 

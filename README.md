@@ -29,11 +29,13 @@
 ```
 浏览器会自动打开 `http://127.0.0.1:28765`。关闭控制台窗口或点击界面右上角「安全退出」即可安全拔盘。
 
-> **发布包体积**：核心运行时 **122MB**（自包含 Python 解释器与全部依赖）。
+> **发布包体积**：核心运行时含自包含 Python 解释器与全部依赖。
 > 最重的一项 `babel`（32MB）来自 `trafilatura` 依赖链上游的 `courlan` ——
 > 它在 import 期就硬引用 `babel.Locale`，实测移除即崩，无法裁剪。
-> 可选能力 `onnxruntime`（+约 120MB）已改为按需安装：`python setup_runtime_windows.py --with-onnx`。
-> 未启用时嵌入源按 `local_onnx → ollama → api → local_hash` 逐级降级。
+> 本地语义检索（`onnxruntime` + `tokenizers`）已是**标准能力**，随包分发；
+> 嵌入模型 `bge-small-zh-v1.5` INT8 约 **23.3MB**（选型依据见
+> `docs/EMBEDDING_ARTIFACT_SELECTION.md`）。
+> 缺任何一种嵌入能力时，按 `local_onnx → ollama → api → 纯 FTS5` 逐级降级，不影响启动。
 
 > **已实测**：`runtime/python-3.11-embed/python.exe tests/test_suite.py`
 > 会输出一行机器可读的结果（`TOTAL=… PASS=… SKIP=… FAIL=…`）。
@@ -122,11 +124,12 @@ Wiki-USB/
 ├── config.ini                  # 主配置（明文；首次运行自动生成）
 ├── requirements.txt
 ├── runtime/                    # [仅 Windows 发布版] 嵌入式 Python 3.11 + 预编译依赖
-│   ├── python-3.11-embed/
-│   │   ├── python.exe
-│   │   ├── python311._pth      # 关键补丁：解除 import site 屏蔽 + 相对依赖目录
-│   │   └── Lib/site-packages/  # sqlite_vec / onnxruntime / trafilatura / lxml / pyyaml
-│   └── models/                 # 本地 ONNX 嵌入模型（可选）
+│   └── python-3.11-embed/
+│       ├── python.exe
+│       ├── python311._pth      # 关键补丁：解除 import site 屏蔽 + 相对依赖目录
+│       └── Lib/site-packages/  # sqlite_vec / onnxruntime / tokenizers / trafilatura / lxml / pyyaml
+├── resources/embedding/        # 随包嵌入资源契约 default.json（**字节不进 Git**）
+└── vendor/cache/embedding/     # maintainer 取件后的模型字节（gitignored，构建时只本地拷贝）
 ├── app/
 │   ├── launcher.py             # 自愈启动器：端口避让 / WAL 自愈 / 优雅退出钩子
 │   ├── server.py               # 标准库 HTTP 服务与路由分发（含 SSE 传输层）
@@ -201,6 +204,7 @@ embedding_dim = 512
 | :--- | :--- | :--- |
 | **Level 1 基础知识库** | 启动 / 导入 / 查看 / FTS 检索 / 返回引用 | **无任何 AI 依赖** |
 | **Level 2 本地语义检索** | 向量召回（`local_onnx` → `ollama` → `api` 逐级降级） | 嵌入源可用；不可用则退化为纯 FTS5 |
+| | `local_onnx` 用随包 **bge-small-zh-v1.5 INT8**（约 23.3MB，标准能力、开箱可用、不联网） | `onnxruntime` + `tokenizers` + `resources/embedding/` |
 | **Level 3 生成式对话** | 自然语言总结回答 | **你选择的**本地 Ollama 模型，或已配置的云端 API |
 
 **对话模型没有默认值。** 程序不会替你预设、也不会自动挑第一个本机模型 ——

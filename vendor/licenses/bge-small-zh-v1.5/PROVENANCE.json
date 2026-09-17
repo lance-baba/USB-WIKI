@@ -1,0 +1,38 @@
+{
+  "format_version": 1,
+  "package": "bge-small-zh-v1.5",
+  "kind": "bundled_model",
+  "base_model": {
+    "id": "BAAI/bge-small-zh-v1.5",
+    "revision": "7999e1d3359715c523056ef9478215996d62a620",
+    "license": "MIT",
+    "license_source": {
+      "project": "https://github.com/FlagOpen/FlagEmbedding",
+      "ref": "master",
+      "commit": "fd1a2bdf69488ffebe0327999d4400d8c8058a0b",
+      "file": "LICENSE",
+      "url": "https://raw.githubusercontent.com/FlagOpen/FlagEmbedding/fd1a2bdf69488ffebe0327999d4400d8c8058a0b/LICENSE",
+      "sha256": "587a673933425dbc36ec61268d3b954051b2d3ef3c9b322ede357976055ffdd5",
+      "size": 1065
+    },
+    "note": "HF 模型仓库只有 license: mit 声明，没有 LICENSE 文件；故取上游项目 FlagEmbedding 的 MIT 原文（pin commit）。"
+  },
+  "conversion_artifact": {
+    "repository": "Xenova/bge-small-zh-v1.5",
+    "revision": "75c43b069aac4d136ba6bc1122f995fedcfd2781",
+    "file": "onnx/model_int8.onnx",
+    "sha256": "b9837c19ce154ff0726d398ee77abbc03a7faf0476c6f93016c84e531be7ebb5",
+    "size": 23903394,
+    "repository_license": "unspecified",
+    "license_basis": "derived_from_base_model",
+    "note": "该转换仓库自身未声明 license。此处**不**把它硬标为 MIT —— 只如实记录「它是上述 MIT base model 的 ONNX INT8 转换产物」。"
+  },
+  "files": [
+    {
+      "name": "LICENSE",
+      "source_url": "https://raw.githubusercontent.com/FlagOpen/FlagEmbedding/fd1a2bdf69488ffebe0327999d4400d8c8058a0b/LICENSE",
+      "size": 1065,
+      "sha256": "587a673933425dbc36ec61268d3b954051b2d3ef3c9b322ede357976055ffdd5"
+    }
+  ]
+}
