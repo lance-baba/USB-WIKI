@@ -203,14 +203,22 @@ def build(platform: str, output: Path, strict: bool = False) -> Path:
     print(f"  payload/python-runtime/ {rt_ok}")
     print(f"  installer/              {(dist_root / 'installer' / 'install.py').is_file()}")
     print(f"  随包文档               {doc_count}")
-    print(f"  第三方组件             {licenses['summary']['packages']}"
-          f"（待复核 {licenses['summary']['review_required']}）")
-    if licenses["summary"]["locked_missing"]:
-        print(f"  ⚠ 依赖锁条目未随包     {licenses['summary']['locked_missing']}")
-    if licenses["summary"]["version_mismatch"]:
-        # 发布构建从 lock 安装，正常应零差异；有差异说明 runtime 非由当前锁构建
-        print("  ⚠ 随包版本 ≠ 依赖锁     "
-              + "；".join(licenses["summary"]["version_mismatch"]))
+    _summary = licenses["summary"]
+    print(f"  第三方组件             {_summary['packages']}"
+          f"（待复核 {_summary.get('review_required', 0)}"
+          f" / 仅元数据 {_summary.get('metadata_only', 0)}）")
+    if _summary.get("locked_missing"):
+        print(f"  ⚠ LOCK_ENTRY_MISSING     {_summary['locked_missing']}")
+    if _summary.get("version_mismatch"):
+        # 发布构建从 lock 安装，正常应零差异；有差异说明 runtime 非由当前锁构建。
+        # 非 strict 只是开发态提示；strict 下同一条件会以 RUNTIME_LOCK_MISMATCH 直接失败。
+        print("  ⚠ RUNTIME_LOCK_MISMATCH  "
+              + "；".join(_summary["version_mismatch"]))
+    if _summary.get("required_metadata_only"):
+        print("  ⚠ LICENSE_TEXT_MISSING   随包运行依赖缺许可原文："
+              + "，".join(_summary["required_metadata_only"]))
+    if _summary.get("vendor_problems"):
+        print("  ⚠ VENDOR_LICENSE_INVALID " + "；".join(_summary["vendor_problems"]))
     print(f"  介质自校验             {check.code}"
           + (f" 失败 {len(check.failures)} 项" if check.failures else ""))
     return dist_root
@@ -218,43 +226,78 @@ def build(platform: str, output: Path, strict: bool = False) -> Path:
 
 def _strict_gate(dist_root: Path, rt_ok: bool, info: dict, licenses: dict,
                  manifest: dict, check, doc_count: int) -> None:
-    """正式发布的完整门禁 —— 任何 RELEASE_REQUIRED 文件缺失即非零退出。"""
-    problems: list[str] = []
+    """正式发布的完整门禁 —— 任一条件不满足即非零退出。
 
-    if not (dist_root / "payload" / "app").is_dir():
-        problems.append("缺少 payload/app/")
-    if not rt_ok or not (dist_root / "payload" / "python-runtime" / "python.exe").is_file():
-        problems.append("缺少 payload/python-runtime/python.exe")
-    if not (dist_root / "installer" / "install.py").is_file():
-        problems.append("缺少 installer/install.py")
-    if not (dist_root / "installer" / "install.bat").is_file():
-        problems.append("缺少 installer/install.bat")
-    if not info.get("git_commit") or info.get("git_commit") == "unknown":
-        problems.append("BUILD_INFO.git_commit 未解析（版本不可追溯）")
-    if not info.get("python_version"):
-        problems.append("BUILD_INFO.python_version 未解析")
-    if not info.get("dependency_lock_sha256"):
-        problems.append("BUILD_INFO.dependency_lock_sha256 缺失（依赖锁不在仓库）")
-    if not licenses.get("inventory_complete"):
-        problems.append("LICENSES 清单不完整（inventory_complete=false）")
-    if licenses["summary"]["locked_missing"]:
-        problems.append("依赖锁条目未随包："
-                        + ", ".join(licenses["summary"]["locked_missing"]))
-    if licenses["summary"]["review_required"]:
-        problems.append(f"{licenses['summary']['review_required']} 个组件许可待人工复核"
-                        "（LICENSE_REVIEW_REQUIRED，V1 发布前必须清零）")
-    if not manifest.get("files"):
-        problems.append("RELEASE_MANIFEST 为空")
-    if not (dist_root / "SHA256SUMS").is_file():
-        problems.append("缺少 SHA256SUMS")
-    if doc_count == 0:
-        problems.append("随包文档为 0（文档白名单与仓库不匹配）")
-    if not check.ok:
-        problems.append(f"介质自校验未通过（{check.code}）："
-                        + "；".join(check.failures[:5]))
+    每个条件带**稳定错误码**，便于 CI / 售后按码定位（不用去解析中文描述）：
+
+        APP_MISSING / RUNTIME_MISSING / INSTALLER_MISSING
+        BUILD_INFO_INCOMPLETE / MEDIA_SELFCHECK_FAILED
+        LICENSES_INCOMPLETE / LOCK_ENTRY_MISSING
+        **RUNTIME_LOCK_MISMATCH** —— 随包运行时与依赖锁版本不一致
+        **LICENSE_TEXT_MISSING** —— 随包运行依赖只有元数据、缺许可原文
+        **VENDOR_LICENSE_INVALID** —— vendor 许可原文库缺件/被改动
+        LICENSE_REVIEW_REQUIRED_REMAINING —— 仍有无法确认许可的组件
+    """
+    problems: list[tuple[str, str]] = []
+
+    def need(ok: bool, code: str, detail: str) -> None:
+        if not ok:
+            problems.append((code, detail))
+
+    summary = licenses.get("summary") or {}
+
+    need((dist_root / "payload" / "app").is_dir(),
+         "APP_MISSING", "缺少 payload/app/")
+    need(rt_ok and (dist_root / "payload" / "python-runtime" / "python.exe").is_file(),
+         "RUNTIME_MISSING", "缺少 payload/python-runtime/python.exe")
+    need((dist_root / "installer" / "install.py").is_file(),
+         "INSTALLER_MISSING", "缺少 installer/install.py")
+    need((dist_root / "installer" / "install.bat").is_file(),
+         "INSTALLER_MISSING", "缺少 installer/install.bat")
+    need(bool(info.get("git_commit")) and info.get("git_commit") != "unknown",
+         "BUILD_INFO_INCOMPLETE", "BUILD_INFO.git_commit 未解析（版本不可追溯）")
+    need(bool(info.get("python_version")),
+         "BUILD_INFO_INCOMPLETE", "BUILD_INFO.python_version 未解析")
+    need(bool(info.get("dependency_lock_sha256")),
+         "BUILD_INFO_INCOMPLETE", "BUILD_INFO.dependency_lock_sha256 缺失（依赖锁不在仓库）")
+
+    # A3.1 硬门禁 #1：BUILD_INFO 记录的是「这份 lock」的 SHA256，
+    # 那么随包运行时就必须确实由这份 lock 构建 —— 否则可追溯性是假的。
+    need(not summary.get("version_mismatch"),
+         "RUNTIME_LOCK_MISMATCH",
+         "随包运行时与依赖锁版本不一致（请按 lock 重建 runtime，禁止反向改 lock 迎合旧 runtime）："
+         + "；".join(summary.get("version_mismatch") or []))
+
+    # A3 门禁：许可清单
+    need(bool(licenses.get("inventory_complete")),
+         "LICENSES_INCOMPLETE", "LICENSES 清单不完整（inventory_complete=false）")
+    need(not summary.get("vendor_problems"),
+         "VENDOR_LICENSE_INVALID",
+         "vendor 许可原文库不一致：" + "；".join(summary.get("vendor_problems") or []))
+    need(not summary.get("locked_missing"),
+         "LOCK_ENTRY_MISSING",
+         "依赖锁条目未随包：" + ", ".join(summary.get("locked_missing") or []))
+    need(not summary.get("required_metadata_only"),
+         "LICENSE_TEXT_MISSING",
+         "随包运行依赖只有元数据、缺许可原文（分发义务未闭）："
+         + ", ".join(summary.get("required_metadata_only") or []))
+    need(not summary.get("review_required"),
+         "LICENSE_REVIEW_REQUIRED_REMAINING",
+         f"{summary.get('review_required')} 个组件许可待人工复核"
+         "（LICENSE_REVIEW_REQUIRED，V1 发布前必须清零）")
+
+    need(bool(manifest.get("files")), "MANIFEST_EMPTY", "RELEASE_MANIFEST 为空")
+    need((dist_root / "SHA256SUMS").is_file(),
+         "CHECKSUMS_MISSING", "缺少 SHA256SUMS")
+    need(doc_count > 0, "DOCS_MISSING", "随包文档为 0（文档白名单与仓库不匹配）")
+    need(check.ok, "MEDIA_SELFCHECK_FAILED",
+         f"介质自校验未通过（{check.code}）：" + "；".join(check.failures[:5]))
 
     if problems:
-        _fail_build("严格模式门禁未通过 —— " + " | ".join(problems))
+        codes = " ".join(dict.fromkeys(c for c, _ in problems))
+        print(f"[build] GATE FAILED codes={codes}", file=sys.stderr)
+        _fail_build("严格模式门禁未通过 —— "
+                    + " | ".join(f"{c}: {d}" for c, d in problems))
 
 
 def main() -> int:

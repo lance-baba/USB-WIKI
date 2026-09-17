@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""第三方分发许可清单（A3）—— 只记录**这个 Release 实际带了什么**。
+"""第三方分发许可清单（A3 / A3.1）—— 只记录**这个 Release 实际带了什么**。
 
 原则
 ====
@@ -7,17 +7,19 @@
    当前没有 bundled Ollama / LLM / GGUF / ONNX model，就不替它们收 license。
 2. **不猜许可**。`Metadata License` 字段为空且无 classifier / 无 license 文件时，
    标记 `LICENSE_REVIEW_REQUIRED` —— 不允许「空 → 猜 MIT」。
-3. 本模块不做法律判断，只建立**完整、可审计**的清单；
-   正式 V1 Release 前必须清零 `LICENSE_REVIEW_REQUIRED`。
+3. **上游不随附时用 vendor 补齐**（A3.1）。某些 wheel 一个许可文件都不带，而义务仍在。
+   许可原文入库到 `vendor/licenses/<pkg>/<ver>/`（含 `PROVENANCE.json` 记录来源与 sha256），
+   构建时**只做本地拷贝，永不联网** —— 否则「正式发布构建」既依赖网络又不可复现。
+4. 本模块不做法律判断，只建立**完整、可审计**的清单。
 
 产物（相对发布根）::
 
     LICENSES/THIRD_PARTY.json          机器可读清单
     LICENSES/THIRD_PARTY_NOTICES.txt   人类可读汇总
     LICENSES/python/LICENSE.txt        CPython 自身许可
-    LICENSES/packages/<pkg>-<ver>/…    各发行包随附的 LICENSE / NOTICE 原文
+    LICENSES/packages/<pkg>-<ver>/…    各发行包随附（或 vendor 补齐）的许可原文
 
-零第三方依赖：只用标准库 `email`（读 METADATA）+ `zipfile` 无关，纯文件读取 + 联网零次。
+零第三方依赖：只用标准库 `email`（读 METADATA），纯文件读取 + **零联网**。
 """
 from __future__ import annotations
 
@@ -27,11 +29,17 @@ import shutil
 from email.parser import Parser
 from pathlib import Path
 
+from release_integrity import sha256_file   # 哈希唯一实现（scripts/ 同目录）
+
 FORMAT_VERSION = 1
 LICENSES_DIRNAME = "LICENSES"
 THIRD_PARTY_JSON = "THIRD_PARTY.json"
 THIRD_PARTY_NOTICES = "THIRD_PARTY_NOTICES.txt"
 PACKAGES_DIRNAME = "packages"
+
+#: 源码侧许可原文库（KB 级纯文本，可进 Git）；构建时只读本地
+VENDOR_SUBDIR = ("vendor", "licenses")
+PROVENANCE_NAME = "PROVENANCE.json"
 
 #: 单份许可原文上限 —— 超限跳过并在清单里写明（避免把巨大语料塞进发布介质）
 MAX_LICENSE_BYTES = 2 * 1024 * 1024
@@ -132,6 +140,18 @@ def _project_url(msg) -> str | None:
     return None
 
 
+#: 上游 METADATA 里已知的占位 URL（真实案例：sqlite-vec 的 Home-page 就是 `https://TODO.com`）。
+#: 仅当**已有经 sha256 校验的 vendor 溯源**时才用它覆盖 —— 不是猜，是用更可靠的证据。
+_PLACEHOLDER_URL_MARKERS = ("todo", "example.com", "example.invalid", "localhost")
+
+
+def _is_placeholder_url(url: str | None) -> bool:
+    if not url:
+        return True
+    low = url.lower()
+    return any(m in low for m in _PLACEHOLDER_URL_MARKERS)
+
+
 def _collect_license_files(dist_info: Path, dest: Path) -> list[Path]:
     """把 dist-info 内的许可原文拷到 *dest*，返回**拷贝后的绝对路径**列表。
 
@@ -144,8 +164,7 @@ def _collect_license_files(dist_info: Path, dest: Path) -> list[Path]:
                 continue
             if src.stat().st_size > MAX_LICENSE_BYTES:
                 continue
-            rel_inside = src.relative_to(dist_info)
-            target = dest / rel_inside
+            target = dest / src.relative_to(dist_info)
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src, target)
             found.append(target)
@@ -153,10 +172,120 @@ def _collect_license_files(dist_info: Path, dest: Path) -> list[Path]:
 
 
 # ---------------------------------------------------------------------------
+# vendor 许可原文库（A3.1）
+# ---------------------------------------------------------------------------
+def vendor_licenses_dir() -> Path:
+    """源码侧许可原文库根目录（相对本文件：``<repo>/vendor/licenses``）。
+
+    发布态安装器不需要本模块，故这里用 `__file__` 推导即可；假仓库测试把
+    `collect_licenses.py` 拷进自己的 `scripts/`，自然指向自己的 vendor。
+    """
+    return Path(__file__).resolve().parents[1].joinpath(*VENDOR_SUBDIR)
+
+
+def find_vendor(vendor_dir: Path | None, pkg_name: str, version: str) -> Path | None:
+    """按「规范化包名 + 精确版本」定位 vendor 目录；版本不同必须另开目录，不许复用。"""
+    root = Path(vendor_dir) if vendor_dir else vendor_licenses_dir()
+    if not root.is_dir():
+        return None
+    want = norm_name(pkg_name)
+    for entry in sorted(root.iterdir()):
+        if not entry.is_dir() or norm_name(entry.name) != want:
+            continue
+        candidate = entry / version
+        if candidate.is_dir():
+            return candidate
+    return None
+
+
+def apply_vendor(vendor_pkg_dir: Path, dest: Path,
+                 problems: list[str]) -> tuple[list[Path], dict | None]:
+    """把 vendor 声明的许可原文拷进发布包；任何不一致都记为 problem（不静默放过）。
+
+    校验三件事：`PROVENANCE.json` 可解析且 `files` 非空、每个声明的文件存在、
+    size 与 sha256 与声明一致 —— 后者就是「许可文本没被手写/改写」的执行器。
+    """
+    label = f"{vendor_pkg_dir.parent.name}@{vendor_pkg_dir.name}"
+    prov_path = vendor_pkg_dir / PROVENANCE_NAME
+    if not prov_path.is_file():
+        problems.append(f"{label}: vendor 缺 {PROVENANCE_NAME}（来源不可审计）")
+        return [], None
+    try:
+        prov = json.loads(prov_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        problems.append(f"{label}: {PROVENANCE_NAME} 无法解析（{exc}）")
+        return [], None
+    if not isinstance(prov, dict):
+        problems.append(f"{label}: {PROVENANCE_NAME} 顶层不是对象")
+        return [], None
+    if prov.get("format_version") != FORMAT_VERSION:
+        problems.append(f"{label}: {PROVENANCE_NAME}.format_version="
+                        f"{prov.get('format_version')!r}（本程序支持 {FORMAT_VERSION}）")
+
+    declared = prov.get("files")
+    if not isinstance(declared, list) or not declared:
+        problems.append(f"{label}: {PROVENANCE_NAME}.files 缺失或为空")
+        return [], None
+
+    copied: list[Path] = []
+    for item in declared:
+        if not isinstance(item, dict):
+            problems.append(f"{label}: files 条目不是对象")
+            continue
+        name = str(item.get("name") or "").strip()
+        if not name or name.startswith(".") or "/" in name or "\\" in name:
+            problems.append(f"{label}: 非法许可文件名 {name!r}")
+            continue
+        src = vendor_pkg_dir / name
+        if not src.is_file():
+            problems.append(f"{label}: 随包许可原文缺失 {name}（vendor 不完整）")
+            continue
+        want_hash = str(item.get("sha256") or "").lower()
+        if not want_hash:
+            problems.append(f"{label}: {name} 未声明 sha256（无法证明未改写）")
+            continue
+        actual = sha256_file(src)
+        if actual != want_hash:
+            problems.append(f"{label}: {name} sha256 与 PROVENANCE 不一致"
+                            f"（期望 {want_hash[:16]}…，实际 {actual[:16]}…）")
+            continue
+        size = item.get("size")
+        if isinstance(size, int) and src.stat().st_size != size:
+            problems.append(f"{label}: {name} 大小与 PROVENANCE 不一致"
+                            f"（期望 {size}，实际 {src.stat().st_size}）")
+            continue
+        dest.mkdir(parents=True, exist_ok=True)
+        target = dest / name
+        shutil.copy2(src, target)
+        copied.append(target)
+    return copied, prov
+
+
+def _vendor_provenance_record(prov: dict, vendor_pkg_dir: Path) -> dict:
+    """写进 THIRD_PARTY.json 的溯源块 —— 让许可来源可被机器审计。"""
+    return {
+        "upstream_project": prov.get("upstream_project"),
+        "upstream_ref": prov.get("upstream_ref"),
+        "upstream_commit": prov.get("upstream_commit"),
+        "retrieved_at_utc": prov.get("retrieved_at_utc"),
+        "declared_in_metadata": prov.get("declared_in_metadata"),
+        "vendor_source": "/".join([*VENDOR_SUBDIR, vendor_pkg_dir.parent.name,
+                                   vendor_pkg_dir.name]),
+        "files": [
+            {"name": f.get("name"),
+             "source_url": f.get("source_url"),
+             "sha256": f.get("sha256")}
+            for f in (prov.get("files") or []) if isinstance(f, dict)
+        ],
+    }
+
+
+# ---------------------------------------------------------------------------
 # 主收集
 # ---------------------------------------------------------------------------
 def collect(runtime_dir: Path, lock_path: Path, root: Path,
-            *, python_version: str | None = None) -> dict:
+            *, python_version: str | None = None,
+            vendor_dir: Path | None = None) -> dict:
     """生成 LICENSES/ 并返回清单 dict。
 
     *runtime_dir* 为随包的运行时目录（payload/python-runtime）；
@@ -172,12 +301,15 @@ def collect(runtime_dir: Path, lock_path: Path, root: Path,
     runtime_dir = Path(runtime_dir)
     site_packages = runtime_dir / "Lib" / "site-packages"
     locked = parse_requirements_lock(lock_path)
+    vendor_root = Path(vendor_dir) if vendor_dir else vendor_licenses_dir()
 
     packages: list[dict] = []
+    vendor_problems: list[str] = []
 
     if site_packages.is_dir():
         for info_dir in sorted(site_packages.glob("*.dist-info")):
-            entry = _one_package(info_dir, pkg_root, locked, root)
+            entry = _one_package(info_dir, pkg_root, locked, root,
+                                 vendor_root, vendor_problems)
             if entry is not None:
                 packages.append(entry)
 
@@ -198,7 +330,8 @@ def collect(runtime_dir: Path, lock_path: Path, root: Path,
             "review_status": STATUS_OK,
         })
 
-    complete = bool(packages) and site_packages.is_dir()
+    complete = (bool(packages) and site_packages.is_dir()
+                and not vendor_problems)
 
     present = {norm_name(p["package"]) for p in packages}
     locked_missing = sorted(n for n in locked if n not in present)
@@ -210,6 +343,14 @@ def collect(runtime_dir: Path, lock_path: Path, root: Path,
     )
     review_required = sorted(p["package"] for p in packages
                              if p["review_status"] == STATUS_REVIEW)
+    metadata_only = sorted(p["package"] for p in packages
+                           if p["review_status"] == STATUS_METADATA_ONLY)
+    # A3.1：**随包运行依赖**（依赖锁内）不得停留在 metadata_only ——
+    # 元数据能回答「是什么许可」，但发布物仍缺许可原文，分发义务未闭。
+    required_metadata_only = sorted(
+        p["package"] for p in packages
+        if p["review_status"] == STATUS_METADATA_ONLY and p["required"]
+    )
 
     inventory = {
         "format_version": FORMAT_VERSION,
@@ -217,14 +358,18 @@ def collect(runtime_dir: Path, lock_path: Path, root: Path,
         "source": {
             "runtime": "payload/python-runtime",
             "lock": Path(lock_path).name,
+            "vendor_licenses": "/".join(VENDOR_SUBDIR),
             "python_version": python_version,
         },
         "summary": {
             "packages": len(packages),
             "review_required": len(review_required),
+            "metadata_only": len(metadata_only),
+            "required_metadata_only": required_metadata_only,
             "locked_total": len(locked),
             "locked_missing": locked_missing,
             "version_mismatch": version_mismatch,
+            "vendor_problems": vendor_problems,
         },
         "packages": packages,
     }
@@ -237,8 +382,8 @@ def collect(runtime_dir: Path, lock_path: Path, root: Path,
     return inventory
 
 
-def _one_package(info_dir: Path, pkg_root: Path, locked: dict[str, str],
-                 root: Path) -> dict | None:
+def _one_package(info_dir: Path, pkg_root: Path, locked: dict[str, str], root: Path,
+                 vendor_root: Path, vendor_problems: list[str]) -> dict | None:
     meta_path = info_dir / "METADATA"
     msg = _read_metadata(meta_path) if meta_path.is_file() else None
     if msg is not None:
@@ -256,8 +401,15 @@ def _one_package(info_dir: Path, pkg_root: Path, locked: dict[str, str],
     project = _project_url(msg) if msg is not None else None
 
     dest = pkg_root / f"{name}-{version}"
-    texts = _collect_license_files(info_dir, dest)
-    texts_rel = [p.relative_to(root).as_posix() for p in texts]
+    bundled = _collect_license_files(info_dir, dest)
+
+    vendored, prov = [], None
+    vdir = find_vendor(vendor_root, name, version)
+    if vdir is not None:
+        vendored, prov = apply_vendor(vdir, dest, vendor_problems)
+
+    texts = [*bundled, *vendored]
+    texts_rel = sorted({p.relative_to(root).as_posix() for p in texts})
     if not texts_rel:
         try:
             dest.rmdir()  # 没拷到任何东西就别留空目录
@@ -271,18 +423,41 @@ def _one_package(info_dir: Path, pkg_root: Path, locked: dict[str, str],
     else:
         # 许可身份可由 License 字段 / classifier / License-Expression 可靠回答，
         # 只是该发行包没随附许可原文 —— 有据可查，不是「猜」。
+        # ⚠ 但若它属于随包运行依赖（required），strict 门禁仍会以
+        #   LICENSE_TEXT_MISSING 拒绝发布 —— 见 collect() 的 required_metadata_only。
         status = STATUS_METADATA_ONLY
 
-    return {
+    # 许可「是什么」的证据来源 与 许可「原文从哪来」是两件事，分开记：
+    #   license_source       —— 身份依据（Metadata License / Classifier / License-Expression / license file）
+    #   license_text_source  —— 原文出处（随包 dist-info / vendor 许可原文库）
+    if vendored and bundled:
+        text_source = "随包 dist-info + vendor 许可原文库（均校验）"
+    elif vendored:
+        text_source = "vendor 许可原文库（已校验 sha256）"
+    elif bundled:
+        text_source = "随包 dist-info"
+    else:
+        text_source = None
+
+    entry = {
         "package": name,
         "version": version,
         "license": license_value,
         "license_source": license_source or ("license file" if texts_rel else None),
+        "license_text_source": text_source,
         "project": project,
         "license_texts": texts_rel,
         "required": norm_name(name) in locked,
         "review_status": status,
     }
+    if prov is not None:
+        entry["provenance"] = _vendor_provenance_record(prov, vdir)
+        upstream = prov.get("upstream_project")
+        if upstream and _is_placeholder_url(entry["project"]):
+            # 元数据里的 Home-page 是上游占位符（如 https://TODO.com）时，
+            # 用已 pin commit 的 vendor 溯源 URL —— 只在此情形覆盖，不做揣测。
+            entry["project"] = upstream
+    return entry
 
 
 def _render_notices(packages: list[dict], inventory: dict) -> str:
@@ -292,20 +467,43 @@ def _render_notices(packages: list[dict], inventory: dict) -> str:
     out.write("本文件由 scripts/collect_licenses.py 自动生成，覆盖本 Release **实际随包分发**的\n")
     out.write("第三方组件。未随包分发的组件（如本地 LLM / Ollama / ONNX 模型）不在此列。\n\n")
     s = inventory["summary"]
-    out.write(f"组件总数：{s['packages']}    待人工复核：{s['review_required']}\n")
+    out.write(f"组件总数：{s['packages']}    待人工复核：{s['review_required']}"
+              f"    仅元数据（无许可原文）：{s['metadata_only']}\n")
     out.write(f"依赖锁条目：{s['locked_total']}    "
               f"锁内缺失：{len(s['locked_missing'])}    版本差异：{len(s['version_mismatch'])}\n\n")
     out.write("-" * 72 + "\n")
     for p in packages:
         out.write(f"{p['package']} {p['version']}\n")
         out.write(f"  许可        : {p['license'] or '(未在元数据中声明)'}\n")
-        out.write(f"  许可来源    : {p['license_source'] or '-'}\n")
+        out.write(f"  许可依据    : {p['license_source'] or '-'}\n")
+        out.write(f"  原文来源    : {p.get('license_text_source') or '(未随附)'}\n")
         out.write(f"  项目主页    : {p['project'] or '-'}\n")
         out.write(f"  许可原文    : "
                   + (", ".join(p["license_texts"]) if p["license_texts"] else "(未随附)")
                   + "\n")
         out.write(f"  依赖锁直接/间接依赖 : {'是' if p['required'] else '否（随运行时附带）'}\n")
-        out.write(f"  复核状态    : {p['review_status']}\n\n")
+        out.write(f"  复核状态    : {p['review_status']}\n")
+        prov = p.get("provenance")
+        if prov:
+            out.write(f"  上游溯源    : {prov.get('upstream_project') or '-'}"
+                      f" @ {prov.get('upstream_ref') or '-'}"
+                      f" ({prov.get('upstream_commit') or '-'})"
+                      f"  取样于 {prov.get('retrieved_at_utc') or '-'}\n")
+            out.write(f"  原文库      : {prov.get('vendor_source') or '-'}\n")
+            for f in prov.get("files") or []:
+                out.write(f"    - {f.get('name')}  <- {f.get('source_url')}\n")
+        out.write("\n")
+    if s["required_metadata_only"]:
+        out.write("-" * 72 + "\n")
+        out.write("⚠ 以下**随包运行依赖**只有元数据、缺许可原文（分发义务未闭，"
+                  "请在 vendor/licenses/ 补齐）：\n")
+        for n in s["required_metadata_only"]:
+            out.write(f"  - {n}\n")
+    if s["vendor_problems"]:
+        out.write("-" * 72 + "\n")
+        out.write("⚠ vendor 许可原文库存在不一致（strict 构建会拒绝）：\n")
+        for n in s["vendor_problems"]:
+            out.write(f"  - {n}\n")
     if s["locked_missing"]:
         out.write("-" * 72 + "\n")
         out.write("⚠ 以下依赖锁条目在随包运行时中未找到（发布不完整）：\n")
@@ -313,7 +511,8 @@ def _render_notices(packages: list[dict], inventory: dict) -> str:
             out.write(f"  - {n}\n")
     if s["version_mismatch"]:
         out.write("-" * 72 + "\n")
-        out.write("⚠ 以下依赖版本与依赖锁不一致（随包运行时可能非由当前锁构建）：\n")
+        out.write("⚠ 以下依赖版本与依赖锁不一致（随包运行时非由当前锁构建，"
+                  "strict 构建会以 RUNTIME_LOCK_MISMATCH 拒绝）：\n")
         for n in s["version_mismatch"]:
             out.write(f"  - {n}\n")
     return out.getvalue()

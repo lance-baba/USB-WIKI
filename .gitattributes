@@ -23,6 +23,16 @@
 *.md            text eol=lf
 *.txt           text eol=lf
 
+# ⚠ vendor 许可原文**只允许原字节**
+# 它们的 sha256 被同目录 PROVENANCE.json 固定，并在构建时逐文件校验；
+# 任何行尾归一化（LF↔CRLF）都会改变字节 → 让校验在别的机器/别的 git 配置下凭空失败。
+# 故显式 -text（等同 binary：不转换、不做行尾 diff 处理）。规则后置，覆盖上面的 * text=auto。
+vendor/licenses/**/LICENSE*      -text
+vendor/licenses/**/LICENCE*      -text
+vendor/licenses/**/COPYING*      -text
+vendor/licenses/**/NOTICE*       -text
+vendor/licenses/**/AUTHORS*      -text
+
 # 二进制文件不得做任何转换
 *.png   binary
 *.jpg   binary

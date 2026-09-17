@@ -1,0 +1,25 @@
+{
+  "format_version": 1,
+  "package": "sqlite-vec",
+  "version": "0.1.9",
+  "upstream_project": "https://github.com/asg017/sqlite-vec",
+  "upstream_ref": "v0.1.9",
+  "upstream_commit": "e9f598abfa0c06b328d8fe5da9c3760cce74be10",
+  "retrieved_at_utc": "2026-09-17",
+  "declared_in_metadata": "MIT License, Apache License, Version 2.0",
+  "note": "上游 wheel sqlite_vec-0.1.9 未随附任何许可原文（dist-info 内无 LICENSE/COPYING/NOTICE）；本目录为上游同一 tag/commit 下 LICENSE-MIT 与 LICENSE-APACHE 的原文字节副本，未作任何改写，sha256 用于校验未被改动。",
+  "files": [
+    {
+      "name": "LICENSE-MIT",
+      "source_url": "https://raw.githubusercontent.com/asg017/sqlite-vec/e9f598abfa0c06b328d8fe5da9c3760cce74be10/LICENSE-MIT",
+      "size": 1068,
+      "sha256": "6ce72bbe12d975bd5286e5ab0a064c069693300c47bccbc57bec18485f1621ea"
+    },
+    {
+      "name": "LICENSE-APACHE",
+      "source_url": "https://raw.githubusercontent.com/asg017/sqlite-vec/e9f598abfa0c06b328d8fe5da9c3760cce74be10/LICENSE-APACHE",
+      "size": 10931,
+      "sha256": "a38070a94d4afd9cd710e3ce67bd1de78097cfe1784c1f0109ac95d3c196bfdc"
+    }
+  ]
+}

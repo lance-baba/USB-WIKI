@@ -480,7 +480,9 @@ def _t_license_inventory_shape(tmp: Path) -> None:
 
     out = tmp / "out"
     out.mkdir()
-    inv = cl.collect(rt, lock, out, python_version="3.11.9")
+    # 显式给一个不存在的 vendor 目录：本用例只测「元数据 → 状态判定」，不掺 vendor 行为
+    inv = cl.collect(rt, lock, out, python_version="3.11.9",
+                     vendor_dir=tmp / "no-such-vendor")
     by_name = {p["package"]: p for p in inv["packages"]}
 
     check("A3-7a 未声明许可的包被标 LICENSE_REVIEW_REQUIRED",
@@ -512,20 +514,82 @@ def _t_license_inventory_shape(tmp: Path) -> None:
 # ---------------------------------------------------------------------------
 # 13 —— 真实 runtime 下的 strict 构建（有运行时才跑）
 # ---------------------------------------------------------------------------
+def _norm_pkg(name: str) -> str:
+    return name.strip().lower().replace("-", "_").replace(".", "_")
+
+
+def expected_version_mismatch() -> list[str]:
+    """**独立推导**「锁 vs 随包运行时」的版本差异。
+
+    刻意不调用 `collect_licenses`：若用被测模块自己的输出去决定预期，就等于
+    「拿被测对象证明被测对象」—— 它一旦算错，测试会跟着一起错。
+    这里直接读 lock 文本 + 随包 `*.dist-info` 目录名派生，互不依赖。
+    """
+    lock = REPO / "requirements-release.lock"
+    sp = REPO / "runtime" / "python-3.11-embed" / "Lib" / "site-packages"
+    locked: dict[str, str] = {}
+    for raw in lock.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "==" not in line:
+            continue
+        name, _, rest = line.partition("==")
+        name = name.strip()
+        if not name or any(c.isspace() for c in name):
+            continue
+        locked[_norm_pkg(name)] = rest.split(";")[0].strip()
+    present: dict[str, str] = {}
+    for d in sp.glob("*.dist-info"):
+        stem = d.name[: -len(".dist-info")]
+        name, _, ver = stem.rpartition("-")
+        present[_norm_pkg(name or stem)] = ver
+    return sorted(
+        f"{n}（锁 {locked[n]} / 随包 {present[n]}）"
+        for n in locked if n in present and present[n] != locked[n]
+    )
+
+
 def _t_real_strict_build(tmp: Path) -> None:
     section("13 真实 runtime strict 构建（有运行时才跑）")
     if not _runtime_present():
         skip("A3-13 真实 strict 构建", "本机无 runtime/python-3.11-embed（CI Portable job 覆盖）")
         return
 
+    stale = expected_version_mismatch()
     out = tmp / "dist"
     proc = subprocess.run(
         [sys.executable, str(REPO / "scripts" / "build_release.py"),
          "--strict", "--output", str(out)],
         cwd=str(REPO), capture_output=True, text=True, encoding="utf-8",
         errors="replace", timeout=1800)
-    check("A3-13a strict 构建返回 0", proc.returncode == 0,
-          (proc.stderr or proc.stdout)[-400:])
+    stderr = proc.stderr or ""
+
+    if stale:
+        # A3.1：本机 runtime 陈旧 ⇒ strict **必须**红，且给出稳定码。
+        # 这是正确行为，不是失败；也**不**为了变绿去重建 runtime 或反向改 lock。
+        print(f"  ⚠ LOCAL_RUNTIME_STALE：{'; '.join(stale)}")
+        print("     （本机 runtime 非由当前 lock 构建；freshness 由 CI Portable job 验证）")
+        check("A3-13a 陈旧 runtime → strict 必须拒绝（rc!=0）", proc.returncode != 0,
+              f"rc={proc.returncode}")
+        check("A3-13a2 拒绝码为 RUNTIME_LOCK_MISMATCH",
+              "RUNTIME_LOCK_MISMATCH" in stderr, stderr[-300:])
+        check("A3-13a3 拒绝信息点出具体不一致的包",
+              any(s.split("（")[0] in stderr for s in stale), stderr[-300:])
+        # 交叉校验：门禁在写盘之后判定，产物里的清单必须如实记录同一组差异 ——
+        # 用**独立推导**的期望去比对被测模块的输出，避免「自己证明自己」。
+        inv_path = (out / f"USB-WIKI-v{APP_VERSION}-win-x64"
+                    / "LICENSES" / "THIRD_PARTY.json")
+        recorded = []
+        if inv_path.is_file():
+            recorded = json.loads(inv_path.read_text(encoding="utf-8")
+                                  )["summary"]["version_mismatch"]
+        check("A3-13a4 独立推导的差异与清单记录逐条一致",
+              sorted(s.split("（")[0] for s in recorded)
+              == sorted(s.split("（")[0] for s in stale),
+              f"expected={sorted(s.split('（')[0] for s in stale)} "
+              f"recorded={sorted(s.split('（')[0] for s in recorded)}")
+        return
+
+    check("A3-13a strict 构建返回 0", proc.returncode == 0, stderr[-400:])
     if proc.returncode != 0:
         return
 
@@ -574,12 +638,18 @@ def _t_real_strict_build(tmp: Path) -> None:
           (proc.stdout or "")[:120])
 
 
-def _make_fake_repo(root: Path, *, with_site_packages: bool = True) -> Path:
+def _make_fake_repo(root: Path, *, with_site_packages: bool = True,
+                    lock_version: str = "1.0", runtime_version: str = "1.0",
+                    pkg_license_file: bool = True) -> Path:
     """微型仓库（秒级构建）：让整条 strict 链路在所有 CI 作业里都能跑。
 
     真实 runtime 的构建太重（拷贝 122MB + 全量哈希），不能作为每次提交的门禁；
     这里用假 app + 假运行时把 BUILD_INFO / LICENSES / MANIFEST / SHA256SUMS /
     自校验 / 严格门禁的**逻辑**完整覆盖，真实产物的验证交给真实构建那条用例。
+
+    *lock_version* / *runtime_version* 可制造「依赖锁 vs 随包运行时」版本差异；
+    *pkg_license_file*=False 让该包只剩元数据（`metadata_only`），用于验证
+    「随包运行依赖必须有许可原文」与 vendor 补齐两条路径。
     """
     (root / "app" / "core").mkdir(parents=True)
     (root / "scripts").mkdir(parents=True)
@@ -601,16 +671,54 @@ def _make_fake_repo(root: Path, *, with_site_packages: bool = True) -> Path:
     (rt / "python311.dll").write_bytes(b"fake-dll")
     (rt / "LICENSE.txt").write_text("PSF LICENSE (fake)\n", encoding="utf-8")
     if with_site_packages:
-        d = rt / "Lib" / "site-packages" / "foo-1.0.dist-info"
+        d = rt / "Lib" / "site-packages" / f"foo-{runtime_version}.dist-info"
         d.mkdir(parents=True)
         (d / "METADATA").write_text(
-            "Metadata-Version: 2.1\nName: foo\nVersion: 1.0\n"
+            f"Metadata-Version: 2.1\nName: foo\nVersion: {runtime_version}\n"
             "License: MIT\nHome-page: https://example.invalid/foo\n\n", encoding="utf-8")
-        (d / "LICENSE").write_text("MIT text\n", encoding="utf-8")
-    (root / "requirements-release.lock").write_text("foo==1.0\n", encoding="utf-8")
+        if pkg_license_file:
+            (d / "LICENSE").write_text("MIT text\n", encoding="utf-8")
+    (root / "requirements-release.lock").write_text(
+        f"foo=={lock_version}\n", encoding="utf-8")
     (root / "README.md").write_text("# fake\n", encoding="utf-8")
     (root / "docs" / "设计与实现.md").write_text("# fake doc\n", encoding="utf-8")
     return root
+
+
+def _write_vendor(vendor_root: Path, pkg: str, ver: str, *, files: dict[str, bytes],
+                  declared: list[str] | None = None,
+                  omit: str | None = None,
+                  tamper: str | None = None) -> Path:
+    """造一个 vendor 许可原文库目录（可选：少一个声明文件 / 声明后被改写）。
+
+    一律 `write_bytes`，避免 Windows 上 `write_text` 的 `\\n`→`\\r\\n` 让
+    sha256/size 与声明不符 —— 那会让测试自身变成噪声源。
+    """
+    d = vendor_root / pkg / ver
+    d.mkdir(parents=True, exist_ok=True)
+    decl = list(declared if declared is not None else files)
+    entries = []
+    for name in decl:
+        body = files[name]
+        if omit != name:
+            (d / name).write_bytes(body)
+        if tamper == name:
+            (d / name).write_bytes(body + b"# edited by hand\n")
+        entries.append({
+            "name": name,
+            "source_url": f"https://example.invalid/{pkg}/{ver}/{name}",
+            "size": len(body),
+            "sha256": hashlib.sha256(body).hexdigest(),
+        })
+    (d / "PROVENANCE.json").write_text(json.dumps({
+        "format_version": 1, "package": pkg, "version": ver,
+        "upstream_project": "https://example.invalid/proj",
+        "upstream_ref": f"v{ver}", "upstream_commit": "b" * 40,
+        "retrieved_at_utc": "2026-01-01",
+        "declared_in_metadata": "MIT License",
+        "files": entries,
+    }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8", newline="\n")
+    return d
 
 
 def _fake_build(repo: Path, out: Path, *, strict: bool,
@@ -688,6 +796,158 @@ def _t_fake_repo_strict_build(tmp: Path) -> None:
           str(res.failures[:2]))
 
 
+def _read_fake_inventory(out: Path) -> dict | None:
+    p = out / "USB-WIKI-v9.9.9-win-x64" / "LICENSES" / "THIRD_PARTY.json"
+    return json.loads(p.read_text(encoding="utf-8")) if p.is_file() else None
+
+
+# ---------------------------------------------------------------------------
+# A3.1-1 —— strict 必须拒绝 runtime 与 lock 版本不一致
+# ---------------------------------------------------------------------------
+def _t_lock_mismatch_gate(tmp: Path) -> None:
+    section("A3.1-1 strict 拒绝 runtime/lock 版本不一致")
+
+    # A) lock 2.0 / 随包 1.0 → 必须失败
+    repo_a = _make_fake_repo(tmp / "a", lock_version="2.0", runtime_version="1.0")
+    out_a = tmp / "distA"
+    p_a = _fake_build(repo_a, out_a, strict=True)
+    err_a = p_a.stderr or ""
+    check("A3.1-A 锁 2.0 / 随包 1.0 → strict 非零退出",
+          p_a.returncode != 0, f"rc={p_a.returncode}")
+    check("A3.1-A 稳定错误码 RUNTIME_LOCK_MISMATCH",
+          "RUNTIME_LOCK_MISMATCH" in err_a, err_a[-300:])
+    check("A3.1-A 信息点出不一致的包与两个版本",
+          "foo" in err_a and "2.0" in err_a and "1.0" in err_a, err_a[-300:])
+    check("A3.1-A 门禁码行可被机器读取",
+          "GATE FAILED codes=" in err_a and "RUNTIME_LOCK_MISMATCH" in err_a,
+          err_a[-300:])
+    inv_a = _read_fake_inventory(out_a)
+    check("A3.1-A 清单如实记录该差异",
+          bool(inv_a) and any("foo" in s for s in inv_a["summary"]["version_mismatch"]),
+          str((inv_a or {}).get("summary", {}).get("version_mismatch")))
+
+    dev_a = _fake_build(repo_a, tmp / "devA", strict=False)
+    check("A3.1-A 非 strict 仍宽松可构建", dev_a.returncode == 0, f"rc={dev_a.returncode}")
+    check("A3.1-A 非 strict 也显著提示该码",
+          "RUNTIME_LOCK_MISMATCH" in (dev_a.stdout or ""), (dev_a.stdout or "")[-300:])
+
+    # B) lock 2.0 / 随包 2.0 → 版本一致性门禁必须放行
+    repo_b = _make_fake_repo(tmp / "b", lock_version="2.0", runtime_version="2.0")
+    out_b = tmp / "distB"
+    p_b = _fake_build(repo_b, out_b, strict=True)
+    check("A3.1-B 锁 2.0 / 随包 2.0 → strict 通过",
+          p_b.returncode == 0, (p_b.stderr or p_b.stdout)[-300:])
+    check("A3.1-B 不出现 RUNTIME_LOCK_MISMATCH",
+          "RUNTIME_LOCK_MISMATCH" not in (p_b.stderr or ""))
+    inv_b = _read_fake_inventory(out_b)
+    check("A3.1-B 清单 version_mismatch 为空",
+          bool(inv_b) and inv_b["summary"]["version_mismatch"] == [],
+          str((inv_b or {}).get("summary", {}).get("version_mismatch")))
+
+
+# ---------------------------------------------------------------------------
+# A3.1-3/4/5 —— 许可原文：vendor 补齐 + 「不许改写」执行器
+# ---------------------------------------------------------------------------
+_VENDOR_FILES = {
+    "LICENSE-MIT": b"MIT License\n\nCopyright (c) fake\n\nPermission is hereby granted...\n",
+    "LICENSE-APACHE": b"Apache License\nVersion 2.0, January 2004\nhttp://www.apache.org/licenses/\n",
+}
+
+
+def _t_vendor_license_gate(tmp: Path) -> None:
+    section("A3.1-3/4/5 vendor 许可原文：补齐 + 缺件/改写必红")
+
+    # F) 随包运行依赖只有元数据、又没 vendor → LICENSE_TEXT_MISSING
+    repo_f = _make_fake_repo(tmp / "f", pkg_license_file=False)
+    out_f = tmp / "distF"
+    p_f = _fake_build(repo_f, out_f, strict=True)
+    err_f = p_f.stderr or ""
+    check("A3.1-F 随包运行依赖缺许可原文 → strict 非零退出",
+          p_f.returncode != 0, f"rc={p_f.returncode}")
+    check("A3.1-F 码为 LICENSE_TEXT_MISSING", "LICENSE_TEXT_MISSING" in err_f, err_f[-300:])
+    inv_f = _read_fake_inventory(out_f)
+    check("A3.1-F 清单列出 required_metadata_only",
+          bool(inv_f) and inv_f["summary"]["required_metadata_only"] == ["foo"],
+          str((inv_f or {}).get("summary", {}).get("required_metadata_only")))
+    check("A3.1-F 该包状态确为 metadata_only",
+          bool(inv_f) and [p for p in inv_f["packages"]
+                           if p["package"] == "foo"][0]["review_status"] == "metadata_only")
+
+    # C) vendor 声明两件、只随包一件 → VENDOR_LICENSE_INVALID + inventory 不完整
+    repo_c = _make_fake_repo(tmp / "c", pkg_license_file=False)
+    _write_vendor(repo_c / "vendor" / "licenses", "foo", "1.0",
+                  files=_VENDOR_FILES, omit="LICENSE-APACHE")
+    out_c = tmp / "distC"
+    p_c = _fake_build(repo_c, out_c, strict=True)
+    err_c = p_c.stderr or ""
+    check("A3.1-C vendor 缺一个声明文件 → strict 非零退出",
+          p_c.returncode != 0, f"rc={p_c.returncode}")
+    check("A3.1-C 码为 VENDOR_LICENSE_INVALID",
+          "VENDOR_LICENSE_INVALID" in err_c, err_c[-300:])
+    inv_c = _read_fake_inventory(out_c)
+    check("A3.1-C 清单 inventory_complete=false",
+          bool(inv_c) and inv_c["inventory_complete"] is False)
+    check("A3.1-C 清单记录 vendor_problems",
+          bool(inv_c) and bool(inv_c["summary"]["vendor_problems"]),
+          str((inv_c or {}).get("summary", {}).get("vendor_problems")))
+
+    # E) vendor 文件被手改 → sha256 执行器必须抓到（「不许改写许可文本」）
+    repo_e = _make_fake_repo(tmp / "e", pkg_license_file=False)
+    _write_vendor(repo_e / "vendor" / "licenses", "foo", "1.0",
+                  files=_VENDOR_FILES, tamper="LICENSE-MIT")
+    out_e = tmp / "distE"
+    p_e = _fake_build(repo_e, out_e, strict=True)
+    err_e = p_e.stderr or ""
+    check("A3.1-E vendor 原文被改写 → strict 非零退出",
+          p_e.returncode != 0, f"rc={p_e.returncode}")
+    check("A3.1-E 码为 VENDOR_LICENSE_INVALID 且指明 sha256 不一致",
+          "VENDOR_LICENSE_INVALID" in err_e and "sha256" in err_e, err_e[-400:])
+
+    # D) 两件齐全且未被改动 → strict 通过，且该包不得停留在 metadata_only
+    repo_d = _make_fake_repo(tmp / "d", pkg_license_file=False)
+    vendor_d = _write_vendor(repo_d / "vendor" / "licenses", "foo", "1.0",
+                             files=_VENDOR_FILES)
+    out_d = tmp / "distD"
+    p_d = _fake_build(repo_d, out_d, strict=True)
+    check("A3.1-D vendor 齐全 → strict 通过",
+          p_d.returncode == 0, (p_d.stderr or p_d.stdout)[-300:])
+    inv_d = _read_fake_inventory(out_d) or {"summary": {}, "packages": []}
+    entry_d = next((p for p in inv_d["packages"] if p["package"] == "foo"), {})
+    check("A3.1-D 该包最终状态不是 metadata_only",
+          entry_d.get("review_status") == "ok", str(entry_d.get("review_status")))
+    check("A3.1-D 全局 metadata_only 计数为 0",
+          inv_d["summary"].get("metadata_only") == 0,
+          str(inv_d["summary"].get("metadata_only")))
+    check("A3.1-D 两份许可原文随包",
+          sorted(entry_d.get("license_texts") or [])
+          == ["LICENSES/packages/foo-1.0/LICENSE-APACHE",
+              "LICENSES/packages/foo-1.0/LICENSE-MIT"],
+          str(entry_d.get("license_texts")))
+    root_d = out_d / "USB-WIKI-v9.9.9-win-x64"
+    check("A3.1-D 随包字节与 vendor 字节完全一致（未被改写）",
+          (root_d / "LICENSES" / "packages" / "foo-1.0" / "LICENSE-MIT"
+           ).read_bytes() == _VENDOR_FILES["LICENSE-MIT"]
+          and (root_d / "LICENSES" / "packages" / "foo-1.0" / "LICENSE-APACHE"
+               ).read_bytes() == _VENDOR_FILES["LICENSE-APACHE"])
+    prov = entry_d.get("provenance") or {}
+    check("A3.1-D 记录上游溯源（项目 / ref / commit / 原文 URL / sha256）",
+          prov.get("upstream_project") == "https://example.invalid/proj"
+          and prov.get("upstream_ref") == "v1.0"
+          and prov.get("upstream_commit") == "b" * 40
+          and len(prov.get("files") or []) == 2
+          and all(f.get("source_url") and f.get("sha256") for f in prov["files"]),
+          str(prov)[:300])
+    check("A3.1-D 记录原文库相对路径（不含绝对路径）",
+          (prov.get("vendor_source") or "").startswith("vendor/licenses/")
+          and ":" not in (prov.get("vendor_source") or ""),
+          str(prov.get("vendor_source")))
+    check("A3.1-D 注释/正文未被联网：vendor 目录可见于仓库侧",
+          (vendor_d / "PROVENANCE.json").is_file())
+    check("A3.1-D 构建产物清单里含两份许可原文",
+          "LICENSES/packages/foo-1.0/LICENSE-APACHE" in
+          (root_d / "SHA256SUMS").read_text(encoding="utf-8"))
+
+
 def _t_non_strict_never_claims_release_ready(tmp: Path) -> None:
     section("9 非 strict 构建不得自称「正式 Release 可交付」")
     fx.load_script("build_release_a3d", "build_release.py")
@@ -718,6 +978,8 @@ def run_a3_tests() -> None:
         ("verify 只读", _t_verify_is_read_only, "s10"),
         ("BUILD_INFO 无隐私", _t_build_info_has_no_private_data, "s11"),
         ("许可清单形态", _t_license_inventory_shape, "s12"),
+        ("A3.1 lock/runtime 一致性门禁", _t_lock_mismatch_gate, "s16"),
+        ("A3.1 vendor 许可原文补齐", _t_vendor_license_gate, "s17"),
         ("微型仓库 strict 全链路", _t_fake_repo_strict_build, "s13"),
         ("非 strict 不称可交付", _t_non_strict_never_claims_release_ready, "s14"),
         ("真实 strict 构建", _t_real_strict_build, "s15"),

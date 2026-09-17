@@ -81,6 +81,26 @@
 - **基础恢复路径**：损坏 App + 完好 Library → 从完好介质重装 App → Library SHA256 不变。
   **不新建 Repair Engine**；cache/index 修复沿用既有 Data Contract + rebuild 能力。
 
+### 3c. A3.1 收口（已冻结）
+
+- **`lock` 是发布基线，runtime 跟随 lock**。BUILD_INFO 记录的是这份 lock 的 SHA256，
+  那么随包运行时就必须确实由这份 lock 构建 —— 否则「可追溯」是假的。
+  **禁止**为了通过门禁反向修改 lock 去迎合旧 runtime。
+- **strict 门禁新增三条硬条件**（每条带稳定错误码，便于 CI / 售后按码定位）：
+  - `RUNTIME_LOCK_MISMATCH` —— 随包运行时与依赖锁版本不一致
+  - `LICENSE_TEXT_MISSING` —— **随包运行依赖**（lock 内）只有元数据、缺许可原文
+  - `VENDOR_LICENSE_INVALID` —— vendor 许可原文库缺件 / 被改写
+  另有 `LICENSE_REVIEW_REQUIRED_REMAINING`。失败时 stderr 额外输出一行
+  `[build] GATE FAILED codes=…` 供机器读取。
+- **本地 runtime 陈旧导致 strict FAIL 是正确行为**（记为 `LOCAL_RUNTIME_STALE`），
+  不得自动 pip install / 重建 runtime 来「修绿」；freshness 由 CI 的 fresh runtime 证明。
+- **上游不随附许可原文时用 vendor 补齐**：`vendor/licenses/<pkg>/<ver>/` 放**原字节**许可文本
+  + `PROVENANCE.json`（上游项目 / tag / **完整 commit** / 每个文件的 source_url 与 sha256）。
+  构建时**只做本地拷贝、永不联网** —— 正式发布构建必须可复现。
+- **许可文本只允许原字节**：禁止手写、翻译、重排、补全。`PROVENANCE.json` 的 sha256
+  就是这条规则的执行器（改一个字节 → `VENDOR_LICENSE_INVALID`）。
+- `metadata_only` **不是**发布完成态：随包运行依赖不得停留在该状态。
+
 ---
 
 ## 4. 当前允许推进的分类
