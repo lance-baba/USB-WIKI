@@ -108,8 +108,9 @@ def _t_missing_app() -> None:
     with _tmp() as tmp:
         bad = tmp / "badpayload"
         (bad / "python-runtime").mkdir(parents=True)
-        shutil.copy2(REPO / "runtime" / "python-3.11-embed" / "python.exe",
-                     bad / "python-runtime" / "python.exe")
+        # 只需要占位文件让 validate_payload 的「runtime 检查」通过，
+        # 从而暴露「缺 app」分支——不依赖真实嵌入式运行时（test 作业无 runtime）。
+        (bad / "python-runtime" / "python.exe").write_text("", encoding="utf-8")
         r = _install(bad, tmp / "app", tmp / "lib")
         check("缺 app/ → 安装明确失败（rc!=0）", r.returncode != 0, f"rc={r.returncode}")
 
