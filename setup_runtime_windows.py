@@ -256,15 +256,21 @@ def check() -> int:
 # Portable 发布的实际门槛是后者：跑得起来 ≠ 可以交付。
 # =====================================================================
 
+# ⚠ config.ini 不在硬清单里：它是**首次运行由程序生成的运行时文件**
+# （含明文密钥，已被 .gitignore），任何发布包 / 干净 checkout 都不该有它，
+# 视为必交付项会False-positive「不可交付」。它是否存在由运行期自检负责。
 VERIFY_ROOT_FILES = [
-    "README.md", "LICENSE", "config.ini",
+    "README.md", "LICENSE",
     "requirements.txt", "requirements-release.lock",
     "setup_runtime_windows.py",
 ]
 VERIFY_LAUNCHERS = ["启动-Windows.bat", "启动-macOS.command", "启动-Linux.sh"]
+# ⚠ data/notes、data/originals 是**用户真相源**，由运行期按需创建，
+# 不随发布包分发，也不该出现在干净 checkout 里 —— 不算交付缺项。
+# data 根目录保留（若已随仓库提交则校验其存在；运行期也会自建）。
 VERIFY_DIRS = [
     "app", "app/core", "app/api", "app/web",
-    "data", "data/notes", "data/originals",
+    "data",
     "docs", "tests",
 ]
 VERIFY_APP_PY = ["app/launcher.py", "app/server.py", "app/version.py"]

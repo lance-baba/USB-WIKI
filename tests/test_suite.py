@@ -3399,6 +3399,10 @@ def test_portable_containment() -> None:
 
         leaks: list[str] = []
         max_dirs, max_files = 60, 3000
+        # 隔离后 paths.DATA_DIR 落在临时目录下；探针笔记本身写在数据根内，
+        # 扫描临时目录会命中它自己 —— 那不是泄漏。只有落在数据根「之外」的
+        # 同名副本才算泄漏，故扫描时跳过数据根内的命中。
+        data_root = paths.DATA_DIR
         for base in hosts:
             if not base.exists():
                 continue
@@ -3411,7 +3415,13 @@ def test_portable_containment() -> None:
                     dirnames[:] = []
                 for name in filenames:
                     if token in name:
-                        leaks.append(str(Path(dirpath) / name))
+                        p = Path(dirpath) / name
+                        try:
+                            p.relative_to(data_root)
+                            continue            # 落在数据根内 = 合法写入，非泄漏
+                        except ValueError:
+                            pass
+                        leaks.append(str(p))
                     seen_files += 1
                     if seen_files >= max_files:
                         break
