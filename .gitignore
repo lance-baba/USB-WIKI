@@ -21,6 +21,11 @@ config.ini
 # ---- 个人记忆与交付产物 ----
 .workbuddy/
 
+# ---- 一次性临时脚本（约定前缀，由 setup_runtime_windows.py --clean 清理）----
+# 它们本身是垃圾，绝不该进仓库；这条规则让 `git add -A` 也不可能误提交。
+# （教训：曾把临时 CI 监视脚本 add 进提交，只能再补一笔删除。）
+scripts/_tmp_*.py
+
 # ---- Python ----
 __pycache__/
 *.py[cod]
