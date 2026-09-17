@@ -29,6 +29,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
+from tests import dist_fixture as fx                    # noqa: E402
 from app.version import APP_VERSION                     # 唯一版本源  # noqa: E402
 
 PASS: list[str] = []
@@ -82,31 +83,26 @@ class _tmp:
 
 
 def _fake_payload(tmp: Path, marker: str) -> Path:
-    """构造一个最小但能通过 validate_payload / _verify_staging 的 payload。
+    """一个最小但**介质完整**的假发布包（A3 起安装前必须先过介质校验）。
 
-    python-runtime/python.exe 用占位空文件（不能真启动，但足以让文件级事务测试跑通）。
+    夹具见 tests/dist_fixture.py：结构含 installer/ + payload/ + LICENSES/ +
+    BUILD_INFO.json + RELEASE_MANIFEST.json + SHA256SUMS，可直接通过 verify_media。
+    事务测试只关心「装到一半失败会不会毁掉旧 App」，与介质校验互不干扰。
     """
-    p = tmp / "payload"
-    (p / "app").mkdir(parents=True)
-    (p / "app" / "launcher.py").write_text(
-        f"# stub launcher (build marker: {marker})\nprint('usb-wiki')\n", encoding="utf-8")
-    (p / "app" / "VERSION.txt").write_text(marker, encoding="utf-8")
-    (p / "app" / "mod.py").write_text("X = 1\n", encoding="utf-8")
-    (p / "python-runtime").mkdir(parents=True)
-    (p / "python-runtime" / "python.exe").write_text("", encoding="utf-8")
-    return p
+    # VERSION.txt 直接写 marker（A2 各场景用 "v1"/"v2" 断言版本切换）
+    return fx.make_fake_release(tmp, app_version=marker, marker=marker)
 
 
-def _install_inproc(iw, payload, app, lib, **kw) -> int:
+def _install_inproc(iw, release, app, lib, **kw) -> int:
     try:
-        return iw.install(Path(payload), Path(app), Path(lib), **kw)
+        return iw.install(Path(release), Path(app), Path(lib), **kw)
     except SystemExit as e:
         return e.code if isinstance(e.code, int) else 1
 
 
-def _install_subprocess(payload, app, lib, extra=None) -> subprocess.CompletedProcess:
+def _install_subprocess(release, app, lib, extra=None) -> subprocess.CompletedProcess:
     cmd = [sys.executable, str(REPO / "scripts" / "install_windows.py"), "install",
-           "--source", str(payload), "--app-target", str(app),
+           "--release", str(release), "--app-target", str(app),
            "--library-target", str(lib), "--no-verify"]
     if extra:
         cmd += extra
@@ -171,13 +167,13 @@ def _t_reinstall_success_verify() -> None:
         if b.returncode != 0:
             skip("B(verify) 重装 + 真实启动验证", f"build 失败：{b.stderr[-200:]}")
             return
-        payload = dist / f"USB-WIKI-v{APP_VERSION}-win-x64" / "payload"
+        release = dist / f"USB-WIKI-v{APP_VERSION}-win-x64"
         app = tmp / "App"
         lib = tmp / "Library"
         # 先装一次
-        r1 = _install_subprocess(payload, app, lib, ["--verify", "--port", "28991"])
+        r1 = _install_subprocess(release, app, lib, ["--verify", "--port", "28991"])
         # 再装一次（重装）并验证启动
-        r2 = _install_subprocess(payload, app, lib, ["--verify", "--port", "28992"])
+        r2 = _install_subprocess(release, app, lib, ["--verify", "--port", "28992"])
         ok = r1.returncode == 0 and r2.returncode == 0
         ok &= (app / "app").is_dir() and (app / "runtime" / "python.exe").is_file()
         ok &= not (app.parent / "App.staging").exists()

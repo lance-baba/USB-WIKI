@@ -57,11 +57,10 @@ def release_zip_name(platform: str = "win-x64") -> str:
     return f"USB-WIKI-v{APP_VERSION}-{platform}.zip"
 
 
-def build_info(commit: str = "", build_time: str = "", platform: str = "windows-x64") -> dict:
-    """未来 BUILD_INFO.json 的结构（同样从单一源派生）。"""
-    return {
-        "version": APP_VERSION,
-        "commit": commit,
-        "build_time": build_time,
-        "platform": platform,
-    }
+# 说明（A3）：BUILD_INFO.json 的**生成器**是 `scripts/release_integrity.py`
+# （build_info / write_build_info），它按 `from app.version import APP_VERSION` 取值 ——
+# 即本文件仍是 app_version 的唯一来源。
+#
+# 这里刻意**不再**保留第二份 `build_info()` 结构体：两处各定义一个 BUILD_INFO 形状，
+# 迟早出现「构建脚本写 A、诊断/测试按 B 读」的漂移。结构体只允许有一个定义处。
+

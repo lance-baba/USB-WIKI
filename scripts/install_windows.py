@@ -40,6 +40,28 @@ BACKUP_SUFFIX = ".backup"
 LAUNCHER_NAME = "启动-Windows.bat"
 LIBRARY_MARKER = "library_path.txt"
 
+#: 稳定错误码：介质损坏（缺文件 / size 不符 / hash 不符 / manifest 损坏）
+MEDIA_CORRUPTED_RC = 4
+
+
+def _load_integrity():
+    """加载介质校验唯一实现。
+
+    发布态它在 installer/ 与 install.py 同目录；仓库态在 scripts/ 同目录。
+    两边都是「本文件所在目录」，因此统一把该目录挂到 sys.path 再 import。
+    """
+    here = Path(__file__).resolve().parent
+    if str(here) not in sys.path:
+        sys.path.insert(0, str(here))
+    import release_integrity  # noqa: PLC0415
+    return release_integrity
+
+
+def _default_release_root() -> Path:
+    here = Path(__file__).resolve().parent
+    # 发布态：installer/install.py → 上一级即发布根（含 payload/ 与 RELEASE_MANIFEST.json）
+    return here.parent if (here.parent / "payload").is_dir() else here
+
 
 # ---------------------------------------------------------------------------
 # 路径解析
@@ -180,16 +202,26 @@ def _verify_staging(staging: Path) -> None:
 
 
 def _can_smoke(app_target: Path) -> bool:
+    """这个 App 是否具备**真正做启动验证**的条件。
+
+    ⚠ 探测方式必须匹配嵌入式运行时的加载机制，否则门禁会「永远通过」：
+    嵌入式 Python 带 `python311._pth`，它会**接管 sys.path**、不再把 cwd 放进
+    `sys.path[0]`，因此 `python.exe -c "import app.launcher"` 在 `._pth` 运行时里
+    **必然** `ModuleNotFoundError: No module named 'app'` —— 早期版本据此判断「运行时
+    不完整」直接返回 0，等于安装后 smoke 从未真正执行（比没有门禁更危险）。
+    真实启动路径是 `python.exe app/launcher.py`（脚本目录会被加入 path），
+    所以探针也显式把 App 根加入 sys.path，与真实启动语义一致。
+    """
     if sys.platform != "win32":
         return False
     exe = app_target / "runtime" / "python.exe"
     if not exe.is_file():
         return False
-    # 必须以嵌入式运行时能够 import app 为准（不完整则跳过，避免误红）
     try:
         probe = subprocess.run(
-            [str(exe), "-c", "import app.launcher"],
-            cwd=str(app_target), capture_output=True, text=True, timeout=60)
+            [str(exe), "-c",
+             "import sys; sys.path.insert(0, '.'); import app.launcher"],
+            cwd=str(app_target), capture_output=True, text=True, timeout=120)
         return probe.returncode == 0
     except Exception:
         return False
@@ -297,8 +329,38 @@ def _run(app_target: Path, library_target: Path, port: int, no_browser: bool) ->
 # ---------------------------------------------------------------------------
 # 事务化安装主流程
 # ---------------------------------------------------------------------------
-def install(payload: Path, app_target: Path, library_target: Path,
+def fail_media(failures: list[str]) -> "None":
+    """介质损坏 —— **稳定错误码** + 明确中止。
+
+    调用点必须在创建 staging / 删除或重命名任何旧 App **之前**，
+    因此这里可以断言：已中止且未改动任何已有 App / Library。
+    """
+    print(f"[install] MEDIA_CORRUPTED：发布介质校验未通过（{len(failures)} 项）",
+          file=sys.stderr)
+    for item in failures[:20]:
+        print(f"  - {item}", file=sys.stderr)
+    if len(failures) > 20:
+        print(f"  … 其余 {len(failures) - 20} 项", file=sys.stderr)
+    print("[install] 已中止：未改动任何已有 App / Library。", file=sys.stderr)
+    raise SystemExit(MEDIA_CORRUPTED_RC)
+
+
+def verify_release(root: Path, *, deep: bool = True):
+    """只读校验发布介质（安装前闸门与 verify 命令共用同一实现）。"""
+    return _load_integrity().verify_media(root, deep=deep)
+
+
+def install(release_root: Path, app_target: Path, library_target: Path,
            launch: bool = False, port: int = 28988, smoke: bool = False) -> int:
+    release_root = Path(release_root)
+    # 0) 介质完整性 —— 必须在任何写操作之前（否则可能出现「坏文件 + 半覆盖 App」）
+    check = verify_release(release_root)
+    if not check.ok:
+        fail_media(check.failures)
+    for warning in check.warnings:
+        print(f"[install] 提示：{warning}")
+
+    payload = release_root / "payload"
     validate_payload(payload)
     ensure_library(library_target)  # 不碰已有 Library
 
@@ -355,15 +417,47 @@ def install(payload: Path, app_target: Path, library_target: Path,
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
-def _parse(argv: list[str]):
-    here = Path(__file__).resolve().parent
-    default_payload = here.parent / "payload"
+def verify_cmd(release_root: Path, *, as_json: bool = False, deep: bool = True) -> int:
+    """只读校验 U 盘发布介质。
 
-    ap = argparse.ArgumentParser(description="USB-WIKI SSD 安装器（事务化）")
+    只读保证：不建 Library、不写 App、不联网、不落任何日志文件。
+    输出**仅含相对文件路径** —— 不泄露客户目录结构。
+    """
+    check = verify_release(release_root, deep=deep)
+
+    if as_json:
+        print(json.dumps(check.as_dict(), ensure_ascii=False, indent=2))
+        return 0 if check.ok else MEDIA_CORRUPTED_RC
+
+    if check.ok:
+        print(f"OK — 发布介质完整（{check.file_count} 个文件，SHA256 全部匹配）")
+        info = check.build_info or {}
+        if info:
+            commit = str(info.get("git_commit") or "")
+            print(f"  版本 {info.get('app_version')} / 提交 {commit[:12]}"
+                  f" / 平台 {info.get('platform')} / 构建 {info.get('build_time_utc')}")
+        for warning in check.warnings:
+            print(f"  提示：{warning}")
+        return 0
+
+    print(f"MEDIA_CORRUPTED — 发布介质校验未通过（{len(check.failures)} 项）")
+    for item in check.failures[:30]:
+        print(f"  - {item}")
+    if len(check.failures) > 30:
+        print(f"  … 其余 {len(check.failures) - 30} 项")
+    print("提示：请重新获取一份完整的发布介质；本命令未改动任何文件。")
+    return MEDIA_CORRUPTED_RC
+
+
+def _parse(argv: list[str]):
+    default_root = _default_release_root()
+
+    ap = argparse.ArgumentParser(description="USB-WIKI SSD 安装器（介质校验 + 事务化）")
     sub = ap.add_subparsers(dest="cmd")
 
     pinstall = sub.add_parser("install", help="事务化安装到 SSD")
-    pinstall.add_argument("--source", default=str(default_payload), help="payload 目录")
+    pinstall.add_argument("--release", default=str(default_root),
+                          help="发布根目录（含 payload/ 与 RELEASE_MANIFEST.json）")
     pinstall.add_argument("--app-target", default=None,
                           help="App 安装目录（默认 LOCALAPPDATA\\USB-WIKI\\App）")
     pinstall.add_argument("--library-target", default=None,
@@ -376,6 +470,13 @@ def _parse(argv: list[str]):
                           help="跳过安装后启动验证")
     pinstall.add_argument("--port", type=int, default=28988)
 
+    pverify = sub.add_parser("verify", help="只读校验发布介质（不装、不改、不联网）")
+    pverify.add_argument("--release", default=str(default_root),
+                         help="发布根目录（含 RELEASE_MANIFEST.json）")
+    pverify.add_argument("--json", action="store_true", help="输出 JSON")
+    pverify.add_argument("--shallow", action="store_true",
+                         help="只校验存在性与大小，跳过 SHA256（大介质快速体检）")
+
     prun = sub.add_parser("run", help="仅启动（需先 install）")
     prun.add_argument("--app-target", default=None)
     prun.add_argument("--library-target", default=None)
@@ -385,8 +486,9 @@ def _parse(argv: list[str]):
 
     args = ap.parse_args(argv)
     if args.cmd is None:
+        # 双击 install.bat 不带参数 ⇒ 默认安装
         args.cmd = "install"
-        args.source = str(default_payload)
+        args.release = str(default_root)
         args.app_target = None
         args.library_target = None
         args.launch = False
@@ -397,6 +499,12 @@ def _parse(argv: list[str]):
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse(sys.argv[1:] if argv is None else argv)
+
+    if args.cmd == "verify":
+        return verify_cmd(Path(args.release).resolve(),
+                          as_json=getattr(args, "json", False),
+                          deep=not getattr(args, "shallow", False))
+
     app_target = Path(args.app_target).resolve() if args.app_target else _default_app_target()
     library_target = (Path(args.library_target).resolve()
                       if args.library_target else _default_library_target())
@@ -405,7 +513,7 @@ def main(argv: list[str] | None = None) -> int:
         nb = getattr(args, "no_browser", False)
         return _run(app_target, library_target, args.port, no_browser=nb)
     return install(
-        Path(args.source).resolve(), app_target, library_target,
+        Path(args.release).resolve(), app_target, library_target,
         launch=getattr(args, "launch", False),
         port=args.port,
         smoke=getattr(args, "verify", True),

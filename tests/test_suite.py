@@ -1512,8 +1512,15 @@ def test_single_version_source(ctx) -> None:
     check("User-Agent token 派生自版本源", V.USER_AGENT_TOKEN == f"WikiUSB/{V.APP_VERSION}")
     check("Git tag 派生自版本源", V.version_tag() == f"v{V.APP_VERSION}")
     check("发布包名派生自版本源", V.release_zip_name() == f"USB-WIKI-v{V.APP_VERSION}-win-x64.zip")
-    check("BUILD_INFO 结构派生自版本源",
-          V.build_info(commit="x")["version"] == V.APP_VERSION)
+    # A3：BUILD_INFO 的唯一生成器在 scripts/release_integrity.py，其 app_version 取自本文件
+    from tests import dist_fixture as _fx
+    _ri = _fx.release_integrity()
+    check("BUILD_INFO 生成器存在且 app_version 派生自版本源",
+          _ri.build_info(platform="win-x64", commit="x", python_version=None,
+                         dependency_lock_sha256=None, schema_version="1.4",
+                         data_format_version=1)["app_version"] == V.APP_VERSION)
+    check("app/version.py 不再保留第二份 BUILD_INFO 结构体（避免双定义漂移）",
+          not hasattr(V, "build_info"))
 
     # ---------- ④ launcher / server 显示值来自同一源 ----------
     lsrc = code_only((paths.BASE_DIR / "app" / "launcher.py").read_text(encoding="utf-8"))
@@ -3681,6 +3688,13 @@ def main() -> int:
         PASS.extend(_a2p)
         FAIL.extend(_a2f)
         SKIP.extend(_a2s)
+        # A3：Release Integrity / BUILD_INFO / SHA256SUMS / 第三方许可（临时目录，全负向构造）
+        from tests.test_distribution_a3 import run_a3_tests
+        run_a3_tests()
+        from tests.test_distribution_a3 import PASS as _a3p, FAIL as _a3f, SKIP as _a3s
+        PASS.extend(_a3p)
+        FAIL.extend(_a3f)
+        SKIP.extend(_a3s)
         test_duplicate_url_detection(ctx)
         test_localhost_security(ctx)
         test_static_assets_serving(ctx)

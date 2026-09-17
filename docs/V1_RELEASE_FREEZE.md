@@ -55,6 +55,34 @@
 
 ---
 
+## 3b. Distribution Layer A3（已冻结）
+
+- **发布介质必须自证完整**：`RELEASE_MANIFEST.json`（相对路径 / POSIX 分隔符 / 固定排序 /
+  含 size + sha256 / **不含自身**）与传统 `SHA256SUMS` 由**同一套枚举**产出，不允许两套实现漂移。
+- **`BUILD_INFO.json` 字段一律取已有唯一来源**，禁止再次硬编码：
+  `app_version ← app/version.py`；`schema_version ← app/core/migrations.py::CURRENT_SCHEMA_VERSION`；
+  `data_format_version ← app/core/library.py::DATA_FORMAT_VERSION`；
+  `dependency_lock_sha256 ← requirements-release.lock 实际 SHA256`；
+  `release_format_version ← scripts/release_integrity.py::FORMAT_VERSION`。
+  **绝不含**用户名 / 绝对路径 / HOME / LOCALAPPDATA / IP / 机器标识 / key。
+- **安装前先验介质**：`install` 必须在创建 staging、删除或重命名任何旧 App **之前**
+  校验 存在性 / size / SHA256；缺文件 / hash 不符 / manifest 损坏 → `MEDIA_CORRUPTED`（rc=4）立即中止。
+  **严禁**「发现一个坏文件 → 先覆盖一半 App → 再报错」。
+- **`verify` 只读命令**：只校验 U 盘介质，不建 Library、不改 App、不联网；
+  输出 `OK` 或 `MEDIA_CORRUPTED` + 失败的**相对**文件（不输出客户隐私路径）。
+- **SHA256 只为 Integrity**（介质损坏检测），**不做 Authenticity**：不签名、不加密、
+  不做激活 / DRM / license key / updater。Code Signing 留到 Release / RC Gate 再判断。
+- **第三方许可清单 `LICENSES/`** 只审**本 Release 实际随包分发**的内容；
+  当前无 bundled Ollama / LLM / GGUF / ONNX model，就不替它们收 license。
+  许可**不允许猜**：元数据无法可靠确认时标 `LICENSE_REVIEW_REQUIRED`，正式 V1 前必须清零。
+- **strict 门禁**（`--strict`）成功条件：app / 嵌入式 runtime / installer / BUILD_INFO /
+  LICENSES inventory 完整 / RELEASE_MANIFEST / SHA256SUMS / 最终介质自校验，全通过才退出 0。
+  非 strict 可宽松，但**不得**输出「正式 Release 可交付」字样。
+- **基础恢复路径**：损坏 App + 完好 Library → 从完好介质重装 App → Library SHA256 不变。
+  **不新建 Repair Engine**；cache/index 修复沿用既有 Data Contract + rebuild 能力。
+
+---
+
 ## 4. 当前允许推进的分类
 
 | 分类 | 含义 | 处理 |
@@ -77,7 +105,10 @@
 
 ---
 
-## 6. 明确不在 A1 / A2 范围（冻结前不做）
+## 6. 明确不在 A1 / A2 / A3 范围（冻结前不做）
 
 Repair Engine / Ollama 安装 / 模型下载 / GGUF / ONNX 最终策略 / 模型推荐 / OCR / Reranker /
-新 UI / LICENSES 汇总 / BUILD_INFO 最终版 / SHA256SUMS 最终版 / ZIP / GitHub Release / Tag。
+新 UI / 云同步 / 激活 / updater / 代码签名 / 私钥 / ZIP / GitHub Release / Tag / RC 测试。
+
+（`LICENSES` 汇总 / `BUILD_INFO` / `SHA256SUMS` 已在 A3 完成初版；仍**不含**模型类资源，
+待 A4 决定真正捆绑什么后再纳入同一机制。）

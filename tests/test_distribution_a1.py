@@ -26,6 +26,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
+from tests import dist_fixture as fx                    # noqa: E402
 from app.version import APP_VERSION                     # 唯一版本源  # noqa: E402
 
 PASS: list[str] = []
@@ -82,13 +83,29 @@ def _build(tmp: Path) -> Path:
     return dist / f"USB-WIKI-v{APP_VERSION}-win-x64"
 
 
-def _install(payload: Path, app: Path, lib: Path) -> subprocess.CompletedProcess:
+def _install(release: Path, app: Path, lib: Path) -> subprocess.CompletedProcess:
     return subprocess.run(
         [sys.executable, str(REPO / "scripts" / "install_windows.py"), "install",
-         "--source", str(payload), "--app-target", str(app),
-         "--library-target", str(lib)],
+         "--release", str(release), "--app-target", str(app),
+         "--library-target", str(lib), "--no-verify"],
         capture_output=True, text=True,
     )
+
+
+def _broken_release(tmp: Path, *, drop_app: bool) -> Path:
+    """造一个**介质完整**但 payload 结构有缺陷的发布包。
+
+    A3 起安装前先过介质闸门；因此「payload 缺 app / 缺 runtime」这类结构性缺陷
+    必须在**介质校验通过之后**才暴露 —— 删掉文件后重新生成清单即可精确命中
+    `validate_payload` 分支（否则测的只是介质闸门，覆盖不到结构校验）。
+    """
+    root = fx.make_fake_release(tmp, app_version="1.0.0")
+    if drop_app:
+        shutil.rmtree(root / "payload" / "app")
+    else:
+        shutil.rmtree(root / "payload" / "python-runtime")
+    fx.write_release_artifacts(root, app_version="1.0.0")
+    return root
 
 
 def _t_build() -> None:
@@ -106,22 +123,19 @@ def _t_build() -> None:
 
 def _t_missing_app() -> None:
     with _tmp() as tmp:
-        bad = tmp / "badpayload"
-        (bad / "python-runtime").mkdir(parents=True)
-        # 只需要占位文件让 validate_payload 的「runtime 检查」通过，
-        # 从而暴露「缺 app」分支——不依赖真实嵌入式运行时（test 作业无 runtime）。
-        (bad / "python-runtime" / "python.exe").write_text("", encoding="utf-8")
+        bad = _broken_release(tmp, drop_app=True)
         r = _install(bad, tmp / "app", tmp / "lib")
         check("缺 app/ → 安装明确失败（rc!=0）", r.returncode != 0, f"rc={r.returncode}")
+        check("缺 app/ 属结构校验（非介质损坏）", r.returncode == 2, f"rc={r.returncode}")
 
 
 def _t_missing_runtime() -> None:
     with _tmp() as tmp:
-        bad = tmp / "badpayload"
-        (bad / "app").mkdir(parents=True)
+        bad = _broken_release(tmp, drop_app=False)
         r = _install(bad, tmp / "app", tmp / "lib")
         check("缺 python-runtime/python.exe → 安装明确失败（rc!=0）",
               r.returncode != 0, f"rc={r.returncode}")
+        check("缺 runtime 属结构校验（非介质损坏）", r.returncode == 2, f"rc={r.returncode}")
 
 
 def _t_preserves_existing_library() -> None:
@@ -133,7 +147,7 @@ def _t_preserves_existing_library() -> None:
         lib = tmp / "lib"
         (lib / "notes").mkdir(parents=True)
         (lib / "notes" / "seed.md").write_text("seed-content", encoding="utf-8")
-        r = _install(root / "payload", tmp / "app", lib)
+        r = _install(root, tmp / "app", lib)
         preserved = (lib / "notes" / "seed.md").read_text(encoding="utf-8") == "seed-content"
         check("已有 Library → 安装后原文件不被覆盖",
               r.returncode == 0 and preserved, f"rc={r.returncode} preserved={preserved}")
@@ -149,9 +163,9 @@ def _t_reinstall_sha256_stable() -> None:
         (lib / "notes").mkdir(parents=True)
         (lib / "notes" / "a.md").write_text("aaa", encoding="utf-8")
         app = tmp / "app"
-        r1 = _install(root / "payload", app, lib)
+        r1 = _install(root, app, lib)
         h1 = _sha256_tree(lib)
-        r2 = _install(root / "payload", app, lib)
+        r2 = _install(root, app, lib)
         h2 = _sha256_tree(lib)
         check("重装前后 Library SHA256 完全一致",
               r1.returncode == 0 and r2.returncode == 0 and h1 == h2,
@@ -165,9 +179,8 @@ def _t_failure_leaves_library() -> None:
         (lib / "notes").mkdir(parents=True)
         (lib / "notes" / "keep.md").write_text("keep", encoding="utf-8")
         h0 = _sha256_tree(lib)
-        # 用缺 python-runtime 的 payload 触发安装失败
-        bad = tmp / "badpayload"
-        (bad / "app").mkdir(parents=True)
+        # 用缺 python-runtime 的发布包触发安装失败（介质完整、结构有缺陷）
+        bad = _broken_release(tmp / "bad", drop_app=False)
         r = _install(bad, tmp / "app", lib)
         h1 = _sha256_tree(lib)
         check("安装失败 → Library SHA256 完全一致",
@@ -185,7 +198,7 @@ def _t_launch_smoke() -> None:
         root = _build(tmp)
         app = tmp / "app"
         lib = tmp / "lib"
-        r = _install(root / "payload", app, lib)
+        r = _install(root, app, lib)
         if r.returncode != 0:
             skip("embedded runtime 启动 smoke", f"install 失败：{r.stderr[-200:]}")
             return
@@ -194,8 +207,12 @@ def _t_launch_smoke() -> None:
             skip("embedded runtime 启动 smoke", "未找到嵌入式 python.exe")
             return
         # 先确认嵌入式运行时能 import app（不完整则跳过，避免误红）
-        probe = subprocess.run([str(exe), "-c", "import app.launcher"],
-                               cwd=str(app), capture_output=True, text=True, timeout=60)
+        # ⚠ 必须显式把 App 根加入 sys.path：嵌入式 `._pth` 接管 sys.path 后 cwd 不在其中，
+        # 裸 `-c "import app.launcher"` 必然失败 —— 那会把「运行时完好」误判成「不完整」，
+        # 让本用例永远是 skip（而不是 red），等于这条验收不存在。
+        probe = subprocess.run(
+            [str(exe), "-c", "import sys; sys.path.insert(0, '.'); import app.launcher"],
+            cwd=str(app), capture_output=True, text=True, timeout=120)
         if probe.returncode != 0:
             skip("embedded runtime 启动 smoke",
                  "嵌入式运行时不完整（import app.launcher 失败）")
