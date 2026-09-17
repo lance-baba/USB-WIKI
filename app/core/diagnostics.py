@@ -308,22 +308,65 @@ def _vec_available() -> bool:
 # --------------------------------------------------------------------------
 # AI / Runtime 探针
 # --------------------------------------------------------------------------
-def _ai_probe(get_cfg, ollama_probe, issues: list) -> dict:
+def _ai_probe(get_cfg, ollama_probe, issues: list, runtime_ai=None) -> dict:
+    """AI 能力诊断（A4.1 契约）。
+
+    只回答两个问题：**嵌入能不能用**、**对话能不能用**。
+
+    ⚠ 键名必须与真实配置一致。此前这里读的是 `AI.ollama_base` /
+    `AI.ollama_model` / `SYSTEM.embedding_source` —— 三个键在配置里都不存在，
+    于是「已配置」恒为 False：**诊断报告自己先说假话**，比不报告更危险。
+    """
     provider = str(get_cfg("AI", "provider", "") or "")
     api_key_set = bool(str(get_cfg("AI", "api_key", "") or ""))
-    ollama_base = redact.sanitize_url_userinfo(str(get_cfg("AI", "ollama_base", "") or ""))
+    ollama_base = redact.sanitize_url_userinfo(str(get_cfg("AI", "ollama_host", "") or ""))
     api_base = redact.sanitize_url_userinfo(str(get_cfg("AI", "api_base_url", "") or ""))
-    emb_src = str(get_cfg("SYSTEM", "embedding_source", "") or "")
+    selected = str(get_cfg("AI", "ollama_chat_model", "") or "").strip()
+    emb_src = str(get_cfg("AI", "embedding_source", "") or "")
 
     out = {
+        # --- 兼容既有字段（前端/测试读它们）---
         "provider": provider or None,
         "ollama_configured": bool(ollama_base),
         "ollama_reachable": None,          # 只在显式提供 probe 时才探测
-        "model_configured": bool(str(get_cfg("AI", "ollama_model", "") or "")),
+        "model_configured": bool(selected),
         "embedding_source": emb_src or None,
         "cloud_api_configured": bool(api_base and api_key_set),
         "api_key_set": api_key_set,
+        # --- A4.1：embedding / chat 两段契约 ---
+        "embedding": {"source": emb_src or None, "ready": None, "fallback_reason": None},
+        "chat": {
+            # ⚠ 这里是**本次实际解析出的**提供方，不是配置里的模式 ——
+            #   静态诊断拿不到解析结果时保持 None，不要拿 "auto" 冒充「当前在用的」。
+            "provider": None,
+            "ollama_available": None,
+            "installed_model_count": None,
+            "selected_model": selected or None,
+            "selected_model_installed": None,
+            "ready": None,
+            "reason": None,
+        },
     }
+
+    # 运行时状态优先（有 ctx 时最准，且只读缓存、不发网络请求）
+    if callable(runtime_ai):
+        try:
+            live = runtime_ai() or {}
+        except Exception as exc:  # noqa: BLE001 - 探测失败不阻塞诊断
+            live = {}
+            issues.append(_issue("AI_RUNTIME_PROBE_FAILED", WARN, False, "ai",
+                                 f"运行时 AI 状态读取失败（不影响诊断）：{exc}"))
+        emb = live.get("embedding") or {}
+        for key in ("source", "ready", "fallback_reason"):
+            if key in emb:
+                out["embedding"][key] = emb[key]
+        if out["embedding"]["source"] is None and emb_src:
+            out["embedding"]["source"] = emb_src
+        chat = live.get("chat") or {}
+        for key in ("provider", "ollama_available", "installed_model_count",
+                    "selected_model", "selected_model_installed", "ready", "reason"):
+            if key in chat and chat[key] is not None:
+                out["chat"][key] = chat[key]
 
     if out["ollama_configured"] and callable(ollama_probe):
         try:
@@ -332,6 +375,16 @@ def _ai_probe(get_cfg, ollama_probe, issues: list) -> dict:
             out["ollama_reachable"] = False
             issues.append(_issue("OLLAMA_PROBE_FAILED", WARN, False, "ai",
                                  f"Ollama 探测失败（不影响诊断）：{exc}"))
+
+    # 兜底：没有运行时信息时，至少让 chat 段自洽（不让 ready/reason 空着）
+    if out["chat"]["ollama_available"] is None and out["ollama_reachable"] is not None:
+        out["chat"]["ollama_available"] = out["ollama_reachable"]
+    if out["chat"]["ready"] is None:
+        out["chat"]["ready"] = False
+        out["chat"]["reason"] = out["chat"]["reason"] or (
+            "未探测到可用的本地对话模型" if out["chat"]["ollama_available"] is False
+            else "未提供运行时状态（静态诊断）"
+        )
     return out
 
 
@@ -377,7 +430,8 @@ def _app_probe() -> dict:
 # --------------------------------------------------------------------------
 # 汇总
 # --------------------------------------------------------------------------
-def collect(*, library_root: Path | None = None, ollama_probe=None) -> dict:
+def collect(*, library_root: Path | None = None, ollama_probe=None,
+            runtime_ai=None) -> dict:
     """收集只读诊断报告。
 
     任何 probe 抛异常都不会中断整体收集 —— 该 probe 记为 ERROR issue，
@@ -386,6 +440,9 @@ def collect(*, library_root: Path | None = None, ollama_probe=None) -> dict:
     :param library_root: 资料库根目录；缺省用当前配置的 ``paths.DATA_DIR``。
     :param ollama_probe: 可注入的 Ollama 可达性探测（返回 bool）；
         传 None 则跳过探测（CI / 离线环境确定性）。
+    :param runtime_ai: 可注入的运行时 AI 状态（返回
+        ``{"embedding": {source, ready, fallback_reason}, "chat": {...}}``）；
+        server 侧由 ctx 提供，CLI 单跑时省略 —— 省略后 chat 段退化为配置级信息。
     """
     issues: list = []
     report: dict = {"status": UNKNOWN, "app": {}, "library": {}, "database": {},
@@ -433,7 +490,7 @@ def collect(*, library_root: Path | None = None, ollama_probe=None) -> dict:
 
     # --- AI（只查能力；Ollama 探测必须由调用方显式注入）---
     try:
-        report["ai"] = _ai_probe(_cfg_get, ollama_probe, issues)
+        report["ai"] = _ai_probe(_cfg_get, ollama_probe, issues, runtime_ai)
     except Exception as exc:  # noqa: BLE001
         issues.append(_issue("AI_PROBE_FAILED", WARN, False, "ai",
                              f"AI 配置读取失败：{exc}"))

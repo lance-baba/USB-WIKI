@@ -188,12 +188,29 @@ Wiki-USB/
 provider = auto                      ; auto / ollama / api / offline
 api_base_url = https://api.deepseek.com/v1
 api_key =                            ; 明文存储，公共设备请勿留存高余额 Key
-api_chat_model = deepseek-chat
+api_chat_model = deepseek-chat       ; 云端接口的模型名（仅在用云端时生效）
 ollama_host = http://127.0.0.1:11434
-ollama_chat_model = qwen2.5:3b
-embedding_source = local_onnx        ; local_onnx / ollama / api
+ollama_chat_model =                  ; 留空＝未选择：由你在「设置 → AI」里挑本机模型
+embedding_source = local_onnx        ; local_onnx / ollama / api / local_hash
 embedding_dim = 512
 ```
+
+### AI 能力分三层，缺哪层都不影响基础使用
+
+| 层 | 能力 | 依赖 |
+| :--- | :--- | :--- |
+| **Level 1 基础知识库** | 启动 / 导入 / 查看 / FTS 检索 / 返回引用 | **无任何 AI 依赖** |
+| **Level 2 本地语义检索** | 向量召回（`local_onnx` → `ollama` → `api` 逐级降级） | 嵌入源可用；不可用则退化为纯 FTS5 |
+| **Level 3 生成式对话** | 自然语言总结回答 | **你选择的**本地 Ollama 模型，或已配置的云端 API |
+
+**对话模型没有默认值。** 程序不会替你预设、也不会自动挑第一个本机模型 ——
+`ollama_chat_model` 留空时状态为 `selection_required`，由你在设置页显式选择。
+就绪状态一览：`no_runtime`（没装 Ollama）/ `no_model`（Ollama 在线但无模型）/
+`selection_required`（有模型未选）/ `model_missing`（选过的模型被删）/
+`ready`（可对话）。只有 `ready` 时 `provider` 才会是 `ollama`。
+
+> **没有可用对话模型时**：程序**不会**报错或阻塞 —— 知识库检索、引用、导入全部照常，
+> 问答自动转为「纯离线检索回答」（`provider=offline`），并明确标注未调用大模型。
 
 > **向量空间签名守卫**：库内 `sys_meta.embedding_signature` 会记录嵌入模型与维度。
 > 一旦在配置里更换模型或维度，控制台将常驻黄色告警并**强制阻断向量召回**，

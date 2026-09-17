@@ -135,6 +135,61 @@ Repair Engine / Ollama 安装 / 模型下载 / GGUF / ONNX 最终策略 / 模型
 
 ---
 
+## 6b. AI 能力分层（A4.1 冻结，2026-09-17）
+
+### 三层能力，缺哪层都不影响基础使用
+
+| 层 | 能力 | 依赖 |
+| :--- | :--- | :--- |
+| **Level 1 基础知识库** | 启动 / 导入 / 查看 / FTS 检索 / 返回结果 / 显示引用来源 | **永不依赖 LLM**（无 Ollama、无聊天模型、无显卡、无网络也必须可用） |
+| **Level 2 本地语义检索** | 向量召回，低配 CPU 可跑，**不要求 Ollama** | 嵌入源链；不可用即退化为纯 FTS5 |
+| **Level 3 生成式对话** | 自然语言总结回答 | **用户选择的**本地 Ollama 模型，或已配置的云端 API |
+
+### Level 2
+
+- 现状链（**不推翻**）：`local_onnx` → `ollama` → `api` → 最终整体关闭向量路（`source=none`）。
+- `local_onnx` = V1 正常本地 semantic baseline。
+- `local_hash` = 降级 / 灾难兜底，**以 `embedding_source = local_hash` 显式启用**
+  （不自动进入：哈希向量会覆写主源签名 → 形成「降级→重建」的破坏性循环）。
+- **本阶段不选具体 ONNX artifact**：型号 / 来源 / SHA256 / license / CPU 实测一律留到 A4.2。
+
+### Level 3
+
+- **V1 标准版不要求随盘自带 LLM。** 模型来源正式允许三类，Core 不得写死任何一种：
+  `existing`（客户机已有 Ollama + 模型）· `downloadable`（客户同意后联网下载）·
+  `bundled`（未来某 SKU 随盘提供）。**A4.1 只实现 `existing`**，另两类仅保留契约。
+- **聊天模型没有默认值**：`ollama_chat_model` 新安装为空，Core 不得预设、也不得自动挑
+  `models[0]`（本机模型可能是 embedding / vision / 资源超标的模型）。
+- **就绪状态（稳定枚举）**：
+
+  | state | 含义 | 是否允许 provider=ollama |
+  | :--- | :--- | :--- |
+  | `no_runtime` | 本机无可用 Ollama | ❌ |
+  | `no_model` | Ollama 在线但一个模型都没有 | ❌ |
+  | `selection_required` | 有模型但用户未选 | ❌ |
+  | `model_missing` | 选过的模型在本机已不存在 | ❌ |
+  | `ready` | 已选择且本机可用 | ✅ |
+
+  ⚠ **Ollama 进程活着 ≠ 可以对话**：`ollama_healthy` 只表示 `/api/tags` 可访问。
+  是否可对话一律看 `chat_ready`。
+
+- **auto 解析顺序**：有效 Ollama 所选模型 → `ollama`；否则有明确配置的 API → `api`；
+  否则 `offline`（**仍允许知识检索**）。
+- `provider = ollama` 模式表示用户明确要求**只走本地**（内容不上云），不就绪时降级为
+  `offline`，**绝不改走 `api`**。
+- **旧配置兼容**：既有 `ollama_chat_model=xxx` 继续读取；存在即 `ready`，
+  不存在即 `model_missing`，**不静默替换成其它模型**。
+- **无可用聊天模型时**（硬要求）：不报启动失败、不阻止导入 / 搜索、不删索引、
+  不改 embedding signature、不假装 AI 可用；明确说明「本地 AI 模型尚未配置」，
+  问答转 `provider=offline` 的纯离线检索回答，且**不得把检索结果伪装成 LLM 生成**。
+
+### 本阶段不决定（留 A4.2 / A4.3）
+
+具体 ONNX embedding 型号 · ONNX artifact 来源 / SHA256 / license · 是否 bundle Ollama runtime ·
+推荐聊天模型 · 2B / 4B · 默认下载模型 · 在线下载 UX · 完全离线 SKU。
+
+---
+
 ## 7. CI 触发策略（2026-09-17 生效）
 
 **普通 `main` push 仅作为云端备份，不触发 Full CI。**

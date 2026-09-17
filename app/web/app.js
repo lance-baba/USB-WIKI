@@ -131,6 +131,20 @@ function renderAlerts(d) {
   $$("#alerts .alert button").forEach(b => b.onclick = e => e.target.parentElement.remove());
 }
 
+/* 对话能力状态文案（后端 ai.state 是稳定枚举，前端只做展示映射）
+   ⚠ 不在这里推荐任何具体模型 —— 产品尚未拍板推荐型号。 */
+function chatStateText(ai) {
+  if (!ai) return "—";
+  if (ai.chat_ready) return "✅ 就绪" + (ai.selected_model ? "（" + ai.selected_model + "）" : "");
+  const map = {
+    no_runtime: "未检测到本地 Ollama",
+    no_model: "Ollama 已启动，但本机尚无模型",
+    selection_required: "本机已有模型，请选择用哪个对话",
+    model_missing: "原配置的模型在本机已不存在",
+  };
+  return (map[ai.state] || "尚未配置") + (ai.reason ? "：" + ai.reason : "");
+}
+
 function fillAppVersion(d) {
   // 版本来自 /api/status（后端单一源 app/version.py），前端不自己硬编码
   const el = document.getElementById('appVer');
@@ -149,6 +163,9 @@ function renderStats(d) {
     ["嵌入源 / 维度", (emb.source || "—") + " / " + (emb.dim || "—")],
     ["嵌入签名", emb.signature ? (emb.signature.model + "@" + emb.signature.dim) : "—"],
     ["AI 模式 / 实际", (ai.provider_mode || "—") + " / " + (ai.resolved || "—")],
+    ["对话能力", chatStateText(ai)],
+    ["本机模型", (ai.installed_model_count || 0) + " 个" +
+      (ai.selected_model ? "，已选 " + ai.selected_model : "，未选择")],
     ["Ollama 探测", ai.ollama_healthy ? "在线" : ("离线 (" + (ai.ollama_detail || "—") + ")")],
     ["API Key", ai.api_key_configured ? "已配置" : "未配置"],
     ["同步轮次 / 更新", (syn.cycles || 0) + " / " + ((syn.indexed || 0) + (syn.updated || 0))],
@@ -811,7 +828,8 @@ const CFG_SCHEMA = [
       { key: "ollama_host", label: "Ollama 服务地址", type: "text", placeholder: "http://127.0.0.1:11434",
         tip: "Ollama 装在本机就用默认值，别改。" },
       { key: "ollama_chat_model", label: "本地对话模型", type: "ollama-model",
-        tip: "从你本机已安装的 Ollama 模型里挑一个。列表是空的就先在命令行跑：ollama pull qwen2.5:3b" },
+        tip: "从你本机已安装的 Ollama 模型里挑一个。程序不会替你预设或自动选择任何模型；" +
+             "本机还没有模型时请先用 Ollama 自行安装，然后点「刷新模型列表」。" },
       { key: "api_base_url", label: "云端接口地址", type: "preset-text", placeholder: "https://api.deepseek.com/v1",
         tip: "选一家常用服务商，或自己填兼容 OpenAI 协议的地址。",
         options: [["https://api.deepseek.com/v1", "DeepSeek"], ["https://dashscope.aliyuncs.com/compatible-mode/v1", "通义千问"], ["https://api.moonshot.cn/v1", "Kimi 月之暗面"], ["https://open.bigmodel.cn/api/paas/v4", "智谱 GLM"], ["https://api.openai.com/v1", "OpenAI"]] },
@@ -982,7 +1000,7 @@ async function refreshOllamaModels() {
   }
 
   sels.forEach(sel => {
-    const current = sel.value;
+    const current = String(sel.value || "").trim();
     const field = sel.closest(".ollama-ctl").parentElement;
     const hint = field.querySelector(".ollama-hint");
     if (!d.available) {
@@ -991,7 +1009,7 @@ async function refreshOllamaModels() {
       inp.dataset.sec = sel.dataset.sec;
       inp.dataset.key = sel.dataset.key;
       inp.value = current;
-      inp.placeholder = "qwen2.5:3b";
+      inp.placeholder = "填写你本机已安装的模型名";
       sel.replaceWith(inp);
       if (hint) hint.innerHTML = "⚠ " + esc(d.detail || "未检测到本地 Ollama") +
         " —— 已切换为手动填写。装好 Ollama 后点「刷新模型列表」可恢复下拉。";
@@ -999,14 +1017,31 @@ async function refreshOllamaModels() {
     }
     const models = d.models || [];
     const bits = m => [m.params, m.size_text].filter(Boolean).join(" · ");
-    sel.innerHTML = models.map(m =>
-      '<option value="' + esc(m.name) + '">' + esc(m.name) +
-      (bits(m) ? "　" + esc(bits(m)) : "") + "</option>").join("") +
-      (current && !models.some(m => m.name === current)
-        ? '<option value="' + esc(current) + '">' + esc(current) + "（当前配置）</option>" : "");
-    sel.value = models.some(m => m.name === current) ? current
-              : (current || (models[0] ? models[0].name : ""));
-    if (hint) hint.innerHTML = "✅ " + esc(d.detail) + "　（Ollama：" + esc(d.host) + "）";
+    const installed = models.some(m => m.name === current);
+    sel.innerHTML = '<option value="">— 未选择（请从下方本机模型里挑一个）—</option>' +
+      (current && !installed
+        ? '<option value="' + esc(current) + '">' + esc(current) + "（原配置，本机未找到）</option>"
+        : "") +
+      models.map(m =>
+        '<option value="' + esc(m.name) + '">' + esc(m.name) +
+        (bits(m) ? "　" + esc(bits(m)) : "") + "</option>").join("");
+    // ⚠ **绝不自动选中 models[0]**：用户没选就保持「未选择」。
+    //   本机模型可能是 embedding 模型、vision 模型，或资源要求过高的模型 ——
+    //   替用户挑一个等于偷偷替他拍板。选了就在保存时显式持久化。
+    sel.value = current;
+    if (hint) {
+      if (!models.length) {
+        hint.innerHTML = "⚠ Ollama 在线，但本机尚未安装任何模型 —— " +
+          "请先用 Ollama 装好模型，再点「刷新模型列表」。";
+      } else if (!current) {
+        hint.innerHTML = "发现 " + models.length + " 个本机模型，请选择一个作为本地对话模型" +
+          "（程序不会自动替你选）。";
+      } else if (!installed) {
+        hint.innerHTML = "⚠ 原配置的「" + esc(current) + "」在本机已不存在，请重新选择。";
+      } else {
+        hint.innerHTML = "✅ 当前模型：" + esc(current) + "　（Ollama：" + esc(d.host) + "）";
+      }
+    }
   });
 }
 

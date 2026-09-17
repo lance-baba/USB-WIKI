@@ -41,7 +41,11 @@ api_chat_model = deepseek-chat
 
 # --- 本地 Ollama 守护进程配置 ---
 ollama_host = http://127.0.0.1:11434
-ollama_chat_model = qwen2.5:3b
+# ⚠ 本地对话模型**故意留空**：产品尚未推荐任何模型，Core 不得替用户预设。
+#   留空时程序会报告 selection_required，由用户在「设置 → AI → 本地对话模型」
+#   里从**本机已安装**的模型中选择；选之前不会自动挑任何一个（也不猜 models[0]）。
+#   升级用户原有的值会被原样保留，不会静默改写。
+ollama_chat_model =
 
 # --- 向量模型配置 ---
 # local_onnx(内置微型 bge-small-zh) / ollama(通过 ollama 计算) / api(通过 API 计算)

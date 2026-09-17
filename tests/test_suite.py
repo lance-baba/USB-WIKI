@@ -3695,6 +3695,13 @@ def main() -> int:
         PASS.extend(_a3p)
         FAIL.extend(_a3f)
         SKIP.extend(_a3s)
+        # A4.1：AI 能力分层契约 / Ollama 就绪状态 / 去隐藏默认模型（不联网、不装 Ollama）
+        from tests.test_ai_contract_a41 import run_a41_tests
+        run_a41_tests()
+        from tests.test_ai_contract_a41 import PASS as _a41p, FAIL as _a41f, SKIP as _a41s
+        PASS.extend(_a41p)
+        FAIL.extend(_a41f)
+        SKIP.extend(_a41s)
         test_duplicate_url_detection(ctx)
         test_localhost_security(ctx)
         test_static_assets_serving(ctx)

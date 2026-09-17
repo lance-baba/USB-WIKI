@@ -216,6 +216,39 @@ class AppContext:
             return {"ok": False, "error": "上下文未初始化"}
         return indexer.rebuild_all(self.db, self.embedder, recreate_vec=recreate_vec)
 
+    def ai_readiness(self) -> dict:
+        """Level 3 对话能力就绪状态（**只读缓存**，不触发网络探测）。
+
+        供 /api/status 与诊断复用；现场探测走 ``gateway.ai_readiness(probe=True)``
+        或 ``/api/ollama/models``（设置页用）。
+        """
+        if self.gateway is None:
+            return {
+                "state": llm.STATE_NO_RUNTIME, "reason": "服务尚未初始化完成",
+                "chat_ready": False, "ollama_available": False, "ollama_probed": False,
+                "installed_models": [], "installed_model_count": 0,
+                "selected_model": None, "selected_model_installed": False,
+                "cloud_api_configured": False,
+            }
+        try:
+            ready = self.gateway.ai_readiness()
+        except Exception as exc:  # noqa: BLE001 - 状态展示失败不得影响 /api/status
+            log.debug("AI 就绪状态解析失败: %s", exc)
+            return {
+                "state": llm.STATE_NO_RUNTIME, "reason": "就绪状态解析失败",
+                "chat_ready": False, "ollama_available": False, "ollama_probed": False,
+                "installed_models": [], "installed_model_count": 0,
+                "selected_model": None, "selected_model_installed": False,
+                "cloud_api_configured": False,
+            }
+        return {
+            k: ready[k] for k in (
+                "state", "reason", "chat_ready", "ollama_available", "ollama_probed",
+                "installed_models", "installed_model_count", "selected_model",
+                "selected_model_installed", "cloud_api_configured",
+            )
+        }
+
     def status(self) -> dict:
         if self.db is None:
             return {"ready": False}
@@ -236,11 +269,14 @@ class AppContext:
             },
             "ai": {
                 "provider_mode": config.get_str("AI", "provider", "auto"),
+                # ⚠ ollama_healthy 只表示「/api/tags 可访问」，不代表能对话；
+                #   能否对话看 state / chat_ready（A4.1 契约）。
                 "ollama_healthy": bool(gw_state and gw_state.ollama_healthy),
                 "ollama_detail": gw_state.ollama_detail if gw_state else "",
                 "api_key_configured": bool(config.get_str("AI", "api_key", "")),
                 "resolved": gw_state.last_provider if gw_state else "",
                 "last_error": gw_state.last_error if gw_state else "",
+                **self.ai_readiness(),
             },
             "sync": self.syncer.status() if self.syncer else {"running": False},
             "warnings": list(self.warnings),      # 需行动 → 顶部告警条
