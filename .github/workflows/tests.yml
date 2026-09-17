@@ -161,6 +161,20 @@ jobs:
         shell: bash
         run: runtime/python-3.11-embed/python.exe setup_runtime_windows.py --check
 
+    # A4.2b Stage Gate：取件 pinned embedding 资源（字节不进 Git，vendor/cache/ 已忽略）
+    # 用维护者侧契约 resources/embedding/default.json，pin 死 revision 逐文件 SHA256 校验，
+    # 绝不从 main/latest 拉取。取不到则后续严格构建的 EMBEDDING_* 门禁会失败。
+      - name: 获取 pinned embedding 资源（取件 + SHA256 校验）
+        shell: bash
+        run: |
+          set +e
+          python scripts/fetch_embedding_resource.py > fetch-out.txt 2>&1
+          rc=$?
+          set -e
+          cat fetch-out.txt
+          echo "embedding fetch rc=$rc"
+          exit "$rc"
+
       - name: 用嵌入式 Python 跑测试套件（这才是产品形态）
         shell: bash
         run: |
@@ -170,6 +184,27 @@ jobs:
           set -e
           grep -aE "TOTAL=|通过 .* 项" portable-out.txt || true
           cat portable-out.txt
+          exit "$rc"
+
+    # A4.2b Stage Gate：严格发布构建（fresh embedded runtime 由当前 lock 构建 →
+    # RUNTIME_LOCK_MISMATCH=0 / LOCK_ENTRY_MISSING=0）。取件已完成，资源会被本地拷贝进
+    # payload/embedding，绝不联网。任一门禁失败即非零退出（_fail_build → SystemExit(1)）。
+      - name: 严格发布构建 + A4.2b Stage Gate（build_release.py --strict）
+        shell: bash
+        run: |
+          set +e
+          runtime/python-3.11-embed/python.exe scripts/build_release.py --strict --output dist/a42b-strict > strict-out.txt 2>&1
+          rc=$?
+          set -e
+          cat strict-out.txt
+          echo "=== A4.2b Stage Gate 证据 ==="
+          echo "RUNTIME_LOCK_MISMATCH count : $(grep -ac 'RUNTIME_LOCK_MISMATCH' strict-out.txt || true)"
+          echo "LOCK_ENTRY_MISSING count    : $(grep -ac 'LOCK_ENTRY_MISSING' strict-out.txt || true)"
+          grep -a "介质自校验" strict-out.txt || true
+          if grep -aq "GATE FAILED" strict-out.txt; then
+            echo "STRICT GATE FAILED"; exit 1
+          fi
+          echo "build_release.py --strict rc=$rc"
           exit "$rc"
 
       - name: 用嵌入式 Python 启动冒烟
