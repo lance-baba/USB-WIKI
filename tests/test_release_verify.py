@@ -136,11 +136,22 @@ def run(check) -> None:
         shutil.rmtree(tmp, ignore_errors=True)
 
     # ---------- 真实仓库自检：当前源码树本身应当可交付 ----------
+    # ⚠ Windows 上「可交付」硬性要求嵌入式运行时（runtime/python-3.11-embed），
+    # 它由 setup_runtime_windows.py 构建，只在 portable 作业中完成；普通 test
+    # 作业用系统 Python、不构建它，故 Windows 源 checkout 必然缺运行时 —— 这是
+    # 预期的，交付校验改由 portable 作业验证。因此此处：Windows 且运行时缺失时，
+    # 只验证「缺运行时被正确指出」，不强行要求 deliverable=True。
     rc, out = _run(S.BASE, as_json=True)
     try:
         doc = json.loads(out)
-        check("当前仓库自检 deliverable=True", rc == 0 and doc["deliverable"] is True,
-              str(doc.get("missing"))[:300])
+        rt_present = (S.BASE / "runtime" / "python-3.11-embed" / "python.exe").exists()
+        if os.name == "nt" and not rt_present:
+            check("当前仓库自检（Windows 源 checkout 未构建运行时）：缺运行时被正确指出",
+                  rc == 1 and "python.exe" in out, out[-300:])
+        else:
+            check("当前仓库自检 deliverable=True",
+                  rc == 0 and doc["deliverable"] is True,
+                  str(doc.get("missing"))[:300])
     except json.JSONDecodeError:
         check("当前仓库自检 deliverable=True", False, out[:200])
 
