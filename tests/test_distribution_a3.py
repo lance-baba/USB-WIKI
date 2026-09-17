@@ -514,6 +514,12 @@ def _t_license_inventory_shape(tmp: Path) -> None:
 # ---------------------------------------------------------------------------
 # 13 —— 真实 runtime 下的 strict 构建（有运行时才跑）
 # ---------------------------------------------------------------------------
+def _in_ci() -> bool:
+    """是否跑在 CI 里（GitHub Actions 会注入 GITHUB_ACTIONS=true / CI=true）。"""
+    return (os.environ.get("GITHUB_ACTIONS", "").lower() == "true"
+            or os.environ.get("CI", "").lower() == "true")
+
+
 def _norm_pkg(name: str) -> str:
     return name.strip().lower().replace("-", "_").replace(".", "_")
 
@@ -564,10 +570,17 @@ def _t_real_strict_build(tmp: Path) -> None:
     stderr = proc.stderr or ""
 
     if stale:
-        # A3.1：本机 runtime 陈旧 ⇒ strict **必须**红，且给出稳定码。
+        # A3.1：runtime 非由当前 lock 构建 ⇒ strict **必须**红，且给出稳定码。
         # 这是正确行为，不是失败；也**不**为了变绿去重建 runtime 或反向改 lock。
         print(f"  ⚠ LOCAL_RUNTIME_STALE：{'; '.join(stale)}")
-        print("     （本机 runtime 非由当前 lock 构建；freshness 由 CI Portable job 验证）")
+        # ⚠ 但 CI 是**例外**：Portable job 的运行时就是从这份 lock 现装的，
+        #   若那里还出现差异，说明 CI 环境本身有问题 —— 必须红。
+        #   没有这条，本用例在「陈旧」分支上也会通过，绿色就证明不了 freshness。
+        if _in_ci():
+            check("A3-13a CI 的运行时必须与依赖锁一致（fresh runtime → mismatch=0）",
+                  False, f"CI 环境下仍存在差异：{stale}")
+            return
+        print("     （本机 runtime 陈旧；freshness 由 CI Portable job 验证）")
         check("A3-13a 陈旧 runtime → strict 必须拒绝（rc!=0）", proc.returncode != 0,
               f"rc={proc.returncode}")
         check("A3-13a2 拒绝码为 RUNTIME_LOCK_MISMATCH",
