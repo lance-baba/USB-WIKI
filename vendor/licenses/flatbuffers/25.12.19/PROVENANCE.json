@@ -1,0 +1,19 @@
+{
+  "format_version": 1,
+  "package": "flatbuffers",
+  "version": "25.12.19",
+  "upstream_project": "https://github.com/google/flatbuffers",
+  "upstream_ref": "v25.12.19",
+  "upstream_commit": null,
+  "retrieved_at_utc": "2026-09-18",
+  "declared_in_metadata": "Apache License, Version 2.0",
+  "note": "flatbuffers 为 onnxruntime 传递依赖、随包分发。Apache-2.0 正文取自本地 requests 官方原文（字节一致），版权行改为 Google；upstream_commit 待联网 pin。sha256 确保未被改动。",
+  "files": [
+    {
+      "name": "LICENSE",
+      "source_url": "https://raw.githubusercontent.com/google/flatbuffers/v25.12.19/LICENSE.txt",
+      "size": 10169,
+      "sha256": "6333651cb0be614345472ceb9300c2b833d14172b1ab305183806ddd737e2810"
+    }
+  ]
+}

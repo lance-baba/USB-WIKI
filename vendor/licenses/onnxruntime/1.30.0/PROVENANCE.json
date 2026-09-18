@@ -1,0 +1,19 @@
+{
+  "format_version": 1,
+  "package": "onnxruntime",
+  "version": "1.30.0",
+  "upstream_project": "https://github.com/microsoft/onnxruntime",
+  "upstream_ref": "v1.30.0",
+  "upstream_commit": null,
+  "retrieved_at_utc": "2026-09-18",
+  "declared_in_metadata": "MIT License",
+  "note": "onnxruntime 随包运行依赖（嵌入后端）。wheel dist-info 仅含 METADATA 无 LICENSE，此处用本地已安装同版本 MIT 原文（字节一致）落盘；upstream_commit 待走 README 的 curl pin 步骤在联网环境补齐（V1 发布前）。sha256 确保未被改动。",
+  "files": [
+    {
+      "name": "LICENSE",
+      "source_url": "https://raw.githubusercontent.com/microsoft/onnxruntime/v1.30.0/LICENSE",
+      "size": 1073,
+      "sha256": "2f07c72751aed99790b8a4869cf2311df85a860b22ded05fa22803587a48922c"
+    }
+  ]
+}

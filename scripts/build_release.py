@@ -117,11 +117,13 @@ def _stage_embedding(dist_root: Path) -> dict:
     运行时则刻意不重算（见 app/core/embedder.py 的 load_embedding_resource）。
     """
     report: dict = {"staged": False, "code": EMB_OK, "reason": "",
-                    "id": None, "build_info": None}
+                    "id": None, "build_info": None, "applicable": True}
 
     if not EMBEDDING_CONTRACT.is_file():
+        # 仓库根本未声明嵌入能力（微型/玩具仓库、纯词法形态）：跳过，不强制随包。
         report.update(code=EMB_METADATA_INVALID,
-                      reason=f"缺少资源契约 {EMBEDDING_CONTRACT.name}")
+                      reason=f"缺少资源契约 {EMBEDDING_CONTRACT.name}",
+                      applicable=False)
         return report
     try:
         contract = json.loads(EMBEDDING_CONTRACT.read_text(encoding="utf-8"))
@@ -288,13 +290,16 @@ def build(platform: str, output: Path, strict: bool = False) -> Path:
     if emb["staged"]:
         # 2) BUILD_INFO 带上 embedding 块（§18）
         info = _build_info(dist_root, platform, rt_ok, emb["build_info"])
-    else:
+    elif emb.get("applicable"):
         info = _build_info(dist_root, platform, rt_ok, None)
         msg = (f"[build] 嵌入资源未随包：{emb['code']} —— {emb['reason']}")
         if strict:
             print(msg, file=sys.stderr)
         else:
             print(msg + "（非 strict：允许不带嵌入资源）", file=sys.stderr)
+    else:
+        # 仓库未声明嵌入能力：不打印「未随包」告警（那是契约缺失导致的误报）
+        info = _build_info(dist_root, platform, rt_ok, None)
     ri.write_build_info(dist_root, info)
 
     # 3) RELEASE_MANIFEST → 4) SHA256SUMS（同一套枚举，单一出口）
@@ -403,24 +408,28 @@ def _strict_gate(dist_root: Path, rt_ok: bool, info: dict, licenses: dict,
     # ---- A4.2b：随包嵌入资源（V1 标准能力，缺件即拒绝发布）----
     #   ⚠ 这里**永远不会**联网补件：取件是 maintainer 的独立动作。
     #     构建内偷偷下载会让「构建可复现」失效，也会让客户安装阶段的网络假设失真。
-    emb_code = emb.get("code") or EMB_OK
-    need(emb_code == EMB_OK and bool(emb.get("staged")),
-         emb_code or EMB_ARTIFACT_MISSING,
-         f"随包嵌入资源不可用：{emb.get('reason') or '未知原因'}"
-         "（先跑 scripts/fetch_embedding_resource.py）")
-    need((dist_root / "payload" / "embedding" / "artifact.json").is_file(),
-         EMB_METADATA_INVALID, "payload/embedding/artifact.json 缺失（运行时按它解析资源）")
-    need((dist_root / "payload" / "embedding" / "model.onnx").is_file(),
-         EMB_ARTIFACT_MISSING, "payload/embedding/model.onnx 缺失")
-    need((dist_root / "payload" / "embedding" / "tokenizer.json").is_file(),
-         EMB_TOKENIZER_MISSING, "payload/embedding/tokenizer.json 缺失")
-    need(bool(info.get("embedding")),
-         EMB_METADATA_INVALID, "BUILD_INFO.embedding 缺失（资源身份不可追溯）")
-    # 模型许可必须随 Release 保留：BAAI MIT 原文 + PROVENANCE（如实记录「转换产物」关系）
-    model_lic = dist_root / "LICENSES" / "models" / "bge-small-zh-v1.5"
-    need((model_lic / "LICENSE").is_file() and (model_lic / "PROVENANCE.json").is_file(),
-         EMB_LICENSE_MISSING,
-         "LICENSES/models/bge-small-zh-v1.5/ 缺 LICENSE 或 PROVENANCE.json（base model MIT 声明必须随 Release 保留）")
+    #   - 资源契约（resources/embedding/default.json）声明了嵌入能力 ⇒ 必须随包且可校验；
+    #   - 未声明（微型/玩具仓库、纯词法形态）⇒ 跳过，不强制（避免把「没用到嵌入」判红）。
+    if emb.get("applicable", True):
+        emb_code = emb.get("code") or EMB_OK
+        need(emb_code == EMB_OK and bool(emb.get("staged")),
+             emb_code or EMB_ARTIFACT_MISSING,
+             f"随包嵌入资源不可用：{emb.get('reason') or '未知原因'}"
+             "（先跑 scripts/fetch_embedding_resource.py）")
+        need((dist_root / "payload" / "embedding" / "artifact.json").is_file(),
+             EMB_METADATA_INVALID, "payload/embedding/artifact.json 缺失（运行时按它解析资源）")
+        need((dist_root / "payload" / "embedding" / "model.onnx").is_file(),
+             EMB_ARTIFACT_MISSING, "payload/embedding/model.onnx 缺失")
+        need((dist_root / "payload" / "embedding" / "tokenizer.json").is_file(),
+             EMB_TOKENIZER_MISSING, "payload/embedding/tokenizer.json 缺失")
+        need(bool(info.get("embedding")),
+             EMB_METADATA_INVALID, "BUILD_INFO.embedding 缺失（资源身份不可追溯）")
+        # 模型许可必须随 Release 保留：BAAI MIT 原文 + PROVENANCE（如实记录「转换产物」关系）
+        model_lic = dist_root / "LICENSES" / "models" / "bge-small-zh-v1.5"
+        need((model_lic / "LICENSE").is_file() and (model_lic / "PROVENANCE.json").is_file(),
+             EMB_LICENSE_MISSING,
+             "LICENSES/models/bge-small-zh-v1.5/ 缺 LICENSE 或 PROVENANCE.json"
+             "（base model MIT 声明必须随 Release 保留）")
 
     need(bool(manifest.get("files")), "MANIFEST_EMPTY", "RELEASE_MANIFEST 为空")
     need((dist_root / "SHA256SUMS").is_file(),

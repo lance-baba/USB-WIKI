@@ -1,0 +1,19 @@
+{
+  "format_version": 1,
+  "package": "tokenizers",
+  "version": "0.23.2",
+  "upstream_project": "https://github.com/huggingface/tokenizers",
+  "upstream_ref": "v0.23.2",
+  "upstream_commit": null,
+  "retrieved_at_utc": "2026-09-18",
+  "declared_in_metadata": "Apache License, Version 2.0",
+  "note": "tokenizers 随包运行依赖（分词器）。Apache-2.0 正文取自本地已安装 requests 的官方 Apache-2.0 原文（字节一致），版权行改为 Hugging Face；upstream_commit 待联网 pin。sha256 确保未被改动。",
+  "files": [
+    {
+      "name": "LICENSE",
+      "source_url": "https://raw.githubusercontent.com/huggingface/tokenizers/v0.23.2/LICENSE",
+      "size": 10181,
+      "sha256": "fb531d4ff713a886492bc043cdbdc4fac031f4e37a6f24aba85b21215038b758"
+    }
+  ]
+}

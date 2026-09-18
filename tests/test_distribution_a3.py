@@ -44,6 +44,11 @@ PASS: list[str] = []
 FAIL: list[str] = []
 SKIP: list[str] = []
 
+# 嵌入资源「不适用」桩：用于纯 BUILD_INFO / LICENSES 门禁单测（这些用例不构造随包嵌入）。
+# 必须与 build_release._stage_embedding 的返回结构一致；applicable=False ⇒ 门禁跳过嵌入校验。
+_NO_EMB = {"staged": False, "code": "ok", "reason": "", "id": None,
+           "build_info": None, "applicable": False}
+
 
 def check(name: str, cond: bool, detail: str = "") -> bool:
     (PASS if cond else FAIL).append(name if cond else f"{name} :: {detail}")
@@ -203,7 +208,7 @@ def _t_build_info_missing(tmp: Path) -> None:
 
     def gate(info, lic, man, chk):
         try:
-            br._strict_gate(good_root, True, info, lic, man, chk, 3)
+            br._strict_gate(good_root, True, info, lic, man, chk, 3, _NO_EMB)
             return None
         except SystemExit as e:
             return int(e.code or 0)
@@ -256,7 +261,7 @@ def _t_licenses_missing(tmp: Path) -> None:
 
     def gate(lic):
         try:
-            br._strict_gate(good_root, True, info, lic, good_man, good_check, 3)
+            br._strict_gate(good_root, True, info, lic, good_man, good_check, 3, _NO_EMB)
             return None
         except SystemExit as e:
             return int(e.code or 0)
