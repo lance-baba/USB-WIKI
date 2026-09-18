@@ -105,9 +105,9 @@ class GUID(ctypes.Structure):
         )
 
 
-def _known_folder_documents() -> Path:
-    # FOLDERID_Documents = {FDD39AD0-238F-46AF-ADB4-6C85480369C7}
-    guid = GUID("FDD39AD0-238F-46AF-ADB4-6C85480369C7")
+def _known_folder(guid_str: str) -> Path:
+    """通用 Known Folder 读取（纯 ctypes，无第三方依赖）。"""
+    guid = GUID(guid_str)
     ppath = ctypes.c_wchar_p()
     shell32 = ctypes.windll.shell32
     shell32.SHGetKnownFolderPath.argtypes = [
@@ -122,6 +122,20 @@ def _known_folder_documents() -> Path:
         return Path(ppath.value)
     finally:
         ctypes.windll.ole32.CoTaskMemFree(ppath)
+
+
+def _known_folder_documents() -> Path:
+    # FOLDERID_Documents = {FDD39AD0-238F-46AF-ADB4-6C85480369C7}
+    return _known_folder("FDD39AD0-238F-46AF-ADB4-6C85480369C7")
+
+
+def _desktop_dir() -> Path:
+    """真实桌面目录（覆盖 OneDrive 重定向 / 企业策略迁移）。"""
+    # FOLDERID_Desktop = {B4BFCC3A-DB2C-424C-B029-7FE99A87C641}
+    try:
+        return _known_folder("B4BFCC3A-DB2C-424C-B029-7FE99A87C641")
+    except Exception:
+        return Path.home() / "Desktop"
 
 
 def _default_library_target() -> Path:
@@ -300,6 +314,53 @@ def _post_install_smoke(app_target: Path, library_target: Path, port: int) -> in
                 proc.kill()
 
 
+SHORTCUT_NAME = "USB-WIKI.lnk"
+
+
+def _psq(s: str) -> str:
+    """PowerShell 单引号字符串转义。"""
+    return "'" + str(s).replace("'", "''") + "'"
+
+
+def create_desktop_shortcut(app_target: Path,
+                            desktop_dir: Path | None = None) -> bool:
+    """在桌面创建 USB-WIKI.lnk → 正式 App 的 启动-Windows.bat（Pilot P0-2）。
+
+    设计约束：
+      - 复用同一 lnk 文件（WScript.Shell 同名覆盖），重装绝不产生 (1)(2) 副本；
+      - 只允许在 App swap **成功之后**调用 → 永远指向正式安装目录，
+        绝不指向 staging / backup 临时目录；
+      - 任何失败都**不算安装失败**：返回 False 并打印手动启动路径（非 BLOCKER）。
+    """
+    manual = str(Path(app_target) / LAUNCHER_NAME)
+    try:
+        target = Path(app_target) / LAUNCHER_NAME
+        if not target.is_file():
+            print(f"[install] 桌面快捷方式创建失败，可从以下位置启动：{manual}")
+            return False
+        desktop = Path(desktop_dir) if desktop_dir else _desktop_dir()
+        desktop.mkdir(parents=True, exist_ok=True)
+        lnk = desktop / SHORTCUT_NAME
+        ps = ("[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;"
+              "$s=(New-Object -ComObject WScript.Shell).CreateShortcut("
+              + _psq(lnk) + ");"
+              "$s.TargetPath=" + _psq(target) + ";"
+              "$s.WorkingDirectory=" + _psq(app_target) + ";"
+              "$s.Description='USB-WIKI';$s.Save()")
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+            capture_output=True, timeout=60,
+            encoding="utf-8", errors="replace")
+        if r.returncode != 0 or not lnk.is_file():
+            raise RuntimeError((r.stderr or r.stdout).strip() or "lnk 未生成")
+        print(f"[install] 已创建桌面快捷方式：{lnk}")
+        return True
+    except Exception as e:
+        print(f"[install] 桌面快捷方式创建失败（不影响安装），"
+              f"可从以下位置启动：{manual}（{e}）")
+        return False
+
+
 def ensure_library(library_target: Path) -> None:
     # Library 为不可触碰边界：已存在则接管，绝不覆盖/删除/移动
     if library_target.exists():
@@ -357,7 +418,8 @@ def verify_release(root: Path, *, deep: bool = True):
 
 
 def install(release_root: Path, app_target: Path, library_target: Path,
-           launch: bool = False, port: int = 28988, smoke: bool = False) -> int:
+           launch: bool = False, port: int = 28988, smoke: bool = False,
+           desktop_dir: Path | None = None) -> int:
     release_root = Path(release_root)
     # 0) 介质完整性 —— 必须在任何写操作之前（否则可能出现「坏文件 + 半覆盖 App」）
     check = verify_release(release_root)
@@ -403,6 +465,9 @@ def install(release_root: Path, app_target: Path, library_target: Path,
         # 5) 成功：清理 backup
         _rmtree(backup)
         print(f"[install] App 已安装到：{app_target}")
+        # 5.5) 桌面快捷方式（P0-2）：swap 已成功才调用 → 只指正式 App；
+        #      失败仅提示手动启动路径，绝不影响安装结果。
+        create_desktop_shortcut(app_target, desktop_dir=desktop_dir)
         if launch:
             return _run(app_target, library_target, port, no_browser=False)
         return 0
@@ -475,6 +540,8 @@ def _parse(argv: list[str]):
     pinstall.add_argument("--no-verify", dest="verify", action="store_false",
                           help="跳过安装后启动验证")
     pinstall.add_argument("--port", type=int, default=28988)
+    pinstall.add_argument("--desktop-dir", default=None,
+                          help=argparse.SUPPRESS)  # 测试注入：重定向桌面目录
 
     pverify = sub.add_parser("verify", help="只读校验发布介质（不装、不改、不联网）")
     pverify.add_argument("--release", default=str(default_root),
@@ -523,6 +590,8 @@ def main(argv: list[str] | None = None) -> int:
         launch=getattr(args, "launch", False),
         port=args.port,
         smoke=getattr(args, "verify", True),
+        desktop_dir=(Path(args.desktop_dir).resolve()
+                     if getattr(args, "desktop_dir", None) else None),
     )
 
 
