@@ -37,6 +37,7 @@ REPO = HERE.parent                                 # 仓库根
 
 #: 随发布交付的文档白名单（**显式**列出：内部过程文档 / 已知问题备忘不进客户包）
 RELEASE_DOC_FILES = (
+    "START_HERE.txt",   # Digital Pilot：面向普通用户的唯一入口文档（其余为随包开发文档）
     "README.md", "CHANGELOG.md", "LICENSE", "SECURITY.md",
     "CODE_OF_CONDUCT.md", "CONTRIBUTING.md",
 )

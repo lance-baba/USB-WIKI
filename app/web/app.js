@@ -84,13 +84,11 @@ function applyStatus(st) {
   if (!S.ready) return;
 
   const emb = d.embedding || {}, ai = d.ai || {}, syn = d.sync || {}, db = d.db || {};
-  const srcName = { local_onnx: "本地 ONNX", ollama: "Ollama", api: "云端 API", local_hash: "轻量哈希", none: "已关闭" };
   const vecOK = db.vec_ready && !emb.signature_mismatch;
-  cE.textContent = "嵌入：" + (srcName[emb.source] || emb.source || "—") + (vecOK ? "" : "（无向量）");
+  cE.textContent = vecOK ? "本地智能搜索：可用" : "本地智能搜索：仅关键词";
   cE.className = "chip " + (vecOK ? "on" : "warn");
 
-  const prov = srcName[ai.resolved] || ai.resolved || (ai.provider_mode || "—");
-  cA.textContent = "AI：" + ({ ollama: "本地 Ollama", api: "云端 API", offline: "纯离线检索", error: "不可用" }[ai.resolved] || ai.provider_mode || "—");
+  cA.textContent = "AI 对话：" + ({ ollama: "本地模型", api: "云端", offline: "尚未配置", error: "不可用" }[ai.resolved] || ai.provider_mode || "—");
   cA.className = "chip " + (ai.resolved === "ollama" || ai.resolved === "api" ? "on" : (ai.resolved === "error" ? "warn" : "off"));
 
   cS.textContent = "同步：" + (syn.running ? (syn.tracked + " 篇 · " + syn.interval + "s") : "未运行");
@@ -111,7 +109,7 @@ function renderEmptyGuide(d) {
   box.innerHTML =
     '<div class="empty-guide"><h5>知识库还是空的 —— 先加内容，问答才有东西可查</h5><ol>' +
     '<li>点顶部 <b>「剪藏」</b> 标签 →  把 <code>.md</code> 文件拖进虚线框，或粘贴一个网址抓取</li>' +
-    '<li>也可以把笔记文件直接丢进 <code>data\\notes\\</code> 文件夹，15 秒内自动入库</li>' +
+    '<li>也可以把 .md / .txt 笔记直接放进资料库的 <code>notes</code> 文件夹（安装版默认在 文档\\USB-WIKI-Data\\notes），15 秒内自动入库</li>' +
     '<li>入库后回到这里提问，回答会带 <b>[1]</b> 角标指向原文出处</li></ol>' +
     '<div style="margin-top:11px"><button class="btn primary" onclick="switchTab(\'capture\')">去添加第一份内容 →</button></div>' +
     "</div>";

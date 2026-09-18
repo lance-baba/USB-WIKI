@@ -12,8 +12,8 @@
     <div class="brand"><b>Wiki-USB</b><small>随身第二大脑 · <span id="appVer">…</span></small></div>
     <div class="chips" id="chips">
       <span class="chip off" id="chipReady">初始化中…</span>
-      <span class="chip off" id="chipEmbed">嵌入引擎 —</span>
-      <span class="chip off" id="chipAI">AI 网关 —</span>
+      <span class="chip off" id="chipEmbed">本地智能搜索 —</span>
+      <span class="chip off" id="chipAI">AI 对话 —</span>
       <span class="chip off" id="chipSync">同步 —</span>
     </div>
     <div class="spacer"></div>
@@ -39,7 +39,7 @@
           <div class="msg assistant">
             <div class="who">W</div>
             <div class="bubble">
-              <p><b>欢迎使用 Wiki-USB。</b> 我会先在你的本地知识库里做混合检索（FTS5 词法 + 向量近邻 + RRF 融合），再交给 AI 组织回答，并标注每一处引用的出处。</p>
+              <p><b>欢迎使用 Wiki-USB。</b> 我会在你自己的本地资料里搜索最相关的内容，组织成回答，并标注每一处引用的出处。资料只保存在你的电脑上，不联网上传。</p>
               <div id="emptyGuide"></div>
             </div>
           </div>
@@ -65,7 +65,7 @@
           <span class="dz-sub">
             Word / PPT / Excel / PDF / EPUB / HTML / 邮件 / CSV / 代码 / 字幕 / 纯文本 等 —— 自动转成 Markdown 入库<br>
             或 <label class="link">点击选择文件<input type="file" id="fileInput" multiple hidden></label>
-            　·　也可以直接把文件丢进 <code>data\notes\</code>（仅限 .md / .txt），15 秒内自动入库
+            　·　也可以把 .md / .txt 文件直接放进资料库的 <code>notes</code> 文件夹（安装版默认在 文档\USB-WIKI-Data\notes），15 秒内自动入库
           </span>
           <div class="dz-result" id="dzResult"></div>
         </div>
