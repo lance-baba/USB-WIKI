@@ -271,13 +271,20 @@ def _t_c_retrieval() -> None:
 
     tmp = Path(tempfile.mkdtemp(prefix="a42b-rag-"))
     os.environ["WIKIUSB_LIBRARY"] = str(tmp / "Library")
+    from app.core import paths as _paths
+    from app.core import db as _db_mod
+    orig_notes = _paths.NOTES_DIR
+    orig_global_db = _db_mod._db          # 保存全局单例，避免 C 的 boot 重指后影响套件共享 db
     try:
-        from app.core import context as ctxmod, indexer, paths
+        from app.core import context as ctxmod, indexer
         from app.core import search as search_mod
         from app.core import config
         from app.core import embedder as emb_mod
 
         with _embedding_env(RESOURCE_DIR):
+            # #9b 隔离：C 自带 25 篇 rag_corpus 写入私有 notes 目录，
+            # 不污染套件共享的 paths.NOTES_DIR（否则会拖累 test_rag_regression 的计数断言）。
+            _paths.NOTES_DIR = tmp / "notes"
             config.update({"AI": {"embedding_source": "local_onnx",
                                   "provider": "offline"}}, persist=False)
             ctx = ctxmod.AppContext()
@@ -294,11 +301,11 @@ def _t_c_retrieval() -> None:
                     return
 
                 from tests.fixtures import rag_corpus as corpus
-                paths.NOTES_DIR.mkdir(parents=True, exist_ok=True)
+                _paths.NOTES_DIR.mkdir(parents=True, exist_ok=True)
                 for name, body in corpus.DOCS.items():
-                    (paths.NOTES_DIR / name).write_text(body, encoding="utf-8")
+                    (_paths.NOTES_DIR / name).write_text(body, encoding="utf-8")
                 for name in corpus.DOCS:
-                    indexer.index_file(db, paths.NOTES_DIR / name, emb)
+                    indexer.index_file(db, _paths.NOTES_DIR / name, emb)
 
                 check("C1 向量索引已写入（非 0）",
                       bool(db.vec_table_ready and not db.signature_mismatch),
@@ -347,6 +354,10 @@ def _t_c_retrieval() -> None:
                     pass
     finally:
         os.environ.pop("WIKIUSB_LIBRARY", None)
+        _paths.NOTES_DIR = orig_notes
+        # 还原全局 db 单例：C 的 boot 会把它重指到私有 tmp/cache.db，
+        # 其 shutdown 又会置 None；还原回套件共享 db，杜绝跨测试串库。
+        _db_mod._db = orig_global_db
         shutil.rmtree(tmp, ignore_errors=True)
         config_path = REPO / "config.ini"
         _ = config_path  # 配置仅在内存覆盖（persist=False），无需回写
