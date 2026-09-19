@@ -101,19 +101,29 @@ def _state_file(localapp: Path) -> Path:
     return localapp / "USB-WIKI" / "install_state.json"
 
 
-def _lnk_target(lnk: Path) -> str:
-    """读取 .lnk 的 TargetPath（仅 Windows）。"""
-    if not IS_WIN:
-        return ""
+def _lnk_points_to(lnk: Path, app: Path) -> bool:
+    """.lnk 是否指向 ``app/启动-Windows.bat``（仅 Windows）。
+
+    只比较 TargetPath 的**父目录**（= App 目录，纯 ASCII），绝不比较含中文的文件名：
+    CI 的英文 Windows（cp1252）解码 PowerShell 输出会把「启动-Windows.bat」变成乱码，
+    用文件名比较会假红 —— 而快捷方式本身其实是正确的。同时显式按 UTF-8 解码输出。
+    """
+    if not IS_WIN or not lnk.is_file():
+        return False
     ps = ("[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;"
           "$s=(New-Object -ComObject WScript.Shell).CreateShortcut('"
-          + str(lnk).replace("'", "''") + "');Write-Output $s.TargetPath")
+          + str(lnk).replace("'", "''") + "');"
+          "Write-Output ([System.IO.Path]::GetDirectoryName($s.TargetPath))")
     try:
         r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
-                           capture_output=True, text=True, timeout=60)
-        return (r.stdout or "").strip()
+                           capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=60)
+        d = (r.stdout or "").strip()
+        if not d:
+            return False
+        return os.path.normcase(str(Path(d).resolve())) == os.path.normcase(str(Path(app).resolve()))
     except Exception:
-        return ""
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -147,8 +157,7 @@ def run(ctx, check, section, skip) -> None:  # noqa: ARG001
         lnk = desk / "USB-WIKI.lnk"
         if IS_WIN:
             check("A 桌面快捷方式存在", lnk.is_file())
-            check("A 快捷方式指向真实 App（启动-Windows.bat）",
-                  "启动-Windows.bat" in _lnk_target(lnk))
+            check("A 快捷方式指向真实 App", _lnk_points_to(lnk, app))
         else:
             skip("A 桌面快捷方式指向真实 App", "非 Windows，跳过 .lnk 解析")
 
@@ -226,7 +235,7 @@ def run(ctx, check, section, skip) -> None:  # noqa: ARG001
               Path(st5.get("app_path", "")).resolve() == custom_app.resolve())
         if IS_WIN:
             check("自定义安装的快捷方式指向自定义 App",
-                  "启动-Windows.bat" in _lnk_target(desk5 / "USB-WIKI.lnk"))
+                  _lnk_points_to(desk5 / "USB-WIKI.lnk", custom_app))
         else:
             skip("自定义安装的快捷方式指向自定义 App", "非 Windows")
 
