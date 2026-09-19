@@ -449,6 +449,23 @@ class Gateway:
         return "offline", warns
 
     # ------------------------------------------------------------------
+    def _degrade_target(self) -> str:
+        """Ollama 真实调用失败后的降级去向（P0-B #5）。
+
+        ``provider=ollama`` 是用户明确「只走本地」，失败**绝不转云端** → offline；
+        只有 ``auto`` 才允许在配置了 api_key 时回落云端 API。
+        """
+        if config.get_str("AI", "provider", "auto").lower() == "ollama":
+            return "offline"
+        return "api" if self.api_key else "offline"
+
+    def _ollama_fail_notice(self) -> str:
+        mode = config.get_str("AI", "provider", "auto").lower()
+        if mode == "ollama":
+            return "本地 Ollama 调用失败，本次为纯离线检索回答（未转云端）"
+        return "本地 Ollama 调用失败，已自动降级"
+
+    # ------------------------------------------------------------------
     def retrieve(self, query: str) -> search_mod.SearchResult:
         top_k = config.get_int("AI", "top_k_parents", 5)
         cands = config.get_int("AI", "recall_candidates", 20)
@@ -552,23 +569,52 @@ class Gateway:
             return
 
         if provider == "ollama":
-            ok = False
+            got_frame = False       # 是否收到过任何有效 stream 帧
+            got_content = False     # 是否收到过正文 delta
+            got_error = False
             for frame in self._stream_ollama(query, history, result):
-                ok = ok or frame.get("type") == "delta"
-                yield frame
-                if frame.get("type") == "error":
+                ft = frame.get("type")
+                if ft == "error":
                     self.state.last_error = frame.get("message", "")
+                    got_error = True
+                    yield frame
                     break
-            if ok:
+                if ft == "delta":
+                    got_content = True
+                    yield frame
+                elif ft == "ollama_progress":   # thinking 帧：流活着，但不算正文
+                    got_frame = True
+                elif ft == "done":
+                    got_frame = True
+                else:
+                    yield frame
+
+            if got_error:
+                self.ollama_status(force=True)
+                yield {"type": "notice", "message": self._ollama_fail_notice()}
+                provider = self._degrade_target()
+            elif not got_frame:
+                # 一个有效帧都没收到（连接被拒 / 首 token 超时 / 流被掐断）
+                self.ollama_status(force=True)
+                yield {
+                    "type": "error",
+                    "message": self.state.last_error or "本地 Ollama 未返回任何数据帧",
+                }
+                yield {"type": "notice", "message": self._ollama_fail_notice()}
+                provider = self._degrade_target()
+            elif not got_content:
+                # 流是活的、但模型没吐正文（被 think/thinking 拦截，或不支持对话）
+                self.ollama_status(force=True)
+                yield {
+                    "type": "error",
+                    "message": "本地 Ollama 已完成请求，但未返回回答正文"
+                    "（可能该模型不支持对话，或被 think/thinking 设置拦截）",
+                }
+                yield {"type": "notice", "message": self._ollama_fail_notice()}
+                provider = self._degrade_target()
+            else:
                 yield {"type": "done"}
                 return
-            # Ollama 流中断 —— 强制刷新健康缓存并降级
-            self.ollama_status(force=True)
-            yield {
-                "type": "notice",
-                "message": "本地 Ollama 推流中断，已自动降级至云端 API / 离线回答",
-            }
-            provider = "api" if self.api_key else "offline"
 
         if provider == "api":
             yielded = False
@@ -603,12 +649,19 @@ class Gateway:
             "model": self.ollama_model,
             "messages": messages,
             "stream": True,
+            # 知识库问答默认关闭 thinking：更快首 token、避免小模型无意义长思考、
+            # 也避免 message.thinking 被前端误判为「无输出」。thinking 内容不展示给用户。
+            "think": False,
             "options": {"num_predict": MAX_TOKENS, "temperature": 0.3},
         }
         url = net_util.join_url(self.ollama_host, "/api/chat")
         try:
             for line in net_util.http_post_stream(
-                url, payload, timeout=IDLE_TIMEOUT, idle_timeout=IDLE_TIMEOUT, with_proxy=False
+                url, payload,
+                connect_timeout=10.0,
+                first_token_timeout=120.0,   # 本地模型首载权重可很慢，给足时间
+                idle_timeout=60.0,           # 流式吐字中两帧间空闲上限
+                with_proxy=False,
             ):
                 line = line.strip()
                 if not line:
@@ -620,11 +673,21 @@ class Gateway:
                 if obj.get("error"):
                     yield {"type": "error", "message": f"Ollama 报错：{obj['error']}"}
                     return
-                piece = (obj.get("message") or {}).get("content") or obj.get("response") or ""
+                msg = obj.get("message") or {}
+                piece = msg.get("content") or obj.get("response") or ""
                 if piece:
                     yield {"type": "delta", "content": piece}
+                elif msg.get("thinking") is not None:
+                    # thinking 模型：思考内容不是正文，但证明流是活的 → 记一帧进度，
+                    # 不让上层把它误判成「推流中断」。
+                    yield {"type": "ollama_progress"}
                 if obj.get("done"):
                     return
+        except net_util.StreamError as exc:
+            yield {
+                "type": "error",
+                "message": f"本地 Ollama 流式中止（{exc.kind}）：{exc.message}",
+            }
         except Exception as exc:  # noqa: BLE001
             yield {"type": "error", "message": f"Ollama 流式连接失败：{exc}"}
 
@@ -647,7 +710,10 @@ class Gateway:
         try:
             for line in net_util.http_post_stream(
                 url, payload, headers=headers,
-                timeout=IDLE_TIMEOUT, idle_timeout=IDLE_TIMEOUT, with_proxy=True,
+                connect_timeout=15.0,
+                first_token_timeout=60.0,
+                idle_timeout=45.0,
+                with_proxy=True,
             ):
                 line = line.strip()
                 if not line or not line.startswith("data:"):
@@ -669,37 +735,57 @@ class Gateway:
                         yield {"type": "delta", "content": piece}
                     if choice.get("finish_reason"):
                         return
+        except net_util.StreamError as exc:
+            yield {
+                "type": "error",
+                "message": f"云端 API 流式中止（{exc.kind}）：{exc.message}",
+            }
         except Exception as exc:  # noqa: BLE001
             yield {"type": "error", "message": f"云端 API 流式连接失败：{exc}"}
 
     def _offline_answer(self, query: str, result: search_mod.SearchResult) -> Iterator[dict]:
-        """纯离线兜底：以检索高亮结果组织成回答，永不空手而归。
+        """纯离线兜底：把检索结果组织成**本地搜索结果**展示，永不空手而归。
 
-        ⚠ 这不是「模型生成的回答」：措辞刻意说明「已在知识库中检索到 N 段」，
-        末尾再标注未调用大模型 —— 不允许把检索结果伪装成生成式回答。
+        ⚠ 这不是「模型生成的回答」。按 P0-F 明确改为「本地搜索结果」：
+        展示章节/标题 + **查询词附近的原文**（表格保持可读结构，不再压成一行）
+        + 来源与引用入口；只在开头说一次「未调用生成式 AI」，不重复三遍。
         """
         if not result.parents:
             text = (
-                "知识库中没有找到相关内容。\n\n"
+                "本地搜索没有找到相关内容。\n\n"
                 "建议：\n1. 换用更具体的关键词重新提问；\n"
                 "2. 在「剪藏」页录入相关网页或笔记后再试。"
             )
             yield {"type": "delta", "content": text}
             return
 
-        yield {"type": "delta", "content": f"已在本地知识库中检索到 {len(result.parents)} 段相关内容：\n\n"}
-        for p in result.parents:
+        yield {
+            "type": "delta",
+            "content": "**本地搜索结果**（未调用生成式 AI，以下均为知识库原文摘录）：\n",
+        }
+        for idx, p in enumerate(result.parents, start=1):
+            body = self._offline_excerpt(p.get("content") or "", query, limit=500)
             sim = f"，相似度 {p['similarity']:.3f}" if p.get("similarity") else ""
-            head = p["content"].strip().replace("\n", " ")[:180]
             yield {
                 "type": "delta",
-                "content": f"[^{p['parent_id'] and result.parents.index(p) + 1}] **{p['title']}**"
-                           f"（{p['path']}）{sim}\n> {head}…\n\n",
+                "content": f"\n### [^{idx}] {p['title']}（{p['path']}）{sim}\n\n{body}\n",
             }
         yield {
             "type": "delta",
-            "content": "\n（当前为纯离线检索模式，未调用大模型。以上内容均为原文摘录，非生成式回答。）",
+            "content": "\n— 以上为本地检索结果，均来自知识库原文摘录。",
         }
+
+    # ------------------------------------------------------------------
+    def _offline_excerpt(self, content: str, query: str, limit: int = 500) -> str:
+        """离线展示用的原文摘录：保留表格等结构，不把换行压成一行。
+
+        短父块整段给出；长父块用查询词定位窗口（与 :func:`_query_window` 一致，
+        只切字符、**不 flatten 换行**，所以 Markdown 表格仍可读）。
+        """
+        c = (content or "").strip()
+        if len(c) <= limit:
+            return c
+        return _query_window(content, query, limit)
 
     # ------------------------------------------------------------------
     def complete(self, prompt: str, max_tokens: int = 200) -> str:

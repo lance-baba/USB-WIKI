@@ -3669,6 +3669,9 @@ def main() -> int:
         test_single_version_source(ctx)
         from tests.test_rag_regression import run as _run_rag
         _run_rag(ctx, check, section, skip)
+        # P0 Core-Loop 回归：导入→搜索→问答→引用（A~F 六条，脱敏合成 fixture）
+        from tests.test_p0_core_loop import run as _run_p0
+        _run_p0(ctx, check, section, skip)
         test_secret_redaction(ctx)
         test_import_security()
         test_archive_ssrf()

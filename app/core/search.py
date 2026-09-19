@@ -292,15 +292,51 @@ def _fts_search(db: Database, query: str, limit: int) -> tuple[list[str], str]:
     return _like_search(db, longest, limit)[0], "like"
 
 
+def _lexical_relevance(content: str, query: str, terms: list[str]) -> float:
+    """短词 / 词法召回的确定性 lexical 相关度打分（P0-E，不用 LLM reranker、不加大模型）。
+
+    信号（按权重叠加，全部可本地即时计算）：
+    * 完整查询命中（强信号）
+    * 词频（查询词出现次数）
+    * 章节标题命中（Markdown 标题行含查询词 → 该块是「关于这个主题的一节」）
+    * 相邻词短语（term_i 紧接 term_{i+1}，如「观测人员」）
+    * 短文本精确命中（整块很短且含全部词）
+    * 表格 / 结构上下文（块内含 Markdown 表格且命中词）
+
+    确定性：纯字符串运算，无随机、无外部依赖，相同输入永远同分。
+    """
+    if not content:
+        return 0.0
+    score = 0.0
+    if query and query in content:
+        score += 6.0
+    for t in terms:
+        score += content.count(t) * 1.0
+    for line in content.splitlines():
+        ls = line.lstrip()
+        if ls.startswith("#") and any(t in line for t in terms):
+            score += 4.0
+    for i in range(len(terms) - 1):
+        pair = terms[i] + terms[i + 1]
+        if pair in content:
+            score += 3.0
+    if len(content) <= 120 and all(t in content for t in terms):
+        score += 2.0
+    if "|" in content and any(t in content for t in terms):
+        score += 1.0
+    return score
+
+
 def _like_search(db: Database, terms, limit: int = LIKE_LIMIT) -> tuple[list[str], str]:
-    """短词 / 特殊缩写降级通道。
+    """短词 / 特殊缩写降级通道（P0-E：结果按 lexical 相关度排序）。
 
     ⚠ 必须按**实词**做子串匹配，**不能拿整句去 LIKE**：自然语言问句
     （如「台风有吗」）整句作为子串永远匹配不到 —— 那等于静默丢掉全部召回，
     只能靠向量路兜底，也正是「引用来源与提问无关」的成因之一。
 
     多个实词用 AND 组合（宁可少召回，也不要召回无关内容）；
-    实词过多时取最长的几个，避免条件爆炸。
+    实词过多时取最长的几个，避免条件爆炸。命中后**本地打分**并确定性排序，
+    不再「LIMIT 后无脑取」，保证「人员配备」章节排到泛化描述前列。
     """
     if isinstance(terms, str):
         terms = content_terms(terms)
@@ -311,10 +347,15 @@ def _like_search(db: Database, terms, limit: int = LIKE_LIMIT) -> tuple[list[str
     where = " AND ".join(["content LIKE '%' || ? || '%'"] * len(items))
     try:
         rows = db.query(
-            f"SELECT chunk_id FROM chunks WHERE {where} LIMIT ?",  # noqa: S608 - 占位符拼接，非用户输入
-            (*items, limit),
+            f"SELECT chunk_id, content FROM chunks WHERE {where} LIMIT ?",  # noqa: S608 - 占位符拼接，非用户输入
+            (*items, limit * 4),
         )
-        return [r["chunk_id"] for r in rows], "like"
+        scored = [
+            (_lexical_relevance(r["content"], " ".join(items), items), r["chunk_id"])
+            for r in rows
+        ]
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [cid for _, cid in scored[:limit]], "like"
     except sqlite3.Error as exc:
         log.error("LIKE 降级检索失败: %s", exc)
         return [], "like"
@@ -616,6 +657,18 @@ def hybrid_search(
                 "similarity": sim,
             }
         )
+
+    # P0-E：词法召回的确定性 lexical 重排（保持 allow_semantic_only=0，不用 LLM reranker）。
+    # 仅当有真实词法命中词时生效；以 lexical 分为主、RRF 分为辅，保证短词查询
+    # 「人员配备」章节稳定排在泛化描述前列，且不影响 FTS 高质量排序（分相同则 RRF 兜底）。
+    if lex_terms:
+        for p in parents:
+            p["_lex"] = _lexical_relevance(p.get("content") or "", query, lex_terms)
+        parents.sort(key=lambda p: (p["_lex"], p["score"]), reverse=True)
+        order_pids = [p["parent_id"] for p in parents]
+        references.sort(key=lambda r: order_pids.index(r.parent_id) if r.parent_id in order_pids else 1 << 30)
+        for i, r in enumerate(references, start=1):
+            r.id = i
 
     result.references = references
     result.parents = parents

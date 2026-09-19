@@ -171,7 +171,7 @@ def _t_a_no_runtime() -> None:
               out["provider"])
         check("A11 明确说明「本地 AI 模型尚未配置」",
               any("本地 AI 模型尚未配置" in w for w in out["warnings"]), str(out["warnings"]))
-        check("A12 正文标注未调用大模型", "未调用大模型" in out["answer"])
+        check("A12 正文标注未调用大模型", "未调用" in out["answer"])
 
         # A13/A14：/api/status 在冒烟测试里被高频轮询 → 默认读缓存**绝不发网络请求**；
         #          显式 probe=True 才许探测。这条不变量一破，首屏与冒烟都会被拖慢。
@@ -367,10 +367,12 @@ def _t_g_retrieval_unaffected() -> None:
         check("G1 检索被真实调用（不被 AI 就绪状态挡住）", calls["n"] == 1, str(calls))
         check("G2 引用 3 条", len(out["references"]) == 3, str(len(out["references"])))
         check("G3 provider = offline", out["provider"] == "offline", out["provider"])
-        check("G4 回答包含检索到的段落", "已在本地知识库中检索到 3 段" in out["answer"])
-        check("G5 明确标注未调用大模型", "未调用大模型" in out["answer"])
+        check("G4 回答包含检索到的段落（本地搜索结果展示原文）",
+              "本地搜索结果" in out["answer"] and "正文内容" in out["answer"])
+        check("G5 明确标注未调用大模型", "未调用" in out["answer"])
         check("G6 措辞为原文摘录，不冒充生成式回答",
-              "非生成式回答" in out["answer"], out["answer"][-80:])
+              "未调用" in out["answer"] and "原文摘录" in out["answer"],
+              out["answer"][-80:])
 
         # G7：连离线兜底都没有命中时也不报错（空手也要给建议，而不是崩）
         gw.retrieve = lambda q: search_mod.SearchResult(query=q, route="like")

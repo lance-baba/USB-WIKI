@@ -928,7 +928,10 @@ function cfgControl(sec, f, val) {
         '" oninput="this.closest(\'.field\').querySelector(\'.rangeval\').textContent=(+this.value).toFixed(2)">' +
         '<span class="rangeval">' + (+val).toFixed(2) + "</span></div>";
     case "ollama-model":
-      return '<div class="ctl-inline ollama-ctl"><select ' + a + ' class="ollama-sel">' +
+      // 对话模型：选中即持久化（P0-A），不要求再点「测试」/重启/刷新浏览器。
+      // 嵌入模型复用同一控件，但不需要即时落盘，故只对 ollama_chat_model 挂 onchange。
+      const selOnChange = f.key === "ollama_chat_model" ? ' onchange="onSelectChatModel(this)"' : "";
+      return '<div class="ctl-inline ollama-ctl"><select ' + a + ' class="ollama-sel"' + selOnChange + '>' +
         '<option value="' + esc(val) + '">' + esc(val || "加载中…") + "</option></select>" +
         '<button class="btn" type="button" title="重新读取本机已安装的 Ollama 模型" onclick="refreshOllamaModels()">刷新模型列表</button></div>' +
         '<div class="tip ollama-hint">正在读取本地 Ollama 模型…</div>';
@@ -1042,6 +1045,35 @@ async function refreshOllamaModels() {
       }
     }
   });
+}
+
+// P0-A：从「本地对话模型」下拉框选择模型 → 立即持久化 AI.ollama_chat_model，
+// 刷新 AI readiness，状态立即变 ready，下一次问答直接用 —— 无需点「测试」/重启/刷新页面。
+// 「测试本地 Ollama」仅保留为诊断按钮，不再承担「保存选择」的职责。
+async function onSelectChatModel(sel) {
+  const val = sel ? sel.value : "";
+  try {
+    const r = await api("/api/config", {
+      method: "POST",
+      body: JSON.stringify({ data: { AI: { ollama_chat_model: val } } }),
+    });
+    if (r.code !== 200) { toast("⚠ 模型选择保存失败：" + (r.message || "")); return; }
+    // 同步 CFG_ORIGINAL，避免后续「保存配置」把它覆盖回旧值
+    if (!CFG_ORIGINAL.AI) CFG_ORIGINAL.AI = {};
+    CFG_ORIGINAL.AI.ollama_chat_model = val;
+    // 立即刷新后端就绪状态（只读缓存、不发网络请求），UI 状态马上更新
+    await pollStatus(false);
+    const hint = sel && sel.closest(".ollama-ctl") && sel.closest(".ollama-ctl").parentElement
+      ? sel.closest(".ollama-ctl").parentElement.querySelector(".ollama-hint") : null;
+    if (hint) {
+      hint.innerHTML = val
+        ? ("✅ 已选择本地模型：" + esc(val) + "（已保存，可直接提问）")
+        : "已清空本地模型选择";
+    }
+    toast(val ? ("已选择并保存本地模型：" + val) : "已清空本地模型选择");
+  } catch (e) {
+    toast("⚠ 模型选择保存失败：" + e.message);
+  }
 }
 
 async function testAI(target) {

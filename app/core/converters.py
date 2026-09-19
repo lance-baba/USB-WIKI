@@ -398,8 +398,76 @@ def _docx_props(z: zipfile.ZipFile) -> str:
     return ""
 
 
-def _docx_para(el) -> tuple[str, int, bool]:
-    """返回 (文本, 标题层级, 是否列表项)。"""
+def _docx_styles(z: zipfile.ZipFile) -> dict[str, dict]:
+    """解析 ``word/styles.xml`` → {styleId: {name, outline, based}}。
+
+    用户真实 DOCX 里 ``w:pStyle/@w:val`` 常常是数字 styleId（如 ``44``），
+    而其指向的样式名才是 ``heading 1`` / ``标题 1``。必须靠这张映射把 ``44``
+    还原成「标题 1」，否则 ``:_docx_para`` 直接正则裸 styleId 会全部漏判。
+    ``outline`` 是样式自身声明的 ``w:outlineLvl``，``based`` 是 ``w:basedOn``
+    链，用于解析继承得到的标题层级。
+    """
+    raw = _zip_read(z, "word/styles.xml")
+    result: dict[str, dict] = {}
+    if not raw:
+        return result
+    try:
+        root = ET.fromstring(raw)
+    except ET.ParseError:
+        return result
+    for st in root.iter(f"{W}style"):
+        sid = st.get(f"{W}styleId")
+        if not sid:
+            continue
+        name_el = st.find(f"{W}name")
+        name = (name_el.get(f"{W}val") or "") if name_el is not None else ""
+        ppr = st.find(f"{W}pPr")
+        outline = None
+        if ppr is not None:
+            ol = ppr.find(f"{W}outlineLvl")
+            if ol is not None:
+                try:
+                    outline = int(ol.get(f"{W}val") or 0)
+                except (TypeError, ValueError):
+                    outline = None
+        based_el = st.find(f"{W}basedOn")
+        based = (based_el.get(f"{W}val") or "") if based_el is not None else ""
+        result[sid] = {"name": name, "outline": outline, "based": based}
+    return result
+
+
+def _docx_effective_level(styles: dict[str, dict], style_id: str) -> int:
+    """解析 styleId 的有效标题层级（1-6），沿 ``basedOn`` 链最多走 8 跳。
+
+    优先用样式自身的 ``outlineLvl``；没有则看样式名（heading/标题 1-6）；
+    都没有就沿继承链向上找。返回 0 表示不是标题。
+    """
+    seen: set[str] = set()
+    cur = style_id
+    for _ in range(8):
+        if not cur or cur in seen:
+            break
+        seen.add(cur)
+        info = styles.get(cur)
+        if not info:
+            break
+        if info["outline"] is not None:
+            return info["outline"] + 1
+        name = info["name"]
+        if name:
+            m = re.search(r"(?:heading|标题)\s*([1-6])", name, re.I) or re.fullmatch(r"([1-6])", name)
+            if m:
+                return int(m.group(1))
+        cur = info["based"]
+    return 0
+
+
+def _docx_para(el, styles: dict[str, dict] | None = None) -> tuple[str, int, bool]:
+    """返回 (文本, 标题层级, 是否列表项)。
+
+    styleId（如 ``44``）→ 经 ``_docx_styles`` 映射解析真实层级；
+    段落自身显式 ``w:outlineLvl`` 仍优先（最权威）。
+    """
     text = "".join(t.text or "" for t in el.iter(f"{W}t")).strip()
     level, is_list = 0, False
     ppr = el.find(f"{W}pPr")
@@ -412,10 +480,14 @@ def _docx_para(el) -> tuple[str, int, bool]:
                 level = int(outline.get(f"{W}val") or 0) + 1
             except (TypeError, ValueError):
                 level = 0
-        if not level:
-            m = re.search(r"(?:heading|标题)\s*([1-6])", style, re.I) or re.fullmatch(r"([1-6])", style)
-            if m:
-                level = int(m.group(1))
+        if not level and style:
+            # 裸 styleId（数字/任意串）→ 走 styles.xml 映射；失败再退化正则
+            if styles:
+                level = _docx_effective_level(styles, style)
+            if not level:
+                m = re.search(r"(?:heading|标题)\s*([1-6])", style, re.I) or re.fullmatch(r"([1-6])", style)
+                if m:
+                    level = int(m.group(1))
         if ppr.find(f"{W}numPr") is not None or "listparagraph" in style.lower():
             is_list = True
     return text, min(level, 6), is_list
@@ -446,6 +518,7 @@ def _h_docx(data: bytes, name: str, warnings: list[str]) -> ConversionResult:
     try:
         with _open_zip(data) as z:
             xml = _zip_read(z, "word/document.xml")
+            styles = _docx_styles(z)
             title = _docx_props(z) or _clean_title(name)
     except zipfile.BadZipFile:
         return ConversionResult(False, error=f"{name} 不是有效的 .docx（可能后缀被改过）")
@@ -461,23 +534,41 @@ def _h_docx(data: bytes, name: str, warnings: list[str]) -> ConversionResult:
     if body is None:
         return ConversionResult(False, error="文档结构异常（缺少 body）")
 
+    # 把「标题 + 紧随其后的表格」合并进同一个逻辑块（P0-D）：
+    # 切片器以空行为块边界、且标题起新块。若标题与表格间有空行，表格会被切到
+    # 无关 Parent，导致「搜索观测人员」召回不到人员配备表、LLM 也看不到职责/姓名。
+    # 这里让标题与紧邻表格保持同一段落（无空行），随章节语境一起进入 Parent。
     out: list[str] = []
+    pending_heading: str | None = None
     for el in list(body):
         tag = el.tag
         if tag == f"{W}p":
-            text, level, is_list = _docx_para(el)
+            text, level, is_list = _docx_para(el, styles)
             if not text:
                 continue
+            line = (f"{'#' * (level + 1)} {text}" if level else
+                    f"- {text}" if is_list else text)
+            # 标题后面如果紧跟的是普通段落（非表格），标题独立成块即可
+            if pending_heading is not None:
+                out.append(pending_heading)
+                pending_heading = None
             if level:
-                out.append(f"\n{'#' * (level + 1)} {text}\n")
-            elif is_list:
-                out.append(f"- {text}")
+                pending_heading = line   # 先挂起，等看下一节点是否表格
             else:
-                out.append(text)
+                out.append(line)
         elif tag == f"{W}tbl":
             table = _docx_table(el)
-            if table:
-                out.append("\n" + "\n".join(table) + "\n")
+            if not table:
+                continue
+            block = "\n".join(table)
+            if pending_heading is not None:
+                # 标题 + 紧邻表格 → 同一块，标题行与表格行之间不留空行
+                out.append(pending_heading + "\n" + block)
+                pending_heading = None
+            else:
+                out.append(block)
+    if pending_heading is not None:
+        out.append(pending_heading)
 
     md = "\n\n".join(x.strip("\n") for x in out if x.strip())
     if not md.strip():
