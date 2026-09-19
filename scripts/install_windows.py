@@ -143,6 +143,23 @@ def _default_library_target() -> Path:
     return _documents_dir() / "USB-WIKI-Data"
 
 
+def _read_marker_library(app_target: Path) -> Path | None:
+    """从已装 App 的 library_path.txt 反查真实 Library 路径（优先于默认路径）。
+
+    安装时 _write_launcher 把用户实际选择的 Library 写进 App 内 marker，
+    卸载时据此精确清理，避免误删默认路径以外的资料。
+    """
+    marker = app_target / LIBRARY_MARKER
+    if marker.is_file():
+        try:
+            p = Path(marker.read_text(encoding="utf-8").strip())
+            if p.is_absolute():
+                return p
+        except Exception:
+            pass
+    return None
+
+
 # ---------------------------------------------------------------------------
 # 基础工具
 # ---------------------------------------------------------------------------
@@ -417,6 +434,69 @@ def verify_release(root: Path, *, deep: bool = True):
     return _load_integrity().verify_media(root, deep=deep)
 
 
+def uninstall(app_target: Path, library_target: Path | None, *,
+              desktop_dir: Path | None = None, assume_yes: bool = False) -> int:
+    """卸载：删除 App + 桌面快捷方式 + Library（资料库）。纯标准库、零联网、零新依赖。
+
+    设计约束：
+      - Library 路径优先从 App/library_path.txt 反查真实位置；否则用默认 Library；
+      - 破坏性操作：默认需交互确认（输入 yes），--yes 供测试/自动化；
+      - 取消或 stdin 不可用时不删除任何东西。
+    """
+    marker_lib = _read_marker_library(app_target)
+    if marker_lib is not None:
+        library_target = marker_lib
+    elif library_target is None:
+        library_target = _default_library_target()
+
+    desk = Path(desktop_dir) if desktop_dir else _desktop_dir()
+    lnk = desk / SHORTCUT_NAME
+
+    app_exists = app_target.exists()
+    lib_exists = library_target.exists()
+    lnk_exists = lnk.exists()
+
+    if not (app_exists or lib_exists or lnk_exists):
+        print("[uninstall] 未发现已安装的 USB-WIKI，无需卸载。")
+        return 0
+
+    print("将删除以下内容：")
+    if app_exists:
+        print(f"  · 程序：{app_target}")
+    print(f"  · 资料库：{library_target}"
+          + ("" if lib_exists else "（不存在，跳过）")
+          + ("  ← 此操作会永久删除你导入的全部资料" if lib_exists else ""))
+    if lnk_exists:
+        print(f"  · 桌面快捷方式：{lnk}")
+    print("")
+    print("⚠ 警告：资料库删除后无法恢复。")
+
+    if not assume_yes:
+        try:
+            ans = input("确认卸载并删除全部资料？输入 yes 继续：").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\n已取消。")
+            return 0
+        if ans != "yes":
+            print("已取消，未做任何改动。")
+            return 0
+
+    if app_exists:
+        _rmtree(app_target)
+        print(f"[uninstall] 已删除程序：{app_target}")
+    if lib_exists:
+        _rmtree(library_target)
+        print(f"[uninstall] 已删除资料库：{library_target}")
+    if lnk_exists:
+        try:
+            lnk.unlink()
+            print(f"[uninstall] 已删除快捷方式：{lnk}")
+        except OSError as e:
+            print(f"[uninstall] 快捷方式删除失败（不影响其余）：{e}", file=sys.stderr)
+    print("[uninstall] 卸载完成。")
+    return 0
+
+
 def install(release_root: Path, app_target: Path, library_target: Path,
            launch: bool = False, port: int = 28988, smoke: bool = False,
            desktop_dir: Path | None = None) -> int:
@@ -557,6 +637,15 @@ def _parse(argv: list[str]):
     prun.add_argument("--no-browser", action="store_true",
                       help="不自动打开浏览器（调试/CI）")
 
+    puninstall = sub.add_parser("uninstall", help="卸载（删除程序与资料库，需确认）")
+    puninstall.add_argument("--app-target", default=None,
+                            help="App 目录（默认 LOCALAPPDATA\\USB-WIKI\\App）")
+    puninstall.add_argument("--library-target", default=None,
+                            help="Library 目录（默认 文档\\USB-WIKI-Data；优先读 App 内记录）")
+    puninstall.add_argument("--desktop-dir", default=None, help=argparse.SUPPRESS)
+    puninstall.add_argument("--yes", action="store_true",
+                            help="跳过交互确认（自动化/测试用）")
+
     args = ap.parse_args(argv)
     if args.cmd is None:
         # 双击 install.bat 不带参数 ⇒ 默认安装
@@ -585,6 +674,17 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "run":
         nb = getattr(args, "no_browser", False)
         return _run(app_target, library_target, args.port, no_browser=nb)
+
+    if args.cmd == "uninstall":
+        lib = Path(args.library_target).resolve() if args.library_target else None
+        return uninstall(
+            (Path(args.app_target).resolve() if args.app_target else _default_app_target()),
+            lib,
+            desktop_dir=(Path(args.desktop_dir).resolve()
+                         if getattr(args, "desktop_dir", None) else None),
+            assume_yes=getattr(args, "yes", False),
+        )
+
     return install(
         Path(args.release).resolve(), app_target, library_target,
         launch=getattr(args, "launch", False),

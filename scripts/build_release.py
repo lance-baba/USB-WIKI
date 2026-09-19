@@ -200,6 +200,17 @@ def _stage_installer(dist_root: Path) -> None:
         "..\\payload\\python-runtime\\python.exe install.py %*\r\n",
         encoding="ascii",
     )
+    (installer_dir / "uninstall.bat").write_text(
+        "@echo off\r\n"
+        "setlocal\r\n"
+        "cd /d \"%~dp0\"\r\n"
+        "if not exist \"..\\payload\\python-runtime\\python.exe\" (\r\n"
+        "  echo MEDIA_CORRUPTED: payload\\python-runtime\\python.exe missing\r\n"
+        "  exit /b 5\r\n"
+        ")\r\n"
+        "..\\payload\\python-runtime\\python.exe install.py uninstall %*\r\n",
+        encoding="ascii",
+    )
     if not (installer_dir / "install.py").is_file():
         _fail_build("installer/install.py 生成失败")
     if not (installer_dir / "release_integrity.py").is_file():
@@ -374,6 +385,8 @@ def _strict_gate(dist_root: Path, rt_ok: bool, info: dict, licenses: dict,
          "INSTALLER_MISSING", "缺少 installer/install.py")
     need((dist_root / "installer" / "install.bat").is_file(),
          "INSTALLER_MISSING", "缺少 installer/install.bat")
+    need((dist_root / "installer" / "uninstall.bat").is_file(),
+         "INSTALLER_MISSING", "缺少 installer/uninstall.bat")
     need(bool(info.get("git_commit")) and info.get("git_commit") != "unknown",
          "BUILD_INFO_INCOMPLETE", "BUILD_INFO.git_commit 未解析（版本不可追溯）")
     need(bool(info.get("python_version")),
