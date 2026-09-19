@@ -245,8 +245,12 @@ def run(ctx, check, section, skip) -> None:
 
     gw.test_ollama = _fake_test  # type: ignore[assignment]
     old_model = config.get_str("AI", "ollama_chat_model", "")
+    old_provider_a = config.get_str("AI", "provider", "auto")
     try:
-        config.update({"AI": {"ollama_chat_model": ""}}, persist=False)
+        # P0-A 验证的是「选模型即即时生效」，与用户选定的 provider 模式无关；
+        # 显式用 auto 隔离该维度 —— test_suite 全局会把 provider 设为 offline，
+        # 若不在此处覆盖，resolve_provider() 会直接返回 offline 而误判本用例失败。
+        config.update({"AI": {"provider": "auto", "ollama_chat_model": ""}}, persist=False)
         before = gw.ai_readiness(probe=False)
         check("P0-A 未选模型时 state=selection_required",
               before["state"] == STATE_SELECTION_REQUIRED, before["state"])
@@ -264,7 +268,8 @@ def run(ctx, check, section, skip) -> None:
         check("P0-A 仅保存选择不触发 /api/ai/test",
               called_test["n"] == 0, f"test 被调用 {called_test['n']} 次")
     finally:
-        config.update({"AI": {"ollama_chat_model": old_model}}, persist=False)
+        config.update({"AI": {"provider": old_provider_a,
+                              "ollama_chat_model": old_model}}, persist=False)
 
     # ---------------------------------------------------------------- P0-F
     section("P0-F：离线搜索结果展示（不伪装 AI 回答）")

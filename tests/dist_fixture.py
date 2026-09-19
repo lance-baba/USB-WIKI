@@ -102,6 +102,11 @@ def make_fake_release(parent: Path, *, app_version: str = "1.0.0",
         encoding="utf-8")
     (root / "installer" / "install.bat").write_text(
         "@echo off\r\nsetlocal\r\n", encoding="ascii")
+    # ⚠ 必须与真实发布布局一致：build_release._strict_gate 会检查 uninstall.bat 存在，
+    #   夹具漏了它会让 A3-4c「全绿不报错」恒红、并让 4d/4e/4f 因「缺 uninstall.bat」而
+    #   不是因被测因素变红（负向用例假装通过）。
+    (root / "installer" / "uninstall.bat").write_text(
+        "@echo off\r\nsetlocal\r\n", encoding="ascii")
 
     (root / "docs" / "README.md").write_text("# fake\n", encoding="utf-8")
     (root / "LICENSES" / "THIRD_PARTY.json").write_text(

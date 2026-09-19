@@ -11,6 +11,10 @@
   5. 仅给启动进程设置进程级 WIKIUSB_LIBRARY（不写系统全局环境变量）
   6. 用户双击入口 启动-Windows.bat 不含 --no-browser（自动开浏览器）；
      --no-browser 仅用于测试/CI/调试
+  7. 卸载安全收口（2026-09-19）：默认只删 App + 桌面快捷方式、**保留 Library**；
+     彻底清场需 `--delete-library --yes`（或交互选 2 并**逐字输入 DELETE**）。
+     自定义 App 安装目录 + 用户级 install_state.json 记录真实安装位置 ——
+     卸载/重装/快捷方式一律按真实位置，绝不假定默认目录。
 
 硬性边界（V1 Freeze / A2 范围）：
   - 纯标准库实现，零 pip、零联网、零外部二进制下载。
@@ -26,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import datetime
 import json
 import os
 import shutil
@@ -39,6 +44,10 @@ STAGING_SUFFIX = ".staging"
 BACKUP_SUFFIX = ".backup"
 LAUNCHER_NAME = "启动-Windows.bat"
 LIBRARY_MARKER = "library_path.txt"
+
+#: 用户级安装记录（跨会话定位真实安装位置，独立于 App 目录，卸载 App 后仍存在）
+STATE_DIRNAME = "USB-WIKI"
+STATE_FILENAME = "install_state.json"
 
 #: 稳定错误码：介质损坏（缺文件 / size 不符 / hash 不符 / manifest 损坏）
 MEDIA_CORRUPTED_RC = 4
@@ -158,6 +167,179 @@ def _read_marker_library(app_target: Path) -> Path | None:
         except Exception:
             pass
     return None
+
+
+# ---------------------------------------------------------------------------
+# 用户级安装记录（install_state.json）—— 跨会话定位真实安装位置
+# ---------------------------------------------------------------------------
+def _state_dir() -> Path:
+    """USB-WIKI 自己的用户级配置区。
+
+    刻意**与 App 目录解耦**：默认 App 落 ``%LOCALAPPDATA%\\USB-WIKI\\App``，
+    但自定义安装可把 App 放到任意盘符；安装记录必须始终落在一个**固定**位置，
+    这样卸载/重装/诊断才能找到真实安装位置，而不是假定默认目录。
+    """
+    # 测试隔离钩子：显式覆盖安装记录目录（正式运行不设置此变量）。
+    override = (os.environ.get("WIKIUSB_STATE_DIR") or "").strip()
+    if override:
+        return Path(override).expanduser()
+    local = os.environ.get("LOCALAPPDATA")
+    base = Path(local) if local else (Path.home() / ".usb-wiki")
+    return base / STATE_DIRNAME
+
+
+def _state_file() -> Path:
+    return _state_dir() / STATE_FILENAME
+
+
+def _write_state(app_target: Path, library_target: Path,
+                 app_version: str | None = None) -> None:
+    """安装成功后写安装记录（App 路径 + Library 路径）。纯标准库、仅用户级。"""
+    try:
+        d = _state_dir()
+        d.mkdir(parents=True, exist_ok=True)
+        data = {
+            "app_path": str(Path(app_target).resolve()),
+            "library_path": str(Path(library_target).resolve()),
+            "install_time_utc": datetime.datetime.now(datetime.timezone.utc)
+            .strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "app_version": app_version or "",
+        }
+        _state_file().write_text(
+            json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    except Exception as e:  # 安装记录失败**不算安装失败**（非 BLOCKER）
+        print(f"[install] 提示：安装记录写入失败（不影响安装）：{e}")
+
+
+def _read_state() -> dict | None:
+    f = _state_file()
+    if not f.is_file():
+        return None
+    try:
+        data = json.loads(f.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _clear_state() -> None:
+    """清除安装记录（卸载时调用；记录不存在或删除失败都不阻断卸载）。"""
+    try:
+        _state_file().unlink()
+    except OSError:
+        pass
+
+
+def _state_app_target() -> Path | None:
+    """从安装记录读回真实 App 目录（供重装 / 启动 / 诊断复用）。"""
+    state = _read_state()
+    if state and state.get("app_path"):
+        try:
+            return Path(state["app_path"]).resolve()
+        except Exception:
+            return None
+    return None
+
+
+def _state_library_target() -> Path | None:
+    """从安装记录读回真实 Library 目录。"""
+    state = _read_state()
+    if state and state.get("library_path"):
+        try:
+            return Path(state["library_path"]).resolve()
+        except Exception:
+            return None
+    return None
+
+
+# ---------------------------------------------------------------------------
+# 自定义 App 安装目录：安全校验 + 解析
+# ---------------------------------------------------------------------------
+def _looks_like_usbwiki_app(p: Path) -> bool:
+    """目标目录是否已是一个 USB-WIKI App（允许 reinstall / transactional upgrade）。"""
+    p = Path(p)
+    return ((p / "app" / "launcher.py").is_file()
+            or (p / LAUNCHER_NAME).is_file()
+            or (p / LIBRARY_MARKER).is_file()
+            or (p / "runtime" / "python.exe").is_file())
+
+
+def _validate_app_target(path: Path, release_root: Path | None = None) -> str | None:
+    """校验自定义 App 安装目录。合法返回 ``None``，否则返回**人话**错误描述。
+
+    安全红线：路径合法 / 父目录可创建可写 / 不是文件 / 不装进发布介质 /
+    不指向 Windows 系统目录 / 已存在目录只能是 USB-WIKI App。
+
+    ⚠ 绝不为了「腾位置」删除未知文件 —— 目录已存在其它文件时直接拒绝，
+      让用户另选空目录。
+    """
+    try:
+        p = Path(path).expanduser().resolve()
+    except Exception as e:
+        return f"路径无法解析（{e}）"
+    if p.is_file():
+        return "目标是一个文件，不是目录"
+    # 不能装进发布介质（解压目录 / payload）内 —— 否则卸载会把源一起删掉
+    if release_root is not None:
+        try:
+            p.relative_to(Path(release_root).resolve())
+            return "不能把程序安装到发布介质目录内（避免卸载误删安装源）"
+        except ValueError:
+            pass
+    # 不能指向 Windows 系统目录
+    sysroot = os.environ.get("SystemRoot")
+    if sysroot:
+        try:
+            sr = Path(sysroot).resolve()
+            if p == sr or p.relative_to(sr):
+                return "不能安装到 Windows 系统目录"
+        except ValueError:
+            pass
+    # 父目录必须可创建且可写（真写一个探针文件再删，比 os.access 可靠）
+    parent = p.parent
+    try:
+        parent.mkdir(parents=True, exist_ok=True)
+        probe = parent / ".usbwiki_writable_probe"
+        probe.write_text("x", encoding="utf-8")
+        probe.unlink()
+    except Exception as e:
+        return f"父目录不可写（{e}）"
+    # 已存在目录：只允许是 USB-WIKI App（reinstall）；否则拒绝
+    if p.exists() and not _looks_like_usbwiki_app(p):
+        return "目标目录已存在其它文件，请选择其它空目录"
+    return None
+
+
+def _resolve_app_target(explicit: str | None, *, interactive: bool,
+                        release_root: Path | None = None) -> Path:
+    """解析最终 App 安装目录：CLI 显式 > 交互输入 > 默认值。
+
+    交互式**仅在 stdin 为 TTY** 时启用：双击 .bat / CI 管道（无 TTY）自动落默认，
+    绝不因等不到输入而卡住。交互 / CLI / CI 三条入口最终共用同一 ``install()``。
+    """
+    if explicit:
+        err = _validate_app_target(Path(explicit), release_root)
+        if err:
+            fail(f"自定义安装目录无效：{err}")
+        return Path(explicit).expanduser().resolve()
+
+    # 无显式目标时，**优先沿用安装记录里的真实位置** —— 这样双击 install.bat 重装
+    # 会原地事务升级（而不是又装一份到默认目录），符合「重装使用真实安装路径」。
+    default = _state_app_target() or _default_app_target()
+    if interactive and sys.stdin is not None and sys.stdin.isatty():
+        try:
+            print("USB-WIKI 安装程序\n")
+            print(f"程序默认安装到：\n  {default}\n")
+            print("直接回车使用默认位置，或输入其它安装目录（例如 D:\\Apps\\USB-WIKI）：")
+            ans = input("> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            ans = ""
+        if ans:
+            err = _validate_app_target(Path(ans), release_root)
+            if err:
+                fail(f"自定义安装目录无效：{err}")
+            return Path(ans).expanduser().resolve()
+    return default
 
 
 # ---------------------------------------------------------------------------
@@ -434,19 +616,72 @@ def verify_release(root: Path, *, deep: bool = True):
     return _load_integrity().verify_media(root, deep=deep)
 
 
-def uninstall(app_target: Path, library_target: Path | None, *,
-              desktop_dir: Path | None = None, assume_yes: bool = False) -> int:
-    """卸载：删除 App + 桌面快捷方式 + Library（资料库）。纯标准库、零联网、零新依赖。
+def _prompt_menu(app_target: Path, library_target: Path) -> int:
+    """交互卸载菜单：返回 1（保留资料，默认）或 2（彻底删除）。"""
+    print("USB-WIKI 卸载程序\n")
+    print(f"程序目录：\n  {app_target}\n")
+    print(f"资料目录：\n  {library_target}\n")
+    print("请选择：\n")
+    print("  [1] 仅卸载程序，保留我的资料（推荐）")
+    print("  [2] 卸载程序，并永久删除全部 USB-WIKI 资料\n")
+    print("默认：1")
+    try:
+        ans = input("选择（1/2，直接回车 = 1）：").strip()
+    except (EOFError, KeyboardInterrupt):
+        ans = ""
+    return 2 if ans == "2" else 1
 
-    设计约束：
-      - Library 路径优先从 App/library_path.txt 反查真实位置；否则用默认 Library；
-      - 破坏性操作：默认需交互确认（输入 yes），--yes 供测试/自动化；
-      - 取消或 stdin 不可用时不删除任何东西。
+
+def _prompt_delete_confirm(library_target: Path) -> bool:
+    """彻底卸载的二次确认：必须**逐字**输入 ``DELETE``（不接受 y/yes）。"""
+    print(f"\n即将永久删除：\n  {library_target}\n")
+    print("其中包含你导入、保存和创建的全部资料。\n")
+    print("此操作不可恢复。请输入：\n")
+    print("  DELETE\n")
+    print("继续永久删除（输入其它内容即取消）：")
+    try:
+        ans = input("> ").strip()
+    except (EOFError, KeyboardInterrupt):
+        ans = ""
+    if ans == "DELETE":
+        return True
+    print("已取消，未做任何改动。")
+    return False
+
+
+def uninstall(*, app_target_cli: Path | None = None,
+              library_target_cli: Path | None = None,
+              desktop_dir: Path | None = None, assume_yes: bool = False,
+              delete_library: bool = False) -> int:
+    """卸载。产品原则：**默认只删程序，保留用户资料**。
+
+      · 默认（交互选 1）/ ``--yes``        → 删 App + 桌面快捷方式，**保留 Library**
+      · 交互选 2 / ``--delete-library --yes`` → 彻底清场（App + Library + 快捷方式 + 安装记录）
+      · 彻底卸载必须二次确认：交互需逐字输入 DELETE，CLI 需显式 ``--delete-library``
+
+    安装位置优先从**用户级安装记录**（install_state.json）反查，其次 App 内
+    library_path.txt，最后回退默认目录 —— 绝不因「默认目录不存在」就误判未安装。
+    纯标准库、零联网、零新依赖。
     """
-    marker_lib = _read_marker_library(app_target)
-    if marker_lib is not None:
-        library_target = marker_lib
-    elif library_target is None:
+    state = _read_state()
+    if app_target_cli is not None:
+        app_target = Path(app_target_cli).resolve()
+    elif state and state.get("app_path"):
+        app_target = Path(state["app_path"]).resolve()
+    else:
+        app_target = _default_app_target()
+
+    # Library 解析优先级：App 内 marker（运行时真实记录）> 安装记录 > CLI > 默认。
+    # ⚠ marker 优先于 CLI：marker 是**已装 App 自己记录的真实资料路径**；
+    #   若让 CLI 覆盖，一次传错的 --library-target 就可能删掉无关目录 / 漏删真实资料。
+    marker = _read_marker_library(app_target)
+    if marker is not None:
+        library_target: Path = marker
+    elif state and state.get("library_path"):
+        library_target = Path(state["library_path"]).resolve()
+    elif library_target_cli is not None:
+        library_target = Path(library_target_cli).resolve()
+    else:
         library_target = _default_library_target()
 
     desk = Path(desktop_dir) if desktop_dir else _desktop_dir()
@@ -460,40 +695,46 @@ def uninstall(app_target: Path, library_target: Path | None, *,
         print("[uninstall] 未发现已安装的 USB-WIKI，无需卸载。")
         return 0
 
-    print("将删除以下内容：")
-    if app_exists:
-        print(f"  · 程序：{app_target}")
-    print(f"  · 资料库：{library_target}"
-          + ("" if lib_exists else "（不存在，跳过）")
-          + ("  ← 此操作会永久删除你导入的全部资料" if lib_exists else ""))
-    if lnk_exists:
-        print(f"  · 桌面快捷方式：{lnk}")
-    print("")
-    print("⚠ 警告：资料库删除后无法恢复。")
+    # --- 决定模式：keep（保留资料）/ thorough（彻底清场）/ cancel（取消）---
+    if assume_yes:
+        mode = "thorough" if delete_library else "keep"
+    elif delete_library:
+        mode = "thorough" if _prompt_delete_confirm(library_target) else "cancel"
+    else:
+        choice = _prompt_menu(app_target, library_target)
+        if choice == 2:
+            mode = "thorough" if _prompt_delete_confirm(library_target) else "cancel"
+        else:
+            mode = "keep"
 
-    if not assume_yes:
-        try:
-            ans = input("确认卸载并删除全部资料？输入 yes 继续：").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            print("\n已取消。")
-            return 0
-        if ans != "yes":
-            print("已取消，未做任何改动。")
-            return 0
+    if mode == "cancel":
+        print("[uninstall] 已取消，未做任何改动。")
+        return 0
 
+    # --- 执行 ---
     if app_exists:
         _rmtree(app_target)
         print(f"[uninstall] 已删除程序：{app_target}")
-    if lib_exists:
-        _rmtree(library_target)
-        print(f"[uninstall] 已删除资料库：{library_target}")
     if lnk_exists:
         try:
             lnk.unlink()
             print(f"[uninstall] 已删除快捷方式：{lnk}")
         except OSError as e:
             print(f"[uninstall] 快捷方式删除失败（不影响其余）：{e}", file=sys.stderr)
-    print("[uninstall] 卸载完成。")
+
+    if mode == "thorough":
+        if lib_exists:
+            _rmtree(library_target)
+            print(f"[uninstall] 已删除资料库：{library_target}")
+        _clear_state()
+        print("[uninstall] 已彻底卸载，并清除 USB-WIKI 安装记录。")
+    else:
+        # 保留资料：清除安装记录（App 已不存在），资料库原样保留
+        _clear_state()
+        print("[uninstall] 程序已卸载。\n")
+        print("你的资料仍保存在：")
+        print(f"  {library_target}\n")
+        print("以后重新安装 USB-WIKI 可以继续使用这些资料。")
     return 0
 
 
@@ -548,6 +789,9 @@ def install(release_root: Path, app_target: Path, library_target: Path,
         # 5.5) 桌面快捷方式（P0-2）：swap 已成功才调用 → 只指正式 App；
         #      失败仅提示手动启动路径，绝不影响安装结果。
         create_desktop_shortcut(app_target, desktop_dir=desktop_dir)
+        # 5.6) 用户级安装记录：记住真实 App / Library 位置，供重装/卸载/诊断反查。
+        #      自定义安装目录时尤其关键 —— 卸载不得再假定默认目录。
+        _write_state(app_target, library_target)
         if launch:
             return _run(app_target, library_target, port, no_browser=False)
         return 0
@@ -637,14 +881,18 @@ def _parse(argv: list[str]):
     prun.add_argument("--no-browser", action="store_true",
                       help="不自动打开浏览器（调试/CI）")
 
-    puninstall = sub.add_parser("uninstall", help="卸载（删除程序与资料库，需确认）")
+    puninstall = sub.add_parser(
+        "uninstall", help="卸载（默认只删程序、保留资料；--delete-library 才清资料）")
     puninstall.add_argument("--app-target", default=None,
-                            help="App 目录（默认 LOCALAPPDATA\\USB-WIKI\\App）")
+                            help="App 目录（默认读安装记录，其次 LOCALAPPDATA\\USB-WIKI\\App）")
     puninstall.add_argument("--library-target", default=None,
-                            help="Library 目录（默认 文档\\USB-WIKI-Data；优先读 App 内记录）")
+                            help="Library 目录（默认读安装记录 / App 内记录 / 文档\\USB-WIKI-Data）")
     puninstall.add_argument("--desktop-dir", default=None, help=argparse.SUPPRESS)
+    puninstall.add_argument("--delete-library", dest="delete_library", action="store_true",
+                            help="彻底卸载：连同 Library 一起删除（破坏性；需配 --yes 或交互确认 DELETE）")
     puninstall.add_argument("--yes", action="store_true",
-                            help="跳过交互确认（自动化/测试用）")
+                            help="非交互（自动化/测试用）。注意：--yes 单独使用**只删程序、保留资料**；"
+                                 "彻底清场需再加 --delete-library")
 
     args = ap.parse_args(argv)
     if args.cmd is None:
@@ -667,26 +915,35 @@ def main(argv: list[str] | None = None) -> int:
                           as_json=getattr(args, "json", False),
                           deep=not getattr(args, "shallow", False))
 
-    app_target = Path(args.app_target).resolve() if args.app_target else _default_app_target()
-    library_target = (Path(args.library_target).resolve()
-                      if args.library_target else _default_library_target())
-
-    if args.cmd == "run":
-        nb = getattr(args, "no_browser", False)
-        return _run(app_target, library_target, args.port, no_browser=nb)
-
     if args.cmd == "uninstall":
-        lib = Path(args.library_target).resolve() if args.library_target else None
         return uninstall(
-            (Path(args.app_target).resolve() if args.app_target else _default_app_target()),
-            lib,
+            app_target_cli=(Path(args.app_target).resolve() if args.app_target else None),
+            library_target_cli=(Path(args.library_target).resolve()
+                                if args.library_target else None),
             desktop_dir=(Path(args.desktop_dir).resolve()
                          if getattr(args, "desktop_dir", None) else None),
             assume_yes=getattr(args, "yes", False),
+            delete_library=getattr(args, "delete_library", False),
         )
 
+    if args.cmd == "run":
+        # 启动也按**真实安装位置**：显式 > 安装记录 > 默认（自定义安装后不得找默认目录）
+        app_target = _resolve_app_target(getattr(args, "app_target", None),
+                                         interactive=False)
+        library_target = (Path(args.library_target).resolve() if args.library_target
+                          else (_state_library_target() or _default_library_target()))
+        nb = getattr(args, "no_browser", False)
+        return _run(app_target, library_target, args.port, no_browser=nb)
+
+    release_root = Path(args.release).resolve()
+    # 交互 / CLI / CI 三条入口共用同一解析：
+    #   显式 --app-target → 校验后使用；否则 TTY 下可交互输入；否则**已装位置**/默认。
+    app_target = _resolve_app_target(getattr(args, "app_target", None),
+                                     interactive=True, release_root=release_root)
+    library_target = (Path(args.library_target).resolve() if args.library_target
+                      else (_state_library_target() or _default_library_target()))
     return install(
-        Path(args.release).resolve(), app_target, library_target,
+        release_root, app_target, library_target,
         launch=getattr(args, "launch", False),
         port=args.port,
         smoke=getattr(args, "verify", True),

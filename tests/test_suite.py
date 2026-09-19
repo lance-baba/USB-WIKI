@@ -3523,6 +3523,11 @@ def _isolate_data_dir() -> Path:
     for d in (paths.DATA_DIR, paths.NOTES_DIR, paths.SNAPSHOT_DIR, paths.ORIGINALS_DIR):
         d.mkdir(parents=True, exist_ok=True)
 
+    # 安装记录（install_state.json）默认落 %LOCALAPPDATA%\USB-WIKI —— 属于**用户级**位置。
+    # 安装类用例（A1/A2/A4.2b）会起子进程跑 install_windows.py，必须让它们写进临时目录，
+    # 否则会污染真实 LOCALAPPDATA（A1 契约：零真实 LOCALAPPDATA 写入）。子进程继承本 env。
+    os.environ["WIKIUSB_STATE_DIR"] = str(tmp / "install_state")
+
     # ⚠ 只改 paths.CONFIG_FILE 还不够：config 模块在**导入时**就把 _path 绑定到了
     # 真实路径（`_path: Path = paths.CONFIG_FILE`），之后再改 paths 对它无效。
     # 后果是测试里任何 `config.update(..., persist=True)` 都会写进用户的真实
@@ -3672,6 +3677,9 @@ def main() -> int:
         # P0 Core-Loop 回归：导入→搜索→问答→引用（A~F 六条，脱敏合成 fixture）
         from tests.test_p0_core_loop import run as _run_p0
         _run_p0(ctx, check, section, skip)
+        # 安装 / 卸载安全收口回归：默认保留资料 · 自定义 App 目录 · 彻底清场（临时目录，零真实写入）
+        from tests.test_install_uninstall import run as _run_iut
+        _run_iut(ctx, check, section, skip)
         test_secret_redaction(ctx)
         test_import_security()
         test_archive_ssrf()
