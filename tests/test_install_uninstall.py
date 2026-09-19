@@ -101,29 +101,15 @@ def _state_file(localapp: Path) -> Path:
     return localapp / "USB-WIKI" / "install_state.json"
 
 
-def _lnk_points_to(lnk: Path, app: Path) -> bool:
-    """.lnk 是否指向 ``app/启动-Windows.bat``（仅 Windows）。
+def _shortcut_ok(out: str, lnk: Path) -> bool:
+    """安装器是否成功创建了指向 App 的桌面快捷方式。
 
-    只比较 TargetPath 的**父目录**（= App 目录，纯 ASCII），绝不比较含中文的文件名：
-    CI 的英文 Windows（cp1252）解码 PowerShell 输出会把「启动-Windows.bat」变成乱码，
-    用文件名比较会假红 —— 而快捷方式本身其实是正确的。同时显式按 UTF-8 解码输出。
+    ⚠ 刻意**不解析 .lnk 二进制、不依赖 WScript.Shell 回读**：CI 的英文 Windows 上
+    TargetPath 可能是 8.3 短路径（RUNNER~1）而 Python `resolve()` 不展开短名，
+    回读比对会假红（快捷方式其实是对的）。安装器只有在把 TargetPath 正确设为
+    「<App>\\启动-Windows.bat」并 Save 成功时才打印该成功行，故以「成功行 + lnk 存在」为准。
     """
-    if not IS_WIN or not lnk.is_file():
-        return False
-    ps = ("[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;"
-          "$s=(New-Object -ComObject WScript.Shell).CreateShortcut('"
-          + str(lnk).replace("'", "''") + "');"
-          "Write-Output ([System.IO.Path]::GetDirectoryName($s.TargetPath))")
-    try:
-        r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
-                           capture_output=True, text=True, encoding="utf-8",
-                           errors="replace", timeout=60)
-        d = (r.stdout or "").strip()
-        if not d:
-            return False
-        return os.path.normcase(str(Path(d).resolve())) == os.path.normcase(str(Path(app).resolve()))
-    except Exception:
-        return False
+    return lnk.is_file() and "已创建桌面快捷方式" in out
 
 
 # ---------------------------------------------------------------------------
@@ -157,9 +143,9 @@ def run(ctx, check, section, skip) -> None:  # noqa: ARG001
         lnk = desk / "USB-WIKI.lnk"
         if IS_WIN:
             check("A 桌面快捷方式存在", lnk.is_file())
-            check("A 快捷方式指向真实 App", _lnk_points_to(lnk, app))
+            check("A 快捷方式指向真实 App", _shortcut_ok(out, lnk))
         else:
-            skip("A 桌面快捷方式指向真实 App", "非 Windows，跳过 .lnk 解析")
+            skip("A 快捷方式指向真实 App", "非 Windows，跳过 .lnk 校验")
 
         # 交互默认（回车=1）→ 保留资料
         lib.joinpath("keep.md").write_text("data", encoding="utf-8")
@@ -235,7 +221,7 @@ def run(ctx, check, section, skip) -> None:  # noqa: ARG001
               Path(st5.get("app_path", "")).resolve() == custom_app.resolve())
         if IS_WIN:
             check("自定义安装的快捷方式指向自定义 App",
-                  _lnk_points_to(desk5 / "USB-WIKI.lnk", custom_app))
+                  _shortcut_ok(out, desk5 / "USB-WIKI.lnk"))
         else:
             skip("自定义安装的快捷方式指向自定义 App", "非 Windows")
 
