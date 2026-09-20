@@ -156,7 +156,8 @@ def index_parsed(
     vec_error: str | None = None
     if embedder is not None and parsed.children:
         try:
-            vectors = _embed_in_batches(embedder, [c.content for c in parsed.children])
+            # P0-4：向量也建在 retrieval_text（含章节路径）上 —— 章节语境对语义召回同样有用
+            vectors = _embed_in_batches(embedder, [c.retrieval_text for c in parsed.children])
         except Exception as exc:  # noqa: BLE001 - 向量失败必须降级而非中断索引
             vec_error = f"向量化失败，已仅建词法索引: {type(exc).__name__}: {exc}"
             log.warning("[%s] %s", parsed.rel_path, vec_error)
@@ -223,22 +224,27 @@ def index_parsed(
                 log.warning("doc_meta 写入失败 %s: %s", parsed.rel_path, exc)
 
             conn.executemany(
-                "INSERT OR REPLACE INTO parent_blocks(parent_id, doc_id, content, ord) VALUES (?,?,?,?)",
-                [(p.parent_id, p.doc_id, p.content, p.ord) for p in parsed.parents],
+                "INSERT OR REPLACE INTO parent_blocks(parent_id, doc_id, content, ord, section_path)"
+                " VALUES (?,?,?,?,?)",
+                [(p.parent_id, p.doc_id, p.content, p.ord, p.section_path) for p in parsed.parents],
             )
             conn.executemany(
                 "INSERT OR REPLACE INTO chunk_metadata(chunk_id, doc_id, parent_id, char_len) VALUES (?,?,?,?)",
                 [(c.chunk_id, c.doc_id, c.parent_id, len(c.content)) for c in parsed.children],
             )
+            # P0-4：content=展示原文（永不被改写），retrieval_text=章节路径+原文（建索引用）
             conn.executemany(
-                "INSERT OR REPLACE INTO chunks(chunk_id, doc_id, parent_id, content) VALUES (?,?,?,?)",
-                [(c.chunk_id, c.doc_id, c.parent_id, c.content) for c in parsed.children],
+                "INSERT OR REPLACE INTO chunks"
+                "(chunk_id, doc_id, parent_id, content, section_path, retrieval_text)"
+                " VALUES (?,?,?,?,?,?)",
+                [(c.chunk_id, c.doc_id, c.parent_id, c.content,
+                  c.section_path, c.retrieval_text) for c in parsed.children],
             )
             # FTS5 的 INSERT OR REPLACE 不会替换，而是静默追加重复行 —— 必须显式先删
             conn.execute("DELETE FROM chunks_fts WHERE doc_id = ?", (parsed.doc_id,))
             conn.executemany(
                 "INSERT INTO chunks_fts(chunk_id, doc_id, content) VALUES (?,?,?)",
-                [(c.chunk_id, c.doc_id, c.content) for c in parsed.children],
+                [(c.chunk_id, c.doc_id, c.retrieval_text) for c in parsed.children],
             )
 
             vec_written = 0

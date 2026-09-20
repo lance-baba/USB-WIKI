@@ -19,7 +19,19 @@ PARENT_HARD_LIMIT = 1200  # 单块超长时强制硬切，防止异常文档撑�
 
 _FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n?", re.DOTALL)
 _WIKILINK_RE = re.compile(r"\[\[([^\[\]|]+?)(?:\|[^\[\]]*)?\]\]")
-_HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s+", re.MULTILINE)
+_MD_HEADING_RE = re.compile(r"^\s{0,3}(#{1,6})\s+(.+?)\s*$")
+# 伪标题：真实公文（DOCX 转 Markdown）里章节号常是纯文本而非 `#`。
+# 形如「三、观测目的和内容」「（二）观测内容」「㈡、观测内容」「2、沉降点布设」「2.1 点位」。
+# ⚠ 只在「整块只有一行且够短」时才算标题，避免把正文里的编号列表误当章节。
+_PSEUDO_HEADING_RE = re.compile(
+    r"^\s*(?:"
+    r"[一二三四五六七八九十百零〇]{1,4}\s*[、.．]"          # 三、 二.
+    r"|[（(]\s*[一二三四五六七八九十\d]{1,3}\s*[）)]"        # （二） (2)
+    r"|[㈠-㈩⑴-⑿⒈-⒛]"                                       # ㈡ ⑴
+    r"|\d{1,3}(?:\.\d{1,3}){0,3}\s*[、.．]"                  # 2、 2.1.
+    r"|\d{1,3}(?:\.\d{1,3}){1,3}\s"                          # 2.1 点位
+    r")"
+)
 _SENT_SPLIT_RE = re.compile(r"(?<=[。！？!?；;])\s*|(?<=\.)\s+|\n{2,}")
 _CODE_FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
 
@@ -30,6 +42,14 @@ class ChildChunk:
     doc_id: str
     parent_id: str
     content: str
+    #: 章节路径（P0-4）：如「三、观测目的和内容 > ㈡、观测内容 > 2、沉降点布设」。
+    #: **只用于检索**（拼成 retrieval_text 给 FTS / embedding），UI 与引用仍显示原始 content。
+    section_path: str = ""
+
+    @property
+    def retrieval_text(self) -> str:
+        """建索引用的检索文本 = 章节路径 + 原文。"""
+        return retrieval_text_of(self.section_path, self.content)
 
 
 @dataclass
@@ -38,6 +58,14 @@ class ParentBlock:
     doc_id: str
     content: str
     ord: int
+    section_path: str = ""
+
+
+def retrieval_text_of(section_path: str, content: str) -> str:
+    """检索文本的唯一构造点（P0-4）：章节路径在前、原文在后。"""
+    sp = (section_path or "").strip()
+    body = content or ""
+    return f"{sp}\n\n{body}" if sp else body
 
 
 @dataclass
@@ -105,31 +133,72 @@ def extract_wikilinks(body: str) -> list[str]:
 
 
 # --------------------------------------------------------------------------
-def _split_parents(body: str) -> list[str]:
-    """按 Markdown 逻辑段落聚合父分块；标题处强制起新块。"""
-    blocks: list[str] = []
+def _heading_of(block: str) -> tuple[int, str] | None:
+    """识别 Markdown 标题与「伪标题」（纯文本章节号），返回 (level, text)。"""
+    stripped = block.strip()
+    if not stripped:
+        return None
+    first = stripped.splitlines()[0].strip()
+    m = _MD_HEADING_RE.match(first)
+    if m:
+        return len(m.group(1)), m.group(2).strip()
+    # 伪标题：整块单行 + 够短 + 以章节号开头
+    if len(stripped.splitlines()) == 1 and len(first) <= 40 and _PSEUDO_HEADING_RE.match(first):
+        if re.match(r"^\s*[一二三四五六七八九十百零〇]{1,4}\s*[、.．]", first):
+            level = 1
+        elif re.match(r"^\s*[（(㈠-㈩⑴-⑿]", first):
+            level = 2
+        else:
+            level = 3 + first.count(".")              # 2、→3；2.1→4
+        return min(level, 6), first
+    return None
+
+
+def _split_parents(body: str) -> list[tuple[str, str]]:
+    """按 Markdown 逻辑段落聚合父分块；标题处强制起新块。
+
+    返回 ``[(parent_text, section_path)]`` —— section_path 是**该块所处章节的层级路径**
+    （P0-4），例如「三、观测目的和内容 > ㈡、观测内容 > 2、沉降点布设」。
+    只做检索用，不改写用户 Markdown。
+    """
+    blocks: list[tuple[str, str]] = []
+    stack: list[tuple[int, str]] = []
     buf = ""
+
+    def path() -> str:
+        return " > ".join(t for _, t in stack)
+
+    def flush() -> None:
+        nonlocal buf
+        if buf.strip():
+            blocks.append((buf.strip(), path()))
+        buf = ""
 
     for raw_block in re.split(r"\n{2,}", body):
         block = raw_block.strip("\n")
         if not block.strip():
             continue
-        starts_heading = bool(_HEADING_RE.match(block))
+        h = _heading_of(block)
+        if h is not None:
+            flush()
+            level, text = h
+            while stack and stack[-1][0] >= level:
+                stack.pop()
+            stack.append((level, text))
+            buf = block
+            continue
         would_overflow = len(buf) + len(block) + 2 > PARENT_SIZE
-
-        if buf and (starts_heading or would_overflow):
-            blocks.append(buf.strip())
-            buf = ""
+        if buf and would_overflow:
+            flush()
         buf = f"{buf}\n\n{block}" if buf else block
 
         # 单块极长（如整段代码/长表格）时硬切
         while len(buf) > PARENT_HARD_LIMIT:
             head, buf = buf[:PARENT_SIZE], buf[PARENT_SIZE:]
-            blocks.append(head.strip())
+            blocks.append((head.strip(), path()))
 
-    if buf.strip():
-        blocks.append(buf.strip())
-    return [b for b in blocks if b]
+    flush()
+    return [(b, p) for b, p in blocks if b]
 
 
 def _sentences(text: str) -> list[str]:
@@ -142,7 +211,8 @@ def _sentences(text: str) -> list[str]:
     return out or [text]
 
 
-def _split_children(parent_text: str, parent_id: str, doc_id: str, start_idx: int) -> list[ChildChunk]:
+def _split_children(parent_text: str, parent_id: str, doc_id: str, start_idx: int,
+                    section_path: str = "") -> list[ChildChunk]:
     """在父分块内做 200/30 滑窗切片，优先在句子边界断开。"""
     out: list[ChildChunk] = []
     idx = start_idx
@@ -158,6 +228,7 @@ def _split_children(parent_text: str, parent_id: str, doc_id: str, start_idx: in
                     doc_id=doc_id,
                     parent_id=parent_id,
                     content=content,
+                    section_path=section_path,
                 )
             )
             idx += 1
@@ -204,10 +275,11 @@ def parse(text: str, rel_path: str) -> ParsedDoc:
     parents: list[ParentBlock] = []
     children: list[ChildChunk] = []
     cursor = 0
-    for i, ptext in enumerate(parent_texts):
+    for i, (ptext, spath) in enumerate(parent_texts):
         pid = f"{doc_id}:p{i}"
-        parents.append(ParentBlock(parent_id=pid, doc_id=doc_id, content=ptext, ord=i))
-        kids = _split_children(ptext, pid, doc_id, cursor)
+        parents.append(ParentBlock(parent_id=pid, doc_id=doc_id, content=ptext, ord=i,
+                                   section_path=spath))
+        kids = _split_children(ptext, pid, doc_id, cursor, section_path=spath)
         children.extend(kids)
         cursor += len(kids)
 

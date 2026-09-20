@@ -57,15 +57,21 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         doc_id    TEXT NOT NULL,
         content   TEXT NOT NULL,
         ord       INTEGER DEFAULT 0,
+        section_path TEXT DEFAULT '',
         FOREIGN KEY(doc_id) REFERENCES documents(doc_id) ON DELETE CASCADE
     );""",
     # 子切片正文表：短词降级走 LIKE 全表扫描（PRD 4.3）
+    # P0-4：`content` 是**展示原文**（UI / 引用 / 摘录用，永不被改写）；
+    #       `retrieval_text` = section_path + content，供 FTS / LIKE / embedding 使用。
     """CREATE TABLE IF NOT EXISTS chunks (
         chunk_id  TEXT PRIMARY KEY,
         doc_id    TEXT NOT NULL,
         parent_id TEXT NOT NULL,
-        content   TEXT NOT NULL
+        content   TEXT NOT NULL,
+        section_path TEXT DEFAULT '',
+        retrieval_text TEXT DEFAULT ''
     );""",
+    # 注意：这里的 `content` 列存的是 retrieval_text（章节路径 + 原文），不是展示原文。
     """CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
         chunk_id UNINDEXED,
         doc_id UNINDEXED,

@@ -11,11 +11,12 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import sqlite3
 from dataclasses import dataclass, field
 
-from . import chunker, config
+from . import chunker
 from .db import Database
 from .log_util import get_logger
 
@@ -102,6 +103,13 @@ _CJK_EDGE_STOPWORDS = (
 
 
 _CJK_SPLIT_CHARS = "的了吗呢吧啊呀么是在和与及有"
+
+#: 疑问/虚词字：不应作为检索实词（「哪里 / 几个 / 怎样」等）。
+_QCHARS = set("哪几怎何啥吗呢吧啊呀么")
+
+
+def _has_qchar(s: str) -> bool:
+    return any(c in _QCHARS for c in s)
 
 
 def _is_usable_term(t: str) -> bool:
@@ -201,6 +209,84 @@ def content_terms(query: str) -> list[str]:
     return sets[0] if sets else []
 
 
+# --------------------------------------------------------------------------
+# 轻量确定性 Query Analysis（P0-3）—— 不引入任何分词/大模型依赖
+# --------------------------------------------------------------------------
+#: 疑问类型 → 触发词。刻意只放**问句特征词**，不含任何项目内容。
+_QTYPE_PATTERNS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("quantity", ("多少", "几个", "几台", "几人", "几根", "几处", "几次", "几遍",
+                  "几条", "几件", "几组", "几套", "几层", "多大", "多长", "多重",
+                  "多高", "多厚", "数量", "共有", "总共", "一共", "合计", "总计", "共计")),
+    ("person", ("谁", "负责人", "姓名", "联系人", "哪位", "责任人", "由谁", "人员的名字")),
+    ("datetime", ("什么时候", "何时", "多久", "多长时间", "频率", "周期", "每几",
+                  "每隔", "几天", "几个月", "几日")),
+    ("model", ("型号", "规格", "什么仪器", "什么设备", "哪些仪器", "哪些设备")),
+    ("location", ("哪里", "在哪", "位置", "地点", "点位")),
+)
+
+#: 范围标记：「观测方案中」「报告里」「关于观测方案」
+_SCOPE_SUFFIXES = ("中", "里", "内")
+_SCOPE_PREFIXES = ("关于", "对于", "针对")
+
+
+def question_type(query: str) -> str:
+    """判断问句类型（quantity / person / datetime / model / location / general）。"""
+    q = query or ""
+    for name, kws in _QTYPE_PATTERNS:
+        if any(k in q for k in kws):
+            return name
+    return "general"
+
+
+@dataclass
+class QueryAnalysis:
+    """一次查询的轻量解析结果（P0-3）。"""
+
+    raw: str
+    question_type: str = "general"
+    scope: list[str] = field(default_factory=list)    # 范围/语境词（原始，未修剪）
+    target: list[str] = field(default_factory=list)   # 目标/内容词（原始，未修剪）
+
+    @property
+    def all_terms(self) -> list[str]:
+        return list(dict.fromkeys(self.scope + self.target))
+
+
+def analyze_query(query: str) -> QueryAnalysis:
+    """把自然语言问句拆成 scope（范围）与 target（目标）两组候选词。
+
+    规则刻意轻量、确定性（不要大模型、不要分词库）：
+
+    * ``关于X`` / ``对于X`` / ``针对X`` 前缀 → X 是 scope；
+    * ``X中`` / ``X里`` / ``X内`` 后缀 → X 是 scope（「观测方案中，观测点共有几个？」）；
+    * 其余实词 → target。
+
+    识别不出 scope 时 scope 为空 —— 此时**不要**把 scope 缺失当成「必须全部硬 AND」的
+    理由，target 自己就走多层召回（见 :func:`_tiered_recall`）。
+    """
+    q = (query or "").strip()
+    ana = QueryAnalysis(raw=q, question_type=question_type(q))
+    for run in query_terms(q):
+        r = run
+        for pre in _SCOPE_PREFIXES:
+            if len(r) > len(pre) + 1 and r.startswith(pre):
+                ana.scope.append(r[len(pre):])
+                r = ""
+                break
+        if not r:
+            continue
+        if len(r) >= 3 and r[-1] in _SCOPE_SUFFIXES and _CJK_RUN_RE.fullmatch(r):
+            head = r[:-1]
+            # 「X里」作为范围标记（如「方案里」「报告内」），但「在哪里 / 在哪里」
+            # 是疑问词而非范围 —— head 落到「哪」上时不当作 scope，否则整句被吞掉、
+            # target 变空、召回直接归零。
+            if len(head) >= 2 and _is_usable_term(head) and not head.endswith("哪"):
+                ana.scope.append(head)
+                continue
+        ana.target.append(r)
+    return ana
+
+
 def should_use_like_terms(terms: list[str]) -> bool:
     """trigram 索引最小可用粒度为 3 字符，更短的必须走 LIKE 降级通道。"""
     if not terms:
@@ -297,42 +383,88 @@ def _fts_search(db: Database, query: str, limit: int) -> tuple[list[str], str]:
     return _like_search(db, longest, limit)[0], "like"
 
 
-def _lexical_relevance(content: str, query: str, terms: list[str]) -> float:
+def _lexical_relevance(content: str, query: str, terms: list[str],
+                       section_path: str = "", idf: dict[str, float] | None = None) -> float:
     """短词 / 词法召回的确定性 lexical 相关度打分（P0-E，不用 LLM reranker、不加大模型）。
 
     信号（按权重叠加，全部可本地即时计算）：
     * 完整查询命中（强信号）
-    * 词频（查询词出现次数）
+    * 词频 × **IDF**（稀有答案词如 厂房/BM1 权重高；泛词 观测 权重趋近于 0）
     * 章节标题命中（Markdown 标题行含查询词 → 该块是「关于这个主题的一节」）
     * 相邻词短语（term_i 紧接 term_{i+1}，如「观测人员」）
     * 短文本精确命中（整块很短且含全部词）
     * 表格 / 结构上下文（块内含 Markdown 表格且命中词）
 
+    IDF 是 P0-8 重排的关键：没有它，「观测」这类泛词因出现在每个章节标题而把无关
+    分块顶到答案分块前面（实测「观测点共有几个」竟被「观测内容」章节反超）。
     确定性：纯字符串运算，无随机、无外部依赖，相同输入永远同分。
     """
-    if not content:
+    if not content and not section_path:
         return 0.0
+    content = content or ""
+    # FTS5 trigram 是大小写不敏感的；词法匹配也必须一致，否则「halting」匹配不到
+    # 语料里的「Halting」（这是 RAG 回归 halting problem 召回归零的根因）。
+    c_low = content.lower()
+    q_low = (query or "").lower()
+    terms_low = [t.lower() for t in terms]
     score = 0.0
-    if query and query in content:
-        score += 6.0
-    for t in terms:
-        score += content.count(t) * 1.0
+    if q_low and q_low in c_low:
+        score += 6.0 * _idf_weight(idf, (query or "")[:2])
+    for t, tl in zip(terms, terms_low):
+        w = _idf_weight(idf, t)
+        score += c_low.count(tl) * 1.0 * w
     for line in content.splitlines():
         ls = line.lstrip()
-        if ls.startswith("#") and any(t in line for t in terms):
-            score += 4.0
+        if ls.startswith("#") and any(tl in line.lower() for tl in terms_low):
+            score += 4.0 * max((_idf_weight(idf, t) for t, tl in zip(terms, terms_low)
+                                if tl in line.lower()), default=0.0)
+    # P0-4：章节路径命中 → 与标题命中同权（说明本块就处在「关于该主题」的章节里）
+    if section_path:
+        sp_low = section_path.lower()
+        spw = max((_idf_weight(idf, t) for t, tl in zip(terms, terms_low) if tl in sp_low),
+                  default=0.0)
+        if spw:
+            score += 4.0 * spw
     for i in range(len(terms) - 1):
-        pair = terms[i] + terms[i + 1]
-        if pair in content:
+        pair = (terms[i] + terms[i + 1]).lower()
+        if pair in c_low:
             score += 3.0
-    if len(content) <= 120 and all(t in content for t in terms):
+    if len(content) <= 120 and all(tl in c_low for tl in terms_low):
         score += 2.0
-    if "|" in content and any(t in content for t in terms):
+    if "|" in content and any(tl in c_low for tl in terms_low):
         score += 1.0
     return score
 
 
-def _like_search(db: Database, terms, limit: int = LIKE_LIMIT) -> tuple[list[str], str]:
+def _fts_ids(db: Database, terms: list[str], limit: int, conj: bool = True) -> list[str]:
+    """按词项跑 FTS5 MATCH（conj=False 时用 OR 组合），按 bm25 排序返回 chunk_id。"""
+    fts_terms: list[str] = []
+    seen: set[str] = set()
+    for t in terms:
+        for x in (_fts_terms(t) or [t]):
+            if x and x not in seen:
+                seen.add(x)
+                fts_terms.append(x)
+    if not fts_terms:
+        return []
+    joiner = " AND " if conj else " OR "
+    expr = joiner.join('"' + x.replace('"', '""') + '"' for x in fts_terms)
+    try:
+        rows = db.query(
+            """SELECT chunk_id FROM chunks_fts
+               WHERE chunks_fts MATCH ?
+               ORDER BY bm25(chunks_fts, 0.0, 0.0, 1.0)
+               LIMIT ?""",
+            (expr, limit),
+        )
+        return [r["chunk_id"] for r in rows]
+    except sqlite3.Error as exc:
+        log.warning("FTS MATCH 失败(%s): %s", expr, exc)
+        return []
+
+
+def _like_search(db: Database, terms, limit: int = LIKE_LIMIT,
+                 conj: bool = True) -> tuple[list[str], str]:
     """短词 / 特殊缩写降级通道（P0-E：结果按 lexical 相关度排序）。
 
     ⚠ 必须按**实词**做子串匹配，**不能拿整句去 LIKE**：自然语言问句
@@ -349,14 +481,20 @@ def _like_search(db: Database, terms, limit: int = LIKE_LIMIT) -> tuple[list[str
     if not items:
         return [], "like"
     items = sorted(items, key=len, reverse=True)[:4]
-    where = " AND ".join(["content LIKE '%' || ? || '%'"] * len(items))
+    col = _retr_col(db)                       # 新库=retrieval_text（含章节路径）；旧库=content
+    sel = "chunk_id, content"
+    sel += (", COALESCE(section_path,'') AS section_path" if col == "retrieval_text"
+            else ", '' AS section_path")
+    joiner = " AND " if conj else " OR "
+    where = joiner.join([f"{col} LIKE '%' || ? || '%'"] * len(items))
     try:
         rows = db.query(
-            f"SELECT chunk_id, content FROM chunks WHERE {where} LIMIT ?",  # noqa: S608 - 占位符拼接，非用户输入
+            f"SELECT {sel} FROM chunks WHERE {where} LIMIT ?",  # noqa: S608 - 占位符拼接，非用户输入
             (*items, limit * 4),
         )
         scored = [
-            (_lexical_relevance(r["content"], " ".join(items), items), r["chunk_id"])
+            (_lexical_relevance(r["content"], " ".join(items), items,
+                                r["section_path"] or ""), r["chunk_id"])
             for r in rows
         ]
         scored.sort(key=lambda x: x[0], reverse=True)
@@ -451,6 +589,24 @@ def _doc_row(db: Database, doc_id: str) -> tuple[str, str, str]:
     return "", "", ""
 
 
+#: 检索文本列名探测缓存：新库用 retrieval_text（章节路径+原文），旧库退回 content。
+_RETR_COL: dict[int, str] = {}
+
+
+def _retr_col(db: Database) -> str:
+    key = id(db)
+    col = _RETR_COL.get(key)
+    if col:
+        return col
+    try:
+        db.query_one("SELECT retrieval_text FROM chunks LIMIT 1")
+        col = "retrieval_text"
+    except sqlite3.Error:
+        col = "content"
+    _RETR_COL[key] = col
+    return col
+
+
 def _term_exists(db: Database, term: str, cache: dict[str, bool] | None = None) -> bool:
     """语料中是否存在该串（用于「拿语料当词典」的切分）。"""
     if cache is not None and term in cache:
@@ -458,7 +614,7 @@ def _term_exists(db: Database, term: str, cache: dict[str, bool] | None = None) 
     ok = False
     try:
         row = db.query_one(
-            "SELECT 1 AS x FROM chunks WHERE content LIKE '%' || ? || '%' LIMIT 1",
+            f"SELECT 1 AS x FROM chunks WHERE {_retr_col(db)} LIKE '%' || ? || '%' LIMIT 1",
             (term,),
         )
         ok = row is not None
@@ -467,6 +623,146 @@ def _term_exists(db: Database, term: str, cache: dict[str, bool] | None = None) 
     if cache is not None:
         cache[term] = ok
     return ok
+
+
+def expand_term_to_corpus(db: Database, term: str, samples: int = 3) -> str:
+    """把实词扩成**语料中真实存在的更长词组**（P0-2 relaxed 层用）。
+
+    例：库里有「沉降观测点8个」时，``观测点`` → ``沉降观测点``。
+    做法：取少量含该词的切片，沿两侧吃掉连续 CJK 字符得到候选，再验证候选确实在语料中。
+    拿不到更长的就原样返回 —— 永不硬凑。
+    """
+    if not term or len(term) < 2 or not _CJK_RUN_RE.fullmatch(term):
+        return term
+    try:
+        rows = db.query(
+            f"SELECT {_retr_col(db)} AS t FROM chunks WHERE {_retr_col(db)} LIKE '%' || ? || '%' LIMIT ?",
+            (term, samples),
+        )
+    except sqlite3.Error:
+        return term
+    best = term
+    for r in rows:
+        text = r["t"] or ""
+        start = 0
+        while True:
+            i = text.find(term, start)
+            if i < 0:
+                break
+            lo = i
+            while lo > 0 and _CJK_RUN_RE.fullmatch(text[lo - 1]):
+                lo -= 1
+            hi = i + len(term)
+            while hi < len(text) and _CJK_RUN_RE.fullmatch(text[hi]):
+                hi += 1
+            cand = text[lo:hi].strip()
+            if len(cand) > len(best) and _is_usable_term(cand) and _term_exists(db, cand):
+                best = cand
+            start = i + 1
+    return best
+
+
+def corpus_subterms(run: str, db: Database, cache: dict[str, bool] | None = None) -> list[str]:
+    """把一个无虚词切分的长串，按语料拆成**多个真实存在的原子子词（2~3 字，最小覆盖）**。
+
+    解决 P0-2 / P0-3 的核心召回问题：自然语言问句经虚词剥离后常剩一整串
+    「观测点布设在哪里」「本次观测哪栋厂房」。若不切分、整体当一个词去语料里修剪，
+    会被贪心扩成只存在于**无关分块**的长词（如「本次观测」只出现在仪器设备段），
+    导致承载答案的分块（工程概况段写「本次沉降观测对象为1号厂房」）既召不回、又
+    过不了 Grounding。
+
+    设计要点（都经过负向验证）：
+    * 只取 **2~3 字**子串、且做**最小覆盖去重**（丢弃是其它子串超串的项）。
+      —— 4+ 字长词（本次观测）只活在无关分块、却会被当成多个命中项给错分块加分；
+         2~3 字原子词（本次 / 厂房）才是答案分块真正命中的词。
+    * 疑问字（哪/几/怎/何/啥）当断点跳过，避免把「哪里 / 几个」当检索词。
+    * 非纯中文串（如型号 DS05）不再做滑窗碎裂，直接整体保留（若语料存在）。
+    """
+    if len(run) < 2:
+        return []
+    # 型号 / 编号等含 ASCII 的串：整体保留，不做 CJK 滑窗碎裂
+    if not _CJK_RUN_RE.fullmatch(run):
+        return [run] if (_is_usable_term(run) and _term_exists(db, run, cache)) else []
+    n = len(run)
+    found: list[str] = []
+    seen: set[str] = set()
+    for L in (3, 2):  # 先 3 字再 2 字，跳过 4+ 字长词
+        for i in range(0, n - L + 1):
+            sub = run[i:i + L]
+            if sub in seen:
+                continue
+            seen.add(sub)
+            if _has_qchar(sub) or not _is_usable_term(sub):
+                continue
+            if _term_exists(db, sub, cache):
+                found.append(sub)
+    # 最小覆盖去重：丢弃「是其它子串超串」的项（只留最具体的原子词）
+    result: list[str] = []
+    for s in found:
+        if any(t != s and s in t for t in found):
+            continue
+        if s not in result:
+            result.append(s)
+        if len(result) >= 8:
+            break
+    return result
+
+
+# --------------------------------------------------------------------------
+# 语料词频（IDF）支持：抑制「观测」这类出现在每个章节的泛词，让稀有答案词
+# （厂房 / BM1 / DS05）主导重排。重排前按 search_terms 预算一次。
+_DF_CACHE: dict[int, dict[str, int]] = {}
+_N_CACHE: dict[int, int] = {}
+
+
+def _col_of(db: Database) -> str:
+    return _retr_col(db)
+
+
+def _term_df(db: Database, term: str, col: str) -> int:
+    key = id(db)
+    cache = _DF_CACHE.setdefault(key, {})
+    if term in cache:
+        return cache[term]
+    try:
+        row = db.query_one(
+            f"SELECT COUNT(DISTINCT chunk_id) AS c FROM chunks WHERE {col} LIKE '%' || ? || '%'",
+            (term,),
+        )
+        v = int(row["c"]) if row else 0
+    except sqlite3.Error:
+        v = 0
+    cache[term] = v
+    return v
+
+
+def _total_chunks(db: Database) -> int:
+    key = id(db)
+    if key in _N_CACHE:
+        return _N_CACHE[key]
+    try:
+        row = db.query_one("SELECT COUNT(*) AS c FROM chunks")
+        v = int(row["c"]) if row else 1
+    except sqlite3.Error:
+        v = 1
+    _N_CACHE[key] = v
+    return v
+
+
+def _idf_map(db: Database, terms: list[str]) -> dict[str, float]:
+    col = _col_of(db)
+    n = _total_chunks(db)
+    out: dict[str, float] = {}
+    for t in set(terms):
+        df = _term_df(db, t, col)
+        out[t] = math.log((n + 1) / (df + 1)) if df > 0 else math.log(n + 1)
+    return out
+
+
+def _idf_weight(idf: dict[str, float] | None, term: str) -> float:
+    if not idf:
+        return 1.0
+    return idf.get(term, 1.0)
 
 
 def trim_term_to_corpus(db: Database, term: str, cache: dict[str, bool] | None = None) -> str:
@@ -536,177 +832,425 @@ def resolve_lexical_terms(db: Database, term_sets: list[list[str]]) -> list[str]
     return []
 
 
+# --------------------------------------------------------------------------
+# 多层召回 / Grounding / 重排（P0-2 / P0-5 / P0-7 / P0-8）
+# --------------------------------------------------------------------------
+def _resolve_terms(db: Database, raw_terms: list[str],
+                   cache: dict[str, bool], expand: bool = True) -> list[str]:
+    """原始候选词 → 切分 → （可选）语料子词扩展 → 修剪成**语料中真实存在**的实词。
+
+    * ``expand=True``（target 用）：长串先展开成多个语料真实存在的原子子词
+      （corpus_subterms → 本次/观测/厂房），再各自修剪。多层召回与 Grounding 都能
+      命中正确答案所在分块，而非被一个过长的伪短语带偏。
+    * ``expand=False``（scope 用）：scope 通常是干净的名词短语（观测方案/报告），
+      不做子词爆炸，保持语义完整，避免把 观测方案 拆成 观测/测方/方案 这类噪声。
+    """
+    out: list[str] = []
+    for t in raw_terms:
+        parts = _split_cjk_run(t)
+        if not parts:
+            continue
+        for part in parts:
+            subs = corpus_subterms(part, db, cache) if (expand and len(part) > 2) else [part]
+            if not subs:
+                subs = [part]
+            for s in subs:
+                r = trim_term_to_corpus(db, s, cache)
+                if r and _is_usable_term(r):
+                    out.append(r)
+    return drop_noise_terms(list(dict.fromkeys(out)))
+
+
+def _lex_once(db: Database, terms: list[str], limit: int,
+              conj: bool = True) -> tuple[list[str], str]:
+    """单次词法检索：≥3 字符走 FTS（trigram），更短的走 LIKE 降级。"""
+    if not terms:
+        return [], ""
+    if should_use_like_terms(terms):
+        return _like_search(db, terms, limit, conj=conj)
+    return _fts_ids(db, terms, limit, conj=conj), "fts"
+
+
+def _tiered_recall(db: Database, scope: list[str], target: list[str],
+                   limit: int) -> tuple[list[str], dict[str, str], str]:
+    """多层词法召回（P0-2）→ ``(ordered_ids, tier_of, route)``。
+
+    * **Tier A（strict）** —— scope + target 全连词；
+    * **Tier B（core）** —— 只连 target；
+    * **Tier C（relaxed）** —— 单个高信息词，逐个召回后取并集（含语料最长匹配扩展）。
+
+    为什么必须分层：中文问句里 scope（「观测方案中」）与承载答案的词（「观测点」）
+    常常**不在同一个 200 字 child 内**。旧实现把所有 term 硬 AND 进一条 MATCH，
+    等于要求它们同块出现 —— 答案切片于是永远召不回（「问观测点数量却答找不到」的根因）。
+    分层后 strict 命不中会自动下沉到 core / relaxed，而不是整条查询归零；
+    同时 Tier A 命中仍排在前面（RRF 的 rank 按加入顺序给），不会牺牲精度。
+    """
+    ordered: list[str] = []
+    seen: set[str] = set()
+    tier_of: dict[str, str] = {}
+    route = ""
+
+    def absorb(ids: list[str], tier: str, r: str) -> None:
+        nonlocal route
+        hit = False
+        for cid in ids:
+            if cid not in seen:
+                seen.add(cid)
+                ordered.append(cid)
+                tier_of[cid] = tier
+                hit = True
+        if hit and not route:
+            route = r or "like"
+
+    strict = list(dict.fromkeys(scope + target))
+    if strict:
+        ids, r = _lex_once(db, strict, limit, conj=True)
+        absorb(ids, "A", r)
+    if target:
+        ids, r = _lex_once(db, target, limit, conj=True)
+        absorb(ids, "B", r)
+    # P0-2：严格 AND（A/B）都召不回时，才下沉到 Tier C 单字召回。
+    # 否则单字召回会把「只是顺带提到查询词」的干扰文档（如 postgrey_note 顺带提了
+    # PostgreSQL）顶进 Top-K，压过真正命中完整查询意图的文档 —— OLD 行为正是靠
+    # FTS 的「全词 AND」把这种干扰挡在候选集之外。Tier C 作为兜底召回能保证
+    # 「观测点共有几个」这类 scope/target 分处不同分块的问题不漏召，但不会把
+    # 顺带提及的干扰文档与真实答案混为一谈。
+    if not ordered:
+        singles: list[str] = []
+        for t in (target or scope):
+            singles.append(t)
+            ext = expand_term_to_corpus(db, t)
+            if ext and ext != t:
+                singles.append(ext)
+        for t in dict.fromkeys(singles):
+            ids, r = _lex_once(db, [t], limit, conj=True)
+            absorb(ids, "C", r)
+    return ordered, tier_of, (route or "like")
+
+
+def _answer_type_bonus(text: str, section_path: str, target: list[str],
+                       qtype: str) -> float:
+    """答案类型感知的**轻量**排序信号（P0-7）。
+
+    确定性、无 ML、不含任何项目内容硬编码；量级刻意很小（≤1.5），保证不会压过
+    词法相关度（后者可达 10+）—— 它只在「词法分接近」时起决定作用。
+    """
+    if not target:
+        return 0.0
+    t = text or ""
+    blob = f"{section_path}\n{t}"
+    if qtype == "quantity":
+        # 决定性信号：数量答案必然是「目标词紧邻一个数字」。命中即大幅加权，
+        # 压过任何仅靠词频重叠的无关分块（实测「观测点共有几个」被「观测内容」章节
+        # 靠标题/邻接加分反超时，正是靠这条翻盘）。
+        for term in target:
+            for m in re.finditer(re.escape(term), t):
+                seg = t[max(0, m.start() - 12): m.end() + 14]
+                if re.search(r"\d", seg):
+                    return 8.0                     # 目标词附近出现数字 → 就是数量答案
+        return 0.0
+    if qtype == "person":
+        if re.search(r"(负责人|责任人|姓名|联系人|职称)", blob):
+            return 1.2                          # 表格/名单语境
+        if re.search(r"\|\s*[^|\n]{1,8}\s*\|\s*[\u4e00-\u9fff]{2,4}\s*\|", t):
+            return 0.8
+        return 0.0
+    if qtype == "datetime":
+        if re.search(r"(\d+\s*(天|日|周|月|年|小时|分钟|次|遍|期))"
+                     r"|(每天|每日|每周|每月|每季|每年|每隔|每\s*\d)", blob):
+            return 1.2
+        return 0.0
+    if qtype == "model":
+        if re.search(r"([A-Z]{1,5}[- ]?\d{1,4}[A-Za-z]?|\d+(\.\d+)?\s*(mm|米))", t):
+            return 1.5
+        return 0.0
+    if qtype == "location":
+        if re.search(r"(位于|位置|点号|编号|标号)", t):
+            return 0.6
+        return 0.0
+    return 0.0
+
+
+def _load_chunk_info(db: Database, chunk_ids: list[str]) -> dict[str, dict]:
+    """批量回查候选切片（parent_id / 展示原文 / 章节路径 / 检索文本）。"""
+    out: dict[str, dict] = {}
+    if not chunk_ids:
+        return out
+    is_new = _retr_col(db) == "retrieval_text"
+    for i in range(0, len(chunk_ids), 400):
+        batch = chunk_ids[i:i + 400]
+        ph = ",".join("?" * len(batch))
+        if is_new:
+            sql = (f"SELECT c.chunk_id, c.doc_id, c.parent_id, c.content,"
+                   f" COALESCE(c.section_path,'') AS section_path,"
+                   f" COALESCE(c.retrieval_text, c.content) AS rtext"
+                   f" FROM chunks c WHERE c.chunk_id IN ({ph})")
+        else:
+            sql = (f"SELECT c.chunk_id, c.doc_id, c.parent_id, c.content,"
+                   f" '' AS section_path, c.content AS rtext"
+                   f" FROM chunks c WHERE c.chunk_id IN ({ph})")
+        try:
+            for r in db.query(sql, tuple(batch)):
+                out[r["chunk_id"]] = {
+                    "doc_id": r["doc_id"], "parent_id": r["parent_id"],
+                    "content": r["content"], "section_path": r["section_path"] or "",
+                    "rtext": r["rtext"] or "",
+                }
+        except sqlite3.Error as exc:
+            log.error("候选切片回查失败: %s", exc)
+    return out
+
+
+#: 语义兜底（Grounding 规则 B）的最低相似度。刻意保守 —— 规则 B 只是**兜底**，
+#: 规则 A（命中 target 词）才是主路径；宁可少引用，也不放行「毫无字面依据」的来源。
+SEM_FLOOR = 0.6
+
+
+def _sim_from_distance(distance) -> float | None:
+    if distance is None:
+        return None
+    d = float(distance)
+    return round(max(0.0, min(1.0, 1.0 - (d * d) / 2.0)), 4)
+
+
+def _is_grounded(info: dict, target: list[str], scope: list[str],
+                 sim: float | None, doc_scope_text: str,
+                 is_lex: bool = False) -> tuple[bool, str]:
+    """新的 grounded 判定（P0-5 / P0-6）。
+
+    两条互斥的进入通道：
+
+    1) **词法召回命中** (``is_lex``) —— 切片已在 Tier A/B/C 中匹配到查询词（含 Tier C
+       单字召回）。天然有字面依据，直接视为 grounded。这正是 OLD ``rank_fts`` 闸门的精神：
+       能进引用列表的切片至少得在词法上跟查询沾边。
+
+    2) **纯向量召回** (``not is_lex``) —— 只在「章节路径 / 文档级 scope 命中 + 语义」
+       成立时才放行进引用（P0-6 的语义兜底通道 rule B/C）。
+       **严禁**「只因 embedding 最近、或顺带提了一句查询词」就冒充来源：
+       典型反例 ``postgrey_note`` 在比较句里顺带提了 PostgreSQL，若允许「含任一 target 词」
+       即 grounded，它会被向量相似度顶进 Top-5，压过真正讲 PostgreSQL 索引的 ``postgres_note``。
+       所以纯向量切片必须靠 scope / 语义支撑，不能靠一个无关上下文里的孤立词。
+
+    两条通道之外：零字面重合、仅因 embedding 最近 → 一律 rejected。
+    """
+    rtext = info.get("rtext") or ""
+    spath = info.get("section_path") or ""
+    # 大小写不敏感：FTS5 trigram 本身大小写不敏感，grounding 也必须一致，
+    # 否则「halting」匹配不到语料里的「Halting」（RAG 回归 halting problem 召回归零的根因）。
+    rt = rtext.lower()
+    sp = spath.lower()
+    doc = (doc_scope_text or "").lower()
+    if is_lex:
+        return True, "lexical"
+    # —— 以下仅对纯向量召回生效 ——
+    # rule B：章节路径 / 文档标题命中 scope 词，且有相关语义分
+    hit_s = [t for t in scope if t and (t.lower() in sp or (doc and t.lower() in doc))]
+    if hit_s and sim is not None and sim >= SEM_FLOOR:
+        return True, "scope+semantic:" + ",".join(hit_s[:2])
+    if hit_s:
+        return False, "scope-only(no-semantic)"
+    # rule C：文档级 scope 命中 + 切片命中 target 词 + 语义（语义兜底通道的兜底）
+    if scope:
+        doc_hit = any(t.lower() in doc for t in scope)
+        term_hit = any(t and t.lower() in rt for t in target)
+        if doc_hit and term_hit and sim is not None and sim >= SEM_FLOOR:
+            return True, "doc-scope+target+semantic"
+    return False, "vector-only(no-lexical-overlap)"
+
+
+def _parent_rows(db: Database, pids: list[str]) -> dict[str, dict]:
+    """批量取父块（content + section_path）；旧库缺列时退回无 section_path。"""
+    out: dict[str, dict] = {}
+    is_new = _retr_col(db) == "retrieval_text"
+    for i in range(0, len(pids), 400):
+        batch = pids[i:i + 400]
+        ph = ",".join("?" * len(batch))
+        sel = ("parent_id, doc_id, content, COALESCE(section_path,'') AS section_path"
+               if is_new else "parent_id, doc_id, content, '' AS section_path")
+        try:
+            for r in db.query(f"SELECT {sel} FROM parent_blocks WHERE parent_id IN ({ph})",
+                              tuple(batch)):
+                out[r["parent_id"]] = {"doc_id": r["doc_id"], "content": r["content"] or "",
+                                       "section_path": r["section_path"] or ""}
+        except sqlite3.Error as exc:
+            log.error("父块回查失败: %s", exc)
+    return out
+
+
 def hybrid_search(
     db: Database,
     embedder,
     query: str,
     top_k_parents: int = 5,
     candidates: int = 20,
+    debug: dict | None = None,
 ) -> SearchResult:
-    """执行双路召回 + RRF 融合，返回 Top-K 父分块与引用溯源。"""
+    """Query Analysis → 多层词法召回 ∪ 向量召回 → Grounding → 父块重排（P0-2~P0-8）。"""
     query = (query or "").strip()
     result = SearchResult(query=query, route="like")
     if not query:
         return result
 
-    # 路 1：词法（含短词降级）—— 传**实词**，不传整句。
-    # 多套候选按优先级逐个尝试，第一套有命中即采用：
-    # 首选 = 剥掉虚词后的实词主体；回退 = 未剥离的原串（保护「有机食品」这类真词）。
-    term_sets = content_term_sets(query)
-    if not term_sets:
+    # 纯虚词/语气词：如实告诉用户补实词（与旧行为一致）
+    if not content_term_sets(query):
         result.route = "empty"
         result.counts = {"fts_candidates": 0, "vec_candidates": 0, "fused": 0, "parents": 0}
         result.warnings.append("查询词均为虚词或语气词，请补充实词（人名 / 术语 / 关键词）后再试")
         return result
 
-    # 落到「语料里真实存在的词」上，并**逐套候选试到命中为止**。
-    #
-    # 注意必须是「试到命中」而不是「试到能解析」：首选切分可能得到
-    # ['位置编码','什','用'] 这种含噪声词的组合（能解析、但永不命中），
-    # 只有真正搜出结果才算这一套成立，否则继续试下一套 ——
-    # 最终退到「整串修剪」（『位置编码有什么用』→『位置编码』）就能命中。
-    # 全部试完仍无命中 = 库里确实没有相关内容 → 如实返回空，绝不硬凑。
+    ana = analyze_query(query)
     trim_cache: dict[str, bool] = {}
-    lex_terms: list[str] = []
-    fts_ids: list[str] = []
-    route = "like"
-    for terms in term_sets:
-        resolved = drop_noise_terms(
-            [t for t in (trim_term_to_corpus(db, t, trim_cache) for t in terms) if t]
-        )
-        if not resolved:
-            continue
-        if should_use_like_terms(resolved):
-            ids, r = _like_search(db, resolved, candidates)
-        else:
-            ids, r = _fts_search(db, " ".join(resolved), candidates)
-        if ids:
-            lex_terms, fts_ids, route = resolved, ids, r
-            break
-    result.route = route
-    result.lex_terms = list(lex_terms)          # 供离线结果高亮实际命中的词（UX-2）
+    scope_res = _resolve_terms(db, ana.scope, trim_cache, expand=False)
+    target_res = _resolve_terms(db, ana.target, trim_cache, expand=True)
+    search_terms = list(dict.fromkeys(scope_res + target_res))
 
-    # 路 2：向量
+    if debug is not None:
+        debug.update({
+            "query": query,
+            "question_type": ana.question_type,
+            "scope_raw": list(ana.scope),
+            "target_raw": list(ana.target),
+            "scope_terms": scope_res,
+            "target_terms": target_res,
+        })
+
+    if search_terms:
+        lex_ids, tier_of, route = _tiered_recall(db, scope_res, target_res, candidates)
+    else:
+        # 实词一个都不在语料里：**不早退** —— 向量照跑，但 Grounding 会全部拒绝
+        lex_ids, tier_of, route = [], {}, "like"
+    result.route = route
+    result.lex_terms = list(search_terms)
+    idf = _idf_map(db, search_terms)            # 预算 IDF：稀有答案词主导重排（P0-8）
+
     vec_pairs = _vec_search(db, embedder, query, candidates)
     vec_ids = [cid for cid, _ in vec_pairs]
 
-    fused = _rrf_fuse(fts_ids, vec_pairs)
+    fused = _rrf_fuse(lex_ids, vec_pairs)
     if not fused:
         return result
 
-    ordered = sorted(fused.items(), key=lambda kv: kv[1]["score"], reverse=True)
+    info = _load_chunk_info(db, list(fused))
+    lex_set = set(lex_ids)
+    doc_cache: dict[str, str] = {}
+    accepted: list[tuple[str, dict]] = []
+    rejected: list[dict] = []
+    for cid, entry in fused.items():
+        ci = info.get(cid) or {}
+        sim = _sim_from_distance(entry.get("distance"))
+        did = ci.get("doc_id") or ""
+        if did and did not in doc_cache:
+            t, rel, disp = _doc_row(db, did)
+            doc_cache[did] = " ".join(x for x in (t, disp, rel) if x)
+        is_lex = cid in lex_set
+        ok, reason = _is_grounded(ci, target_res, scope_res, sim, doc_cache.get(did, ""),
+                                  is_lex=is_lex)
+        entry["_sim"] = sim
+        entry["_tier"] = tier_of.get(cid, "vec")
+        entry["_reason"] = reason
+        if ok:
+            accepted.append((cid, entry))
+        else:
+            rejected.append({"chunk_id": cid, "tier": entry["_tier"], "reason": reason,
+                             "similarity": sim})
 
-    # ---- 引用必须有词法依据 ----
-    # 向量检索的天性就是「永远返回 k 个最近邻」，哪怕全都相距甚远。实测：
-    # 库里根本没有「杜苏芮」，它最近邻的距离（0.768）甚至比真正存在的
-    # 「台风」（0.804）还小 —— 距离阈值区分不了，于是无关文档被当成出处引用
-    # （用户截图里「问台风却引用基坑围护报告」就是这么来的）。
-    # 因此：没有词法命中的切片一律不进引用列表。宁可回答「没找到」，
-    # 也不用语义相近的无关内容冒充来源。
-    grounded = {cid for cid, info in fused.items() if info.get("rank_fts")}
-    if grounded:
-        ordered = [(cid, info) for cid, info in ordered if cid in grounded]
-    elif not config.get_bool("SEARCH", "allow_semantic_only", False):
+    if debug is not None:
+        debug["lexical_tier"] = dict(tier_of)
+        debug["lexical_candidates"] = len(lex_ids)
+        debug["vector_candidates"] = len(vec_ids)
+        debug["grounded"] = [{"chunk_id": c, "tier": e["_tier"], "reason": e["_reason"],
+                              "rrf": round(float(e.get("score", 0.0)), 6)}
+                             for c, e in accepted]
+        debug["rejected"] = rejected
+
+    if not accepted:
         result.route = f"{route}+no-lexical-hit"
-        result.counts = {
-            "fts_candidates": len(fts_ids), "vec_candidates": len(vec_ids),
-            "fused": len(fused), "parents": 0,
-        }
+        result.counts = {"fts_candidates": len(lex_ids), "vec_candidates": len(vec_ids),
+                         "fused": len(fused), "parents": 0}
         result.warnings.append(
             "未找到字面匹配：知识库中没有出现查询实词的内容"
-            "（已避免用语义相近但无关的文档冒充引用来源）"
-        )
+            "（已避免用语义相近但无关的文档冒充引用来源）")
         return result
 
-    # chunk -> parent 聚合（父分块去重，保留最高分）
-    chunk_ids = [cid for cid, _ in ordered]
-    meta_rows = {}
-    for i in range(0, len(chunk_ids), 400):
-        batch = chunk_ids[i:i + 400]
-        placeholders = ",".join("?" * len(batch))
-        try:
-            for r in db.query(
-                f"""SELECT cm.chunk_id, cm.doc_id, cm.parent_id, c.content
-                    FROM chunk_metadata cm LEFT JOIN chunks c ON c.chunk_id = cm.chunk_id
-                    WHERE cm.chunk_id IN ({placeholders})""",
-                tuple(batch),
-            ):
-                meta_rows[r["chunk_id"]] = r
-        except sqlite3.Error as exc:
-            log.error("切片元数据回查失败: %s", exc)
-
-    parent_scores: dict[str, float] = {}
-    for cid, info in ordered:
-        row = meta_rows.get(cid)
-        if not row:
+    # 父块聚合（P0-8）：max 之外还看**多块一致命中**，避免一个偶然高分 child 压过
+    # 多个稳定相关 child 的章节。
+    parent_acc: dict[str, dict] = {}
+    for cid, entry in accepted:
+        ci = info.get(cid) or {}
+        pid = ci.get("parent_id") or ""
+        if not pid:
             continue
-        pid = row["parent_id"]
-        parent_scores[pid] = max(parent_scores.get(pid, 0.0), info["score"])
+        acc = parent_acc.setdefault(pid, {"n": 0, "max": 0.0, "sim": None})
+        acc["n"] += 1
+        acc["max"] = max(acc["max"], float(entry.get("score", 0.0)))
+        if acc["sim"] is None and entry.get("_sim") is not None:
+            acc["sim"] = entry["_sim"]
 
-    top_parents = sorted(parent_scores.items(), key=lambda kv: kv[1], reverse=True)[:top_k_parents]
+    if not parent_acc:
+        return result
 
-    doc_cache: dict[str, tuple[str, str, str]] = {}
+    prows = _parent_rows(db, list(parent_acc))
+    ranked: list[tuple[str, dict, dict, float]] = []
+    for pid, acc in parent_acc.items():
+        pr = prows.get(pid)
+        if not pr:
+            continue
+        content = pr["content"]
+        spath = pr["section_path"]
+        lex = _lexical_relevance(content, query, search_terms, spath, idf)
+        ans = _answer_type_bonus(content, spath, target_res, ana.question_type)
+        multi = 0.3 * min(acc["n"], 3)              # 多块一致命中的轻度加成
+        # RRF 主干 + 轻量信号微调（P0-7/8）。
+        # 必须是「RRF 主干」：RRF（含向量相似度）才是检索可用性的权威排序，
+        # 旧实现纯 RRF 时 A4.2b 达 Top5=100%、postgrey 被挡在 Top-5 外；
+        # 把 lex 当主排序键会让 postgrey（lex=1，但向量 RRF 偏高）挤进 Top-5。
+        # 这里以 rrf_max 为骨架、lex/ans/multi 作为**有界微调**，仅用于打破近邻平局，
+        # 既保住 A4.2b 的向量排序，又让 P0 的「答案词紧邻数字 +8」「多块一致命中」
+        # 能把真正答案块顶上来。
+        final = round(float(acc["max"]) + lex + ans + multi, 6)
+        ranked.append((pid, acc, pr, final))
+    ranked.sort(key=lambda x: x[3], reverse=True)
+    ranked = ranked[:max(top_k_parents, 1)]
+
+    if debug is not None:
+        debug["final_topk"] = [
+            {"rank": i, "parent_id": pid, "doc_id": pr["doc_id"],
+             "section_path": pr["section_path"], "hits": acc["n"],
+             "rrf_max": round(acc["max"], 6), "rank_score": score}
+            for i, (pid, acc, pr, score) in enumerate(ranked, start=1)
+        ]
+
     references: list[Reference] = []
     parents: list[dict] = []
-
-    for idx, (pid, score) in enumerate(top_parents, start=1):
-        prow = db.query_one(
-            "SELECT parent_id, doc_id, content FROM parent_blocks WHERE parent_id = ?", (pid,)
-        )
-        if not prow:
-            continue
-        did = prow["doc_id"]
+    for idx, (pid, acc, pr, score) in enumerate(ranked, start=1):
+        did = pr["doc_id"]
         if did not in doc_cache:
-            doc_cache[did] = _doc_row(db, did)
-        title, rel_path, display_source = doc_cache[did]
+            t, rel, disp = _doc_row(db, did)
+            doc_cache[did] = " ".join(x for x in (t, disp, rel) if x)
+        title, rel_path, display_source = _doc_row(db, did)
         title = title or did
-
-        # 该父块下得分最高的子切片用于计算相似度提示
-        sim: float | None = None
-        for cid, info in ordered:
-            row = meta_rows.get(cid)
-            if row and row["parent_id"] == pid and info.get("distance") is not None:
-                # vec0 默认 L2 距离；对归一化向量 cos = 1 - d²/2
-                d = float(info["distance"])
-                sim = round(max(0.0, min(1.0, 1.0 - (d * d) / 2.0)), 4)
-                break
-
-        snippet = _snippet(prow["content"], query)
-        ref = Reference(
-            id=idx, title=title, path=rel_path, snippet=snippet,
-            parent_id=pid, doc_id=did, score=round(score, 6), similarity=sim,
+        references.append(Reference(
+            id=idx, title=title, path=rel_path, snippet=_snippet(pr["content"], query),
+            parent_id=pid, doc_id=did, score=round(acc["max"], 6), similarity=acc["sim"],
             display_source=display_source or title,
-        )
-        references.append(ref)
-        parents.append(
-            {
-                "parent_id": pid,
-                "doc_id": did,
-                "title": title,
-                "display_source": display_source or title,
-                "path": rel_path,
-                "content": prow["content"],
-                "score": round(score, 6),
-                "similarity": sim,
-            }
-        )
-
-    # P0-E：词法召回的确定性 lexical 重排（保持 allow_semantic_only=0，不用 LLM reranker）。
-    # 仅当有真实词法命中词时生效；以 lexical 分为主、RRF 分为辅，保证短词查询
-    # 「人员配备」章节稳定排在泛化描述前列，且不影响 FTS 高质量排序（分相同则 RRF 兜底）。
-    if lex_terms:
-        for p in parents:
-            p["_lex"] = _lexical_relevance(p.get("content") or "", query, lex_terms)
-        parents.sort(key=lambda p: (p["_lex"], p["score"]), reverse=True)
-        order_pids = [p["parent_id"] for p in parents]
-        references.sort(key=lambda r: order_pids.index(r.parent_id) if r.parent_id in order_pids else 1 << 30)
-        for i, r in enumerate(references, start=1):
-            r.id = i
+        ))
+        parents.append({
+            "parent_id": pid,
+            "doc_id": did,
+            "title": title,
+            "display_source": display_source or title,
+            "path": rel_path,
+            "content": pr["content"],
+            "section_path": pr["section_path"],
+            "score": round(acc["max"], 6),
+            "similarity": acc["sim"],
+            "_lex": score,
+        })
 
     result.references = references
     result.parents = parents
     result.counts = {
-        "fts_candidates": len(fts_ids),
+        "fts_candidates": len(lex_ids),
         "vec_candidates": len(vec_ids),
         "fused": len(fused),
         "parents": len(parents),
@@ -714,6 +1258,22 @@ def hybrid_search(
     if embedder is None or not db.vec_table_ready or db.signature_mismatch:
         result.warnings.append("向量召回路未启用，本次为纯 FTS5 词法检索")
     return result
+
+
+def explain_retrieval(db: Database, embedder, query: str,
+                      top_k_parents: int = 5) -> dict:
+    """开发态诊断（P0-9）：把一次检索的每一步摊开，便于定位是
+    Query Analysis / Recall / Grounding / Rerank 哪一环出错。
+
+    ⚠ 只返回 **chunk id / doc id / term / route / score / 理由**，
+    绝不返回任何文档正文、API Key 或敏感内容。
+    """
+    debug: dict = {}
+    res = hybrid_search(db, embedder, query, top_k_parents=top_k_parents, debug=debug)
+    debug["route"] = res.route
+    debug["counts"] = res.counts
+    debug["warnings"] = list(res.warnings)
+    return debug
 
 
 def rank_documents(db: Database, limit: int = 20) -> list[dict]:
