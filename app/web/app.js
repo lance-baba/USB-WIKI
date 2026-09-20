@@ -12,6 +12,7 @@ const S = {
   rendered: "",      // 已渲染的文本（不含滞留缓冲）
   holding: "",       // 未闭合角标滞留缓冲
   full: "",          // 收到的完整文本
+  q: "",             // 最近一次提问（证据跳转的高亮词源）
   busy: false,
 };
 
@@ -229,6 +230,7 @@ async function send() {
   input.value = "";
 
   S.full = ""; S.rendered = ""; S.holding = ""; S.refs = [];
+  S.q = q;                              // B：证据跳转时高亮查询关键词
   const bub = pushMsg("assistant", '<span class="hint">检索知识库…</span>');
 
   try {
@@ -546,8 +548,9 @@ function renderNoteList() {
   $$("#noteList .list-item").forEach(el => el.onclick = () => openNoteItem(el));
 }
 
-/* 打开一条笔记（列表项已渲染时使用）。抽成具名函数，供问答引用跳转复用。 */
-async function openNoteItem(el) {
+/* 打开一条笔记（列表项已渲染时使用）。抽成具名函数，供问答引用跳转复用。
+ * jump 非空时（B）：证据跳转 —— 打开后按 parent_id 定位证据块并高亮。 */
+async function openNoteItem(el, jump) {
     $$("#noteList .list-item").forEach(x => x.classList.remove("active"));
     el.classList.add("active");
     $("#noteTitleBar").textContent = el.querySelector(".t").textContent;
@@ -566,12 +569,20 @@ async function openNoteItem(el) {
     btn.title = orig
       ? ("查看原版：" + orig.name + "（" + fmtSize(orig.size) + "）")
       : "该笔记没有留存原件（纯 Markdown / 纯文本导入）";
+    if (jump) {
+      // 证据跳转只在「渲染」视图里定位（B4：不做 PDF/DOCX 页面坐标）。
+      // 若该笔记默认开「原版」，先切回渲染视图再定位。
+      NOTE.view = "rendered";
+      setNoteView(NOTE.view);
+      jumpToEvidence(el.dataset.path, jump);
+      return;
+    }
     NOTE.view = orig ? "original" : "rendered";
     setNoteView(NOTE.view);
 }
 
 /* 按路径打开笔记：供问答内文角标 / 底部来源 chips 跳转使用 */
-async function openNoteByPath(path) {
+async function openNoteByPath(path, jump) {
   if (!path) return;
   switchTab("notes");
   await loadNotes();                    // 列表异步渲染，必须等它出来
@@ -584,7 +595,121 @@ async function openNoteByPath(path) {
   }
   if (!el) { toast("找不到该笔记（可能已被删除）", 3200); return; }
   el.scrollIntoView({ block: "center" });
-  openNoteItem(el);
+  openNoteItem(el, jump);
+}
+
+/* -------- B：证据精确定位（parent_id 为主、snippet 文本兜底） -------- */
+function _normTxt(s) {
+  return String(s || "").replace(/\s+/g, "").replace(/[#>*`|]/g, "").toLowerCase();
+}
+function _evBlocks(box) {
+  // 渲染视图的顶层块级元素（docToHtml 的输出结构：p/h*/ul/ol/blockquote/table/pre/hr）
+  return Array.from(box.children).filter(el =>
+    /^(P|H1|H2|H3|H4|H5|H6|UL|OL|BLOCKQUOTE|TABLE|PRE|HR|DIV)$/.test(el.tagName));
+}
+/* 在元素内的文本节点上包 <mark>（不碰任何标签/属性；每个节点从最早命中开始，递归处理尾部） */
+function _markNode(node, terms) {
+  const text = node.nodeValue;
+  if (!text || !text.trim()) return;
+  let best = null;
+  for (const t of terms) {
+    if (!t) continue;
+    const i = text.toLowerCase().indexOf(t);
+    if (i >= 0 && (!best || i < best.i)) best = { i, t };
+  }
+  if (!best) return;
+  const frag = document.createDocumentFragment();
+  if (best.i > 0) frag.appendChild(document.createTextNode(text.slice(0, best.i)));
+  const mk = document.createElement("mark");
+  mk.textContent = text.slice(best.i, best.i + best.t.length);
+  frag.appendChild(mk);
+  const tail = document.createTextNode(text.slice(best.i + best.t.length));
+  frag.appendChild(tail);
+  node.parentNode.replaceChild(frag, node);
+  _markNode(tail, terms);          // tail 严格更短 → 必然终止
+}
+function _queryTerms(q) {
+  // 问题词二连字不作为高亮词（共有/几个/哪些…不是证据关键词）
+  const STOP = new Set(["共有", "几个", "多少", "哪些", "什么", "怎么", "如何", "哪里", "是否",
+    "需要", "要求", "使用", "进行", "可以", "能够", "应该", "以及", "通过", "根据"]);
+  const out = [];
+  (String(q || "").match(/[\u4e00-\u9fff]{2,}|[A-Za-z0-9][A-Za-z0-9\-_.]{2,}/g) || [])
+    .forEach(run => {
+      const k = run.toLowerCase();
+      if (/^[\u4e00-\u9fff]+$/.test(run)) {
+        if (run.length <= 4 && !STOP.has(run)) out.push(k);          // 短词整词
+        for (let i = 0; i + 2 <= run.length; i++) {                  // 2-gram（实际命中的才算）
+          const g = run.slice(i, i + 2).toLowerCase();
+          if (!STOP.has(g) && !out.includes(g)) out.push(g);
+        }
+      } else if (!out.includes(k)) out.push(k);
+    });
+  return out.slice(0, 12);
+}
+async function jumpToEvidence(path, jump) {
+  const box = $("#noteView");
+  if (!box || !jump) return;
+  // 1) 取证据块原文（parent_id → /api/notes/evidence；失败则退 snippet）
+  let ev = null;
+  if (jump.parent_id) {
+    try {
+      const r = await api("/api/notes/evidence?path=" + encodeURIComponent(path) +
+        "&parent_id=" + encodeURIComponent(jump.parent_id));
+      if (r.code === 200) ev = r.data;
+    } catch (e) { /* 走 snippet 兜底 */ }
+  }
+  const src = (ev && ev.content) || jump.snippet || "";
+  if (!src) { toast("该引用缺少定位信息，已打开原文", 3000); return; }
+
+  // 2) 清掉上一次的高亮（noteView 里的 <mark> 全部是本功能写入的）
+  box.querySelectorAll("mark").forEach(m => {
+    const p = m.parentNode;
+    while (m.firstChild) p.insertBefore(m.firstChild, m);
+    m.remove();
+    if (p.normalize) p.normalize();
+  });
+  box.querySelectorAll(".ev-hl,.ev-hl-fade").forEach(el =>
+    el.classList.remove("ev-hl", "ev-hl-fade"));
+
+  // 3) 文本定位：parent 原文的行 → 渲染块。parent_id 拿不到内容时才退 snippet。
+  const blocks = _evBlocks(box);
+  const texts = blocks.map(b => _normTxt(b.textContent));
+  const lines = src.split("\n").map(s => _normTxt(s)).filter(s => s.length >= 6);
+  let start = -1;
+  if (lines.length) {
+    for (let i = 0; i < blocks.length && start < 0; i++) {
+      for (const ln of lines) {
+        if (texts[i].indexOf(ln) >= 0) { start = i; break; }      // 块包含行
+        if (texts[i].length >= 8 && ln.indexOf(texts[i]) === 0) { start = i; break; } // 行起点
+      }
+    }
+    if (start < 0) {                                              // 首行前缀兜底
+      const head = lines[0].slice(0, 12);
+      for (let i = 0; i < blocks.length; i++)
+        if (head.length >= 6 && texts[i].indexOf(head) >= 0) { start = i; break; }
+    }
+  }
+  if (start < 0) { toast("未能精确定位证据块，已打开原文", 3000); return; }
+
+  // 4) 向后扩展到约覆盖整个 parent（上限 15 块，防止异常数据导致高亮半篇文档）
+  const targetLen = _normTxt(src).length;
+  let end = start, acc = 0;
+  for (let j = start; j < blocks.length && j <= start + 15; j++) {
+    end = j; acc += texts[j].length;
+    if (acc >= targetLen) break;
+  }
+  const region = blocks.slice(start, end + 1);
+  region.forEach(b => b.classList.add("ev-hl"));
+  const terms = _queryTerms(S.q);
+  if (terms.length) region.forEach(b => {
+    const walker = document.createTreeWalker(b, NodeFilter.SHOW_TEXT, null);
+    const nodes = [];
+    while (walker.nextNode()) nodes.push(walker.currentNode);
+    nodes.forEach(n => _markNode(n, terms));
+  });
+  region[0].scrollIntoView({ block: "center", behavior: "smooth" });
+  // 证据块背景几秒后淡化，关键词 <mark> 保留（任务 B1 的视觉规范）
+  setTimeout(() => region.forEach(b => b.classList.add("ev-hl-fade")), 3500);
 }
 
 /* -------- 笔记视图：渲染 / 原版 / 源码 -------- */
@@ -616,6 +741,7 @@ function setNoteView(view) {
   if (view === "original") {
     const url = "/api/notes/original?path=" + encodeURIComponent(d.path);
     const meta = '<div class="doc-meta">原版：' + esc(orig.name) + "（" + fmtSize(orig.size) + "）" +
+      '　<a href="' + url + '" target="_blank" rel="noopener noreferrer">在新标签打开</a>' +
       '　<a href="' + url + '?download=1" download>下载原件</a></div>';
     const isWeb = orig.ext === ".html" || orig.ext === ".htm";
     const isPdf = orig.ext === ".pdf";
@@ -635,8 +761,15 @@ function setNoteView(view) {
     const frame = wrap.querySelector("iframe");
 
     if (isPdf) {
-      // 浏览器内置 PDF 查看器 —— 与直接打开 PDF 完全一致的观感
+      // 浏览器内置 PDF 查看器 —— 与直接打开 PDF 完全一致的观感。
+      // 不参与下面的 1280px 虚拟宽度缩放：查看器自带缩放/适配，transform-scale
+      // 只会把工具栏和页面一起压小（窄面板下小到不可用）。
+      frame.style.width = "100%";
+      frame.style.height = "100%";
       frame.src = url + "#toolbar=1&view=FitH";
+      // 某些环境（浏览器关闭了内置 PDF 查看器 / 旧内核）iframe 里看不到 PDF ——
+      // 「在新标签打开」就是兜底（C2），同一 URL 浏览器会用自带查看器整页打开。
+      return;
     } else if (isWeb) {
       // 剪藏的原网页：沙箱 iframe 还原版式。sandbox="" 屏蔽脚本/表单/弹窗，
       // 因为抓来的第三方 HTML 属于不可信内容 —— 这条安全底线不能放宽
@@ -1143,14 +1276,21 @@ function switchTab(name) {
   if (name === "settings") { loadConfig(); pollStatus(false); }
 }
 
-/* 问答引用可跳转：内文角标 [^N] 与底部来源 chips 都点了能进对应笔记 */
+/* 问答引用跳转（B）：
+ * 正文角标 [N]（.cite）= **证据**：打开笔记 → 按 parent_id 定位证据块 → 滚动 + 高亮；
+ * 底部来源 chips（.ref）= **文档**：只打开整篇资料，不强制跳某个 Parent。
+ * 语义区分：数字 = 证据，来源名 = 文档。 */
 document.addEventListener("click", function (ev) {
   const chip = ev.target && ev.target.closest ? ev.target.closest(".cite,.ref") : null;
   if (!chip) return;
   const id = chip.dataset.ref;
   const ref = (S.refs || []).find(function (r) { return String(r.id) === String(id); });
   if (!ref) { toast("该引用没有对应的笔记路径", 2600); return; }
-  openNoteByPath(ref.path);
+  const isCite = chip.classList.contains("cite");
+  openNoteByPath(ref.path, isCite ? {
+    parent_id: ref.parent_id || "",
+    snippet: ref.snippet || ""
+  } : null);
 });
 
 /* ---------------------------- 绑定 ---------------------------- */

@@ -2,6 +2,7 @@
 
 涵盖 /api/notes（列表）、/api/notes/content（Markdown 正文 + 原件信息）、
 /api/notes/original（导入的 PDF/Office、剪藏 HTML 原件，含 HTTP Range 与沙箱回退）、
+/api/notes/evidence（引用精确跳转：按 path+parent_id 返回证据块）、
 /api/notes/save（手动笔记）、/api/notes/import（批量导入）、/api/import/formats
 （支持的导入扩展名）。
 
@@ -122,6 +123,42 @@ def note_original(h: "Handler", rel: str) -> None:
     h._send_file_range(orig, ctype, inline)
 
 
+def note_evidence(h: "Handler", rel: str, parent_id: str) -> None:
+    """引用精确跳转（B）：按 path + parent_id 返回证据块的定位信息。
+
+    返回 ``section_path``（章节路径，供展示）与 ``content``（父块原文，供前端在
+    渲染视图里按文本定位）。前端优先用 parent_id 建立稳定定位（B3），本接口就是
+    它的数据源；snippet 只作为兜底，不做「全文搜第一个相同句子」式的脆弱定位。
+    """
+    if not rel or not parent_id:
+        h._send_json({"code": 400, "message": "缺少 path 或 parent_id 参数"}, 400)
+        return
+    db = h.ctx.db
+    row = db.query_one(
+        """SELECT pb.content, pb.section_path, d.rel_path
+           FROM parent_blocks pb JOIN documents d ON d.doc_id = pb.doc_id
+           WHERE pb.parent_id = ?""",
+        (parent_id,),
+    )
+    if row is None:
+        h._send_json({"code": 404, "message": "证据块不存在（索引可能已重建）"}, 404)
+        return
+    if row["rel_path"] != rel:
+        # 证据块不属于该笔记 —— 防止跨文档错位引用
+        h._send_json({"code": 404, "message": "证据块与该笔记不匹配"}, 404)
+        return
+    h._send_json(
+        {
+            "code": 200,
+            "data": {
+                "parent_id": parent_id,
+                "section_path": row["section_path"] or "",
+                "content": row["content"] or "",
+            },
+        }
+    )
+
+
 def save_note(h: "Handler") -> None:
     body = h._read_json()
     result = crawler.save_manual_note(
@@ -201,6 +238,9 @@ def handle_get(h: "Handler", path: str) -> bool:
         return True
     if path == "/api/notes/original":
         note_original(h, (q.get("path") or [""])[0])
+        return True
+    if path == "/api/notes/evidence":
+        note_evidence(h, (q.get("path") or [""])[0], (q.get("parent_id") or [""])[0])
         return True
     if path == "/api/import/formats":
         import_formats(h)

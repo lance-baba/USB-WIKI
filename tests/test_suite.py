@@ -3683,6 +3683,9 @@ def main() -> int:
         # P0 流式状态机 / 三档超时 / 来源显示 / 高亮摘录（真实状态用例）
         from tests.test_p0_stream_ux import run as _run_stream
         _run_stream(ctx, check, section, skip)
+        # A/B 轮：回答归因契约（禁同文共现→因果）+ 证据跳转接口
+        from tests.test_attribution_contract import run as _run_attr
+        _run_attr(ctx, check, section, skip)
         test_secret_redaction(ctx)
         test_import_security()
         test_archive_ssrf()

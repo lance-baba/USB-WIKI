@@ -25,7 +25,10 @@
     <button class="tab active" data-tab="chat">问答</button>
     <button class="tab" data-tab="capture">剪藏</button>
     <button class="tab" data-tab="notes">笔记</button>
-    <button class="tab" data-tab="graph">主题</button>
+    <!-- Pilot 隐藏「主题」：主题页对 Pilot（问答/资料）没有实际价值（主题 0 个 / 尚未归题 11 篇）。
+         仅 UI 隐藏 —— 主题后端、数据、本面板代码全部保留，待 Collections / Topic Intelligence
+         重新定义产品价值后再启用。 -->
+    <button class="tab" data-tab="graph" hidden>主题</button>
     <button class="tab" data-tab="settings">设置</button>
   </nav>
 
