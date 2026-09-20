@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import json
+import re
 import threading
 import time
 from dataclasses import dataclass, field
@@ -163,6 +164,68 @@ def _query_window(text: str, query: str, limit: int) -> str:
     start = max(0, pos - limit // 3)
     out = t[start:start + limit]
     return ("…" if start > 0 else "") + out + ("…" if start + limit < len(t) else "")
+
+
+#: 高亮哨兵：前端在 **HTML 转义之后** 把这两个控制字符替换成 <mark>/</mark>。
+#: 为什么不直接塞 <mark>：前端会对整段文本做 HTML 转义（防 XSS），直接塞标签会被
+#: 转义成字面量。哨兵是控制字符，转义不动它，前端再替换 —— 既高亮又不破坏转义。
+_HL_OPEN = "\u0001"
+_HL_CLOSE = "\u0002"
+
+
+def _highlight(text: str, terms: list[str]) -> str:
+    """把命中关键词包上高亮哨兵（长词优先 + 单次扫描，避免短词把长词切碎/嵌套）。"""
+    if not text or not terms:
+        return text
+    uniq = sorted({t for t in terms if t}, key=len, reverse=True)
+    if not uniq:
+        return text
+    pattern = "|".join(re.escape(t) for t in uniq)
+    try:
+        return re.sub(pattern, lambda m: _HL_OPEN + m.group(0) + _HL_CLOSE,
+                      text, flags=re.IGNORECASE)
+    except re.error:  # noqa: BLE001 - 极端词形导致编译失败时不高亮，不影响展示
+        return text
+
+
+_TABLE_SEP_RE = re.compile(r"^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$")
+
+
+def _table_excerpt(content: str, terms: list[str], max_rows: int = 6) -> str:
+    """若查询命中 Markdown 表格 → 返回「表头 + 命中行 + 相邻 ≤1 行」。
+
+    刻意**不按 300 字截断** —— 职责/姓名这类映射被砍掉一半比长一点更糟。
+    未命中任何表格行时返回空串，调用方回退到普通窗口摘录。
+    """
+    if "|" not in content or not terms:
+        return ""
+    lines = content.splitlines()
+    n = len(lines)
+    i = 0
+    while i < n - 1:
+        head, sep = lines[i], lines[i + 1]
+        if "|" in head and _TABLE_SEP_RE.match(sep or ""):
+            j = i + 2
+            rows: list[str] = []
+            while j < n and "|" in lines[j]:
+                rows.append(lines[j])
+                j += 1
+            hit = [k for k, r in enumerate(rows) if any(t in r for t in terms)]
+            if hit:
+                keep: set[int] = set()
+                for k in hit:
+                    for d in (-1, 0, 1):
+                        kk = k + d
+                        if 0 <= kk < len(rows):
+                            keep.add(kk)
+                body = [rows[k] for k in sorted(keep)]
+                if len(body) > max_rows:
+                    body = body[:max_rows]
+                return "\n".join([head, sep, *body])
+            i = j
+        else:
+            i += 1
+    return ""
 
 
 class Gateway:
@@ -551,6 +614,8 @@ class Gateway:
         refs = [
             {
                 "id": r.id, "title": r.title, "path": r.path,
+                # UX-1：界面「来源」用 display_source（导入文件→源文件名，剪藏/笔记→标题）
+                "display_source": getattr(r, "display_source", "") or r.title,
                 "snippet": r.snippet, "parent_id": r.parent_id,
                 "score": r.score, "similarity": r.similarity,
             }
@@ -569,52 +634,66 @@ class Gateway:
             return
 
         if provider == "ollama":
-            got_frame = False       # 是否收到过任何有效 stream 帧
-            got_content = False     # 是否收到过正文 delta
-            got_error = False
+            # 显式流式状态机（P0-1）。旧实现有两个致命缺陷：
+            #   ① delta 只记 got_content，**不计入「有效帧」**（got_frame 只由
+            #      thinking/done 置位）；
+            #   ② done=true 在 _stream_ollama 内部被直接 return，上层永远收不到。
+            # 二者叠加 → 模型**已完整输出答案**后 got_frame 仍为 False，被误判成
+            # 「未返回任何数据帧」→ 再追加一整套离线搜索结果。必须彻底拆开状态：
+            #   stream_started 收到过任何有效帧（content / thinking / done）
+            #   got_content    收到过正文
+            #   got_done       收到 done=true
+            #   stream_error   流式异常（连接中断 / 超时 / 服务端报错）
+            stream_started = False
+            got_content = False
+            got_done = False
+            stream_error = ""
             for frame in self._stream_ollama(query, history, result):
                 ft = frame.get("type")
-                if ft == "error":
-                    self.state.last_error = frame.get("message", "")
-                    got_error = True
-                    yield frame
-                    break
                 if ft == "delta":
+                    stream_started = True
                     got_content = True
                     yield frame
                 elif ft == "ollama_progress":   # thinking 帧：流活着，但不算正文
-                    got_frame = True
-                elif ft == "done":
-                    got_frame = True
+                    stream_started = True
+                elif ft == "ollama_done":
+                    stream_started = True
+                    got_done = True
+                elif ft == "error":
+                    stream_started = True
+                    stream_error = frame.get("message", "") or "本地 Ollama 流式中止"
+                    self.state.last_error = stream_error
+                    break
                 else:
                     yield frame
 
-            if got_error:
-                self.ollama_status(force=True)
-                yield {"type": "notice", "message": self._ollama_fail_notice()}
-                provider = self._degrade_target()
-            elif not got_frame:
-                # 一个有效帧都没收到（连接被拒 / 首 token 超时 / 流被掐断）
-                self.ollama_status(force=True)
-                yield {
-                    "type": "error",
-                    "message": self.state.last_error or "本地 Ollama 未返回任何数据帧",
-                }
-                yield {"type": "notice", "message": self._ollama_fail_notice()}
-                provider = self._degrade_target()
-            elif not got_content:
-                # 流是活的、但模型没吐正文（被 think/thinking 拦截，或不支持对话）
-                self.ollama_status(force=True)
+            # A. 有正文且无异常（含正常 EOF / 收到 done）→ 成功结束，绝不降级
+            if got_content and not stream_error:
+                yield {"type": "done"}
+                return
+            # B. 已有正文但连接异常结束（没等到 done）→ 保留已生成的答案 + 提示可能不完整，
+            #    **绝不再追加离线全文**（否则「AI 答案 + 一整份离线答案」混成一坨）
+            if got_content:
+                log.warning("Ollama 流式在正文后异常结束：%s", stream_error)
+                # 用 delta 追加**留在对话里**的提示（notice 只是 3.6s 的 toast，会被错过）
+                yield {"type": "delta",
+                       "content": "\n\n> ⚠ 本地模型连接提前结束，以上回答可能不完整。\n"}
+                yield {"type": "done"}
+                return
+            # C. 完全没有正文 → 才允许降级（provider=ollama→offline；auto→api→offline）
+            self.ollama_status(force=True)
+            if stream_error:
+                yield {"type": "error", "message": stream_error}
+            elif not stream_started:
+                yield {"type": "error", "message": "本地 Ollama 未返回任何数据帧"}
+            else:
                 yield {
                     "type": "error",
                     "message": "本地 Ollama 已完成请求，但未返回回答正文"
                     "（可能该模型不支持对话，或被 think/thinking 设置拦截）",
                 }
-                yield {"type": "notice", "message": self._ollama_fail_notice()}
-                provider = self._degrade_target()
-            else:
-                yield {"type": "done"}
-                return
+            yield {"type": "notice", "message": self._ollama_fail_notice()}
+            provider = self._degrade_target()
 
         if provider == "api":
             yielded = False
@@ -682,6 +761,9 @@ class Gateway:
                     # 不让上层把它误判成「推流中断」。
                     yield {"type": "ollama_progress"}
                 if obj.get("done"):
+                    # 必须把「正常 done」明确传回上层（P0-1）：旧实现直接 return，
+                    # 上层收不到 done，会把已完成的回答误判成失败。
+                    yield {"type": "ollama_done"}
                     return
         except net_util.StreamError as exc:
             yield {
@@ -763,12 +845,18 @@ class Gateway:
             "type": "delta",
             "content": "**本地搜索结果**（未调用生成式 AI，以下均为知识库原文摘录）：\n",
         }
-        for idx, p in enumerate(result.parents, start=1):
-            body = self._offline_excerpt(p.get("content") or "", query, limit=500)
+        # UX-2：只对**实际参与词法检索**的词高亮（拿不到就退回查询实词）
+        terms = list(getattr(result, "lex_terms", None) or []) or search_mod.content_terms(query)
+        # UX-3：默认最多展示 Top 3（需要更多请进资料正文查看，不新增搜索 UI）
+        for idx, p in enumerate(result.parents[:3], start=1):
+            body = self._offline_excerpt(p.get("content") or "", query, terms, limit=300)
+            body = _highlight(body, terms)
+            # UX-1：来源用 display_source（导入文件→源文件名；剪藏/笔记→标题）
+            src = p.get("display_source") or p.get("title") or ""
             sim = f"，相似度 {p['similarity']:.3f}" if p.get("similarity") else ""
             yield {
                 "type": "delta",
-                "content": f"\n### [^{idx}] {p['title']}（{p['path']}）{sim}\n\n{body}\n",
+                "content": f"\n### [^{idx}] {src}{sim}\n\n{body}\n",
             }
         yield {
             "type": "delta",
@@ -776,15 +864,19 @@ class Gateway:
         }
 
     # ------------------------------------------------------------------
-    def _offline_excerpt(self, content: str, query: str, limit: int = 500) -> str:
-        """离线展示用的原文摘录：保留表格等结构，不把换行压成一行。
+    def _offline_excerpt(self, content: str, query: str, terms: list[str],
+                         limit: int = 300) -> str:
+        """离线展示用的原文摘录（UX-3）：默认 ~250–350 字、以查询词为中心。
 
-        短父块整段给出；长父块用查询词定位窗口（与 :func:`_query_window` 一致，
-        只切字符、**不 flatten 换行**，所以 Markdown 表格仍可读）。
+        表格命中时**保表格结构**（表头 + 命中行 + 相邻 ≤1 行）—— 绝不为了 300 字符
+        把「职责 ↔ 姓名」这类映射截断。保留换行（不 flatten），所以表格仍可读。
         """
         c = (content or "").strip()
         if len(c) <= limit:
             return c
+        tbl = _table_excerpt(c, terms)
+        if tbl:
+            return tbl
         return _query_window(content, query, limit)
 
     # ------------------------------------------------------------------

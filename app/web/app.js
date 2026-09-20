@@ -41,6 +41,10 @@ function mdToHtml(src) {
     return "\u0000BLK" + (blocks.length - 1) + "\u0000";
   });
   text = esc(text);
+  // UX-2：把后端下发的命中哨兵（控制字符 \u0001/\u0002）转成 <mark>。
+  // 必须放在 esc() **之后**：关键词本身已随全文一起转义，这里只把哨兵换成标签 ——
+  // 既不破坏 HTML 转义，也不会在表格/路径里乱插标签。
+  text = text.replace(/\u0001/g, "<mark>").replace(/\u0002/g, "</mark>");
   text = text.replace(/`([^`\n]+)`/g, "<code>$1</code>");
   text = text.replace(/\*\*([^*\n]+)\*\*/g, "<b>$1</b>");
   text = text.replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<i>$2</i>");
@@ -51,7 +55,7 @@ function mdToHtml(src) {
   // 引用角标 [^1] / [1]
   text = text.replace(/\[\^?(\d+)\]/g, (m, n) => {
     const ref = S.refs.find(r => String(r.id) === String(n));
-    const tip = ref ? (ref.title + "\n" + ref.path + "\n\n" + (ref.snippet || "")).slice(0, 320) : "引用 " + n;
+    const tip = ref ? ((ref.display_source || ref.title) + "\n" + ref.path + "\n\n" + (ref.snippet || "")).slice(0, 320) : "引用 " + n;
     return '<span class="cite" data-ref="' + n + '" data-tip="' + esc(tip).replace(/\n/g, "&#10;") + '">' + n + "</span>";
   });
   text = text.replace(/\n{2,}/g, "</p><p>");
@@ -265,7 +269,9 @@ async function send() {
 function refsHtml(refs) {
   return '<div class="refs">' + refs.map(r =>
     '<span class="ref" data-ref="' + r.id + '" title="' +
-      esc(r.path + "\n" + (r.snippet || "点击跳转到该笔记")) + '">[' + r.id + "] " + esc(r.title) + "</span>"
+      esc(r.path + "\n" + (r.snippet || "点击跳转到该笔记")) + '">[' + r.id + "] " +
+      // UX-1：来源显示名优先（导入文件→源文件名；剪藏/笔记→标题）
+      esc(r.display_source || r.title) + "</span>"
   ).join("") + "</div>";
 }
 
@@ -524,11 +530,14 @@ async function loadNotes() {
 }
 function renderNoteList() {
   const kw = $("#noteFilter").value.trim().toLowerCase();
+  // UX-1：列表显示与过滤都用 display_source（导入文件→源文件名），
+  //       内部 title 仍保留在索引里（检索/提示词用），只是不再当「来源名」展示。
   const list = noteCache.filter(n =>
-    !kw || (n.title || "").toLowerCase().includes(kw) || (n.rel_path || "").toLowerCase().includes(kw));
+    !kw || (n.display_source || "").toLowerCase().includes(kw)
+    || (n.title || "").toLowerCase().includes(kw) || (n.rel_path || "").toLowerCase().includes(kw));
   $("#noteList").innerHTML = list.map(n =>
     '<div class="list-item" data-path="' + esc(n.rel_path) + '">' +
-      '<div class="t">' + esc(n.title || "(无标题)") + "</div>" +
+      '<div class="t">' + esc(n.display_source || n.title || "(无标题)") + "</div>" +
       '<div class="m"><span>' + esc(n.rel_path) + "</span>" +
       (n.status === "partial_fallback" ? '<span class="pill warn">快照</span>' : "") +
       "<span>" + (n.chunks || 0) + " 切片</span></div>" +

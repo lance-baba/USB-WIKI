@@ -6,6 +6,9 @@ data/assets/
 data/cache.db
 data/cache.db-wal
 data/cache.db-shm
+# 结构升级时自动产生的旧索引备份（cache.db.v14r20260916-114002.bak[+-wal/-shm]）。
+# 属于派生索引的备份，绝不入库；不忽略的话 `git add -A` 会把它们扫进提交。
+data/cache.db.v*.bak*
 data/wiki-usb.log
 data/temp_chrome_profile/
 

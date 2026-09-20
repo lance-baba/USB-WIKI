@@ -1517,7 +1517,7 @@ def test_single_version_source(ctx) -> None:
     _ri = _fx.release_integrity()
     check("BUILD_INFO 生成器存在且 app_version 派生自版本源",
           _ri.build_info(platform="win-x64", commit="x", python_version=None,
-                         dependency_lock_sha256=None, schema_version="1.4",
+                         dependency_lock_sha256=None, schema_version=M.CURRENT_SCHEMA_VERSION,
                          data_format_version=1)["app_version"] == V.APP_VERSION)
     check("app/version.py 不再保留第二份 BUILD_INFO 结构体（避免双定义漂移）",
           not hasattr(V, "build_info"))
@@ -3680,6 +3680,9 @@ def main() -> int:
         # 安装 / 卸载安全收口回归：默认保留资料 · 自定义 App 目录 · 彻底清场（临时目录，零真实写入）
         from tests.test_install_uninstall import run as _run_iut
         _run_iut(ctx, check, section, skip)
+        # P0 流式状态机 / 三档超时 / 来源显示 / 高亮摘录（真实状态用例）
+        from tests.test_p0_stream_ux import run as _run_stream
+        _run_stream(ctx, check, section, skip)
         test_secret_redaction(ctx)
         test_import_security()
         test_archive_ssrf()

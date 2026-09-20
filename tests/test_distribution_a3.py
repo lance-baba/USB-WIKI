@@ -39,6 +39,7 @@ if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 from tests import dist_fixture as fx                          # noqa: E402
 from app.version import APP_VERSION                           # noqa: E402
+from app.core.migrations import CURRENT_SCHEMA_VERSION as _SCHEMA_VERSION  # noqa: E402
 
 PASS: list[str] = []
 FAIL: list[str] = []
@@ -621,8 +622,10 @@ def _t_real_strict_build(tmp: Path) -> None:
           info["git_commit"])
     check("A3-13c python_version 取自随包运行时",
           info["python_version"] == "3.11.9", str(info["python_version"]))
+    # ⚠ 必须与 migrations 的**唯一来源**比对，不能写死字面量 ——
+    # 写死会在结构版本升级时假红（本用例的名字就是「取自唯一来源」）。
     check("A3-13d schema_version 取自 migrations 唯一来源",
-          info["schema_version"] == "1.4", str(info["schema_version"]))
+          info["schema_version"] == _SCHEMA_VERSION, str(info["schema_version"]))
     check("A3-13e data_format_version 取自 library 唯一来源",
           info["data_format_version"] == 1, str(info["data_format_version"]))
     lock_sha = ri.sha256_file(REPO / "requirements-release.lock")

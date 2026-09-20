@@ -49,6 +49,9 @@ class Reference:
     doc_id: str
     score: float
     similarity: float | None = None
+    #: UX-1 界面「来源」：导入文件→源文件名；剪藏→网页标题；笔记→笔记标题。
+    #: 与内部 title 分离 —— title 仍用于 metadata / 检索 / 提示词。
+    display_source: str = ""
 
 
 @dataclass
@@ -59,6 +62,8 @@ class SearchResult:
     references: list[Reference] = field(default_factory=list)
     parents: list[dict] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    #: 本次检索**实际落地**的词法实词（供离线结果做命中高亮；UX-2）
+    lex_terms: list[str] = field(default_factory=list)
 
 
 # --------------------------------------------------------------------------
@@ -419,6 +424,33 @@ def _snippet(text: str, query: str, width: int = 140) -> str:
     return t[:width] + ("…" if len(t) > width else "")
 
 
+def _doc_row(db: Database, doc_id: str) -> tuple[str, str, str]:
+    """取 (title, rel_path, display_source)。
+
+    display_source 来自 doc_meta（UX-1）。为兼容「尚未含该列的旧库」，查询失败时
+    退回不含该列的旧语句，而不是让整条检索链报错。
+    """
+    try:
+        r = db.query_one(
+            """SELECT d.title, d.rel_path,
+                      COALESCE(m.display_source, '') AS display_source
+                 FROM documents d LEFT JOIN doc_meta m ON m.doc_id = d.doc_id
+                WHERE d.doc_id = ?""",
+            (doc_id,),
+        )
+        if r:
+            return (r["title"] or ""), (r["rel_path"] or ""), (r["display_source"] or "")
+    except sqlite3.Error:
+        pass
+    try:
+        r = db.query_one("SELECT title, rel_path FROM documents WHERE doc_id = ?", (doc_id,))
+        if r:
+            return (r["title"] or ""), (r["rel_path"] or ""), ""
+    except sqlite3.Error:
+        pass
+    return "", "", ""
+
+
 def _term_exists(db: Database, term: str, cache: dict[str, bool] | None = None) -> bool:
     """语料中是否存在该串（用于「拿语料当词典」的切分）。"""
     if cache is not None and term in cache:
@@ -552,6 +584,7 @@ def hybrid_search(
             lex_terms, fts_ids, route = resolved, ids, r
             break
     result.route = route
+    result.lex_terms = list(lex_terms)          # 供离线结果高亮实际命中的词（UX-2）
 
     # 路 2：向量
     vec_pairs = _vec_search(db, embedder, query, candidates)
@@ -612,7 +645,7 @@ def hybrid_search(
 
     top_parents = sorted(parent_scores.items(), key=lambda kv: kv[1], reverse=True)[:top_k_parents]
 
-    doc_cache: dict[str, sqlite3.Row | None] = {}
+    doc_cache: dict[str, tuple[str, str, str]] = {}
     references: list[Reference] = []
     parents: list[dict] = []
 
@@ -623,12 +656,10 @@ def hybrid_search(
         if not prow:
             continue
         did = prow["doc_id"]
-        drow = doc_cache.get(did, "__miss__")  # type: ignore[assignment]
-        if drow == "__miss__":  # type: ignore[comparison-overlap]
-            drow = db.query_one("SELECT title, rel_path, status FROM documents WHERE doc_id = ?", (did,))
-            doc_cache[did] = drow
-        title = (drow["title"] if drow else None) or did
-        rel_path = (drow["rel_path"] if drow else "") or ""
+        if did not in doc_cache:
+            doc_cache[did] = _doc_row(db, did)
+        title, rel_path, display_source = doc_cache[did]
+        title = title or did
 
         # 该父块下得分最高的子切片用于计算相似度提示
         sim: float | None = None
@@ -644,6 +675,7 @@ def hybrid_search(
         ref = Reference(
             id=idx, title=title, path=rel_path, snippet=snippet,
             parent_id=pid, doc_id=did, score=round(score, 6), similarity=sim,
+            display_source=display_source or title,
         )
         references.append(ref)
         parents.append(
@@ -651,6 +683,7 @@ def hybrid_search(
                 "parent_id": pid,
                 "doc_id": did,
                 "title": title,
+                "display_source": display_source or title,
                 "path": rel_path,
                 "content": prow["content"],
                 "score": round(score, 6),
@@ -684,17 +717,31 @@ def hybrid_search(
 
 
 def rank_documents(db: Database, limit: int = 20) -> list[dict]:
-    """笔记列表（按索引时间倒序）。"""
-    try:
-        rows = db.query(
-            """SELECT d.doc_id, d.rel_path, d.title, d.status, d.file_size, d.mtime,
-                      (SELECT COUNT(*) FROM chunks c WHERE c.doc_id = d.doc_id) AS chunks
-               FROM documents d ORDER BY d.mtime DESC LIMIT ?""",
-            (limit,),
-        )
-        return [dict(r) for r in rows]
-    except sqlite3.Error:
-        return []
+    """笔记列表（按索引时间倒序）。带 display_source（UX-1）；旧库退回无该列查询。"""
+    sql_join = (
+        """SELECT d.doc_id, d.rel_path, d.title, d.status, d.file_size, d.mtime,
+                  COALESCE(m.display_source, '') AS display_source,
+                  (SELECT COUNT(*) FROM chunks c WHERE c.doc_id = d.doc_id) AS chunks
+             FROM documents d LEFT JOIN doc_meta m ON m.doc_id = d.doc_id
+            ORDER BY d.mtime DESC LIMIT ?"""
+    )
+    sql_plain = (
+        """SELECT d.doc_id, d.rel_path, d.title, d.status, d.file_size, d.mtime,
+                  (SELECT COUNT(*) FROM chunks c WHERE c.doc_id = d.doc_id) AS chunks
+             FROM documents d ORDER BY d.mtime DESC LIMIT ?"""
+    )
+    for sql in (sql_join, sql_plain):
+        try:
+            out: list[dict] = []
+            for r in db.query(sql, (limit,)):
+                d = dict(r)
+                if not d.get("display_source"):
+                    d["display_source"] = d.get("title") or d.get("rel_path") or ""
+                out.append(d)
+            return out
+        except sqlite3.Error:
+            continue
+    return []
 
 
 def keyword_search_chunks(db: Database, query: str, limit: int = 30) -> list[dict]:

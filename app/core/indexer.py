@@ -19,6 +19,32 @@ from . import urls as _urls
 log = get_logger()
 
 
+def derive_display_source(meta: dict, title: str, rel_path: str) -> str:
+    """统一「来源显示名」（UX-1）—— **只服务界面**，不影响内部 title。
+
+    规则（按优先级）：
+      * 本地导入文件  → frontmatter 的 ``source_file``（用户上传时的原始文件名）
+      * 网页剪藏      → 网页标题（即内部 ``title``）
+      * 手写笔记      → 笔记标题（即内部 ``title``）
+      * 兜底          → ``rel_path`` 的文件名
+
+    背景：真实 DOCX 的 ``docProps/core.xml`` 里 title/subject 常是公司名之类，
+    拿它当检索来源会让用户看到「宁波孙氏开发有限公司太阳广场」而不是自己上传的
+    文件名。内部 ``title`` 继续用于 metadata / 检索 / 提示词，不改动。
+    """
+    meta = meta or {}
+    src_file = str(meta.get("source_file") or "").strip()
+    if src_file:
+        return src_file
+    t = str(title or "").strip()
+    if t:
+        return t
+    try:
+        return Path(rel_path or "").name
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 # --------------------------------------------------------------------------
 def _vec_chunk_ids_for(db: Database, doc_id: str) -> list[str]:
     """扫描 ``chunks_vec`` 取回属于该文档的全部 chunk_id。
@@ -177,17 +203,20 @@ def index_parsed(
                     _norm_url = _urls.normalize_url(_src)
                 except Exception:  # noqa: BLE001 - 规范化失败不影响索引
                     _norm_url = ""
+            # UX-1：统一「来源显示名」（导入文件→源文件名；剪藏/笔记→标题）
+            _display = derive_display_source(_m, parsed.title, parsed.rel_path)
             try:
                 conn.execute(
                     """INSERT OR REPLACE INTO doc_meta
-                       (doc_id, keywords, host, language, summary, entities, normalized_url)
-                       VALUES (?,?,?,?,?,?,?)""",
+                       (doc_id, keywords, host, language, summary, entities,
+                        normalized_url, display_source)
+                       VALUES (?,?,?,?,?,?,?,?)""",
                     (
                         parsed.doc_id, _kw_text[:600], _host,
                         str(_m.get("language") or "")[:16],
                         str(_m.get("summary") or "")[:300],
                         json.dumps(_m.get("entities") or {}, ensure_ascii=False)[:900],
-                        _norm_url,
+                        _norm_url, _display[:300],
                     ),
                 )
             except sqlite3.Error as exc:  # 元数据写入失败不该影响索引
