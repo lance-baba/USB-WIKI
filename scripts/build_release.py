@@ -183,34 +183,55 @@ def _stage_embedding(dist_root: Path) -> dict:
     return report
 
 
+def _installer_bat(subcmd: str) -> str:
+    """生成 installer/*.bat 的内容（**纯 ASCII**）。
+
+    硬性约束（否则 cp936 宿主机上 .bat 内嵌中文会乱码）：
+      · 本体只含 ASCII，中文提示一律由 Python 打印；
+      · **不使用括号块** —— 括号内 `%VAR%` 在解析期展开会拿到过期值，用 label/goto 扁平结构。
+    关键 UX（2026-09-20 修）：双击 .bat 时 Windows 给了它一个新控制台，**进程一退出窗口即关闭**；
+    此前没有 `pause`，导致用户「输入路径回车后窗口就没了」，成功/报错全都看不见。
+    现在无论成功失败都 `pause` 等待按键，用户能看到完整输出。
+    """
+    return (
+        "@echo off\r\n"
+        "setlocal\r\n"
+        "cd /d \"%~dp0\"\r\n"
+        "if not exist \"..\\payload\\python-runtime\\python.exe\" goto media_missing\r\n"
+        f"..\\payload\\python-runtime\\python.exe install.py {subcmd} %*\r\n"
+        "set RC=%ERRORLEVEL%\r\n"
+        "if not \"%RC%\"==\"0\" goto failed\r\n"
+        "echo.\r\n"
+        "echo [OK] Done. Return code 0.\r\n"
+        "goto hold\r\n"
+        ":failed\r\n"
+        "echo.\r\n"
+        "echo [ERROR] Failed with exit code %RC%. Please read the message above.\r\n"
+        "goto hold\r\n"
+        ":hold\r\n"
+        "echo.\r\n"
+        "echo Press any key to close this window . . .\r\n"
+        "pause >nul\r\n"
+        "exit /b %RC%\r\n"
+        ":media_missing\r\n"
+        "echo MEDIA_CORRUPTED: payload\\python-runtime\\python.exe missing\r\n"
+        "echo Press any key to close this window . . .\r\n"
+        "pause >nul\r\n"
+        "exit /b 5\r\n"
+    )
+
+
 def _stage_installer(dist_root: Path) -> None:
     installer_dir = dist_root / "installer"
     installer_dir.mkdir(parents=True, exist_ok=True)
     shutil.copy2(HERE / "install_windows.py", installer_dir / "install.py")
     # 介质校验唯一实现：安装器同目录副本，避免「构建/校验」两套枚举漂移
     shutil.copy2(HERE / "release_integrity.py", installer_dir / "release_integrity.py")
-    (installer_dir / "install.bat").write_text(
-        "@echo off\r\n"
-        "setlocal\r\n"
-        "cd /d \"%~dp0\"\r\n"
-        "if not exist \"..\\payload\\python-runtime\\python.exe\" (\r\n"
-        "  echo MEDIA_CORRUPTED: payload\\python-runtime\\python.exe missing\r\n"
-        "  exit /b 5\r\n"
-        ")\r\n"
-        "..\\payload\\python-runtime\\python.exe install.py %*\r\n",
-        encoding="ascii",
-    )
-    (installer_dir / "uninstall.bat").write_text(
-        "@echo off\r\n"
-        "setlocal\r\n"
-        "cd /d \"%~dp0\"\r\n"
-        "if not exist \"..\\payload\\python-runtime\\python.exe\" (\r\n"
-        "  echo MEDIA_CORRUPTED: payload\\python-runtime\\python.exe missing\r\n"
-        "  exit /b 5\r\n"
-        ")\r\n"
-        "..\\payload\\python-runtime\\python.exe install.py uninstall %*\r\n",
-        encoding="ascii",
-    )
+    # ⚠ 两个 .bat 都必须带上**子命令**：install.py 是 subparsers 结构，
+    #   `install.py --app-target X` 会被 argparse 当成「X 是子命令」而报 invalid choice
+    #   （旧版 install.bat 写的是 `install.py %*`，缺 `install` 子命令 → 带参数的 CLI 用法一直是坏的）。
+    (installer_dir / "install.bat").write_text(_installer_bat("install"), encoding="ascii")
+    (installer_dir / "uninstall.bat").write_text(_installer_bat("uninstall"), encoding="ascii")
     if not (installer_dir / "install.py").is_file():
         _fail_build("installer/install.py 生成失败")
     if not (installer_dir / "release_integrity.py").is_file():

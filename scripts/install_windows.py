@@ -304,10 +304,27 @@ def _validate_app_target(path: Path, release_root: Path | None = None) -> str | 
         probe.unlink()
     except Exception as e:
         return f"父目录不可写（{e}）"
-    # 已存在目录：只允许是 USB-WIKI App（reinstall）；否则拒绝
+    # 已存在目录：只允许是 USB-WIKI App（reinstall）；否则拒绝（绝不删未知文件腾位置）
     if p.exists() and not _looks_like_usbwiki_app(p):
-        return "目标目录已存在其它文件，请选择其它空目录"
+        return (f"目录已存在且里面有其它文件：{p}\n"
+                "        为避免误删你的文件，安装器不会覆盖它。\n"
+                "        请换一个**尚不存在或为空**的目录，例如 D:\\Apps\\USB-WIKI-2")
     return None
+
+
+def _normalize_user_path(raw: str) -> str:
+    """规整用户手输/粘贴的路径。
+
+    常见粘贴形态：`"D:\\Apps\\USB-WIKI"`（带引号）、首尾空白、末尾多余分隔符。
+    必须剥掉引号再交给 Path，否则会得到一个含引号的非法路径（WinError 123）——
+    实测这正是「输入自定义目录后立刻失败」的一个真实成因。
+    """
+    s = (raw or "").strip()
+    # 反复剥掉成对的引号（含中文书名号/全角引号，粘贴自聊天工具时的常见形态）
+    while len(s) >= 2 and s[0] in ("\"", "'", "“", "‘") and s[-1] in ("\"", "'", "”", "’"):
+        s = s[1:-1].strip()
+    s = s.strip().strip("\"'“”‘’").strip()
+    return s
 
 
 def _resolve_app_target(explicit: str | None, *, interactive: bool,
@@ -316,30 +333,40 @@ def _resolve_app_target(explicit: str | None, *, interactive: bool,
 
     交互式**仅在 stdin 为 TTY** 时启用：双击 .bat / CI 管道（无 TTY）自动落默认，
     绝不因等不到输入而卡住。交互 / CLI / CI 三条入口最终共用同一 ``install()``。
+
+    交互输入最多重试 3 次：输错（目录非空 / 带引号 / 指向介质内 …）会**打印原因并让你重输**，
+    而不是直接退出 —— 否则用户只看到窗口一闪而过。
     """
     if explicit:
-        err = _validate_app_target(Path(explicit), release_root)
+        err = _validate_app_target(Path(_normalize_user_path(explicit)), release_root)
         if err:
             fail(f"自定义安装目录无效：{err}")
-        return Path(explicit).expanduser().resolve()
+        return Path(_normalize_user_path(explicit)).expanduser().resolve()
 
     # 无显式目标时，**优先沿用安装记录里的真实位置** —— 这样双击 install.bat 重装
     # 会原地事务升级（而不是又装一份到默认目录），符合「重装使用真实安装路径」。
     default = _state_app_target() or _default_app_target()
-    if interactive and sys.stdin is not None and sys.stdin.isatty():
+    if not (interactive and sys.stdin is not None and sys.stdin.isatty()):
+        return default
+
+    print("USB-WIKI 安装程序\n")
+    print(f"程序将安装到（默认）：\n  {default}\n")
+    for _ in range(3):
+        print("直接回车 = 使用上面的默认位置；或输入其它安装目录（例如 D:\\Apps\\USB-WIKI）：")
         try:
-            print("USB-WIKI 安装程序\n")
-            print(f"程序默认安装到：\n  {default}\n")
-            print("直接回车使用默认位置，或输入其它安装目录（例如 D:\\Apps\\USB-WIKI）：")
-            ans = input("> ").strip()
-        except (EOFError, KeyboardInterrupt):
-            ans = ""
-        if ans:
-            err = _validate_app_target(Path(ans), release_root)
-            if err:
-                fail(f"自定义安装目录无效：{err}")
+            ans = input("> ")
+        except EOFError:
+            return default                    # 拿不到输入（非交互）→ 默认，不阻断
+        except KeyboardInterrupt:
+            fail("已取消安装。", rc=130)
+        ans = _normalize_user_path(ans)
+        if not ans:
+            return default
+        err = _validate_app_target(Path(ans), release_root)
+        if err is None:
             return Path(ans).expanduser().resolve()
-    return default
+        print(f"\n[目录不可用] {err}\n")
+    fail("自定义安装目录连续 3 次无效，已取消安装。", rc=3)
 
 
 # ---------------------------------------------------------------------------

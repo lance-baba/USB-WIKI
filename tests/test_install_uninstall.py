@@ -255,5 +255,28 @@ def run(ctx, check, section, skip) -> None:  # noqa: ARG001
         check("拒绝覆盖已有其它文件的目录（不删未知文件腾位置）",
               rc != 0 and (dirty / "userfile.txt").is_file())
 
+        # ---- [G] 交互可用性：双击 .bat 窗口不再一闪而过 + 粘贴路径容错 ----
+        import build_release as br
+        inst_bat = br._installer_bat("install")
+        un_bat = br._installer_bat("uninstall")
+        check("install.bat 退出前 pause（双击窗口不再一闪而过）", "pause" in inst_bat.lower())
+        check("uninstall.bat 退出前 pause", "pause" in un_bat.lower())
+        check("installer .bat 为纯 ASCII（cp936 宿主机不乱码）",
+              all(ord(c) < 128 for c in inst_bat + un_bat))
+        check("installer .bat 不使用括号块（避免 %VAR% 解析期展开）",
+              "(" not in inst_bat and ")" not in inst_bat)
+        check("install.bat 带 install 子命令（否则带参数的 CLI 用法会被 argparse 拒绝）",
+              "install.py install" in inst_bat)
+        check("uninstall.bat 带 uninstall 子命令", "install.py uninstall" in un_bat)
+
+        import install_windows as _iw
+        q_target = root / "q" / "USB-WIKI"
+        quoted = '"' + str(q_target) + '"'
+        check("粘贴的带引号路径被剥离引号",
+              _iw._normalize_user_path(quoted) == str(q_target),
+              _iw._normalize_user_path(quoted))
+        check("带引号路径校验通过（不再 WinError 123）",
+              _iw._validate_app_target(Path(_iw._normalize_user_path(quoted)), release) is None)
+
     finally:
         shutil.rmtree(root, ignore_errors=True)
