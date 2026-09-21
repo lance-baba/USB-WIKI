@@ -1,8 +1,12 @@
-"""恢复脚本：从 cache.db.v16r*.bak 的父块正文重建 data/notes/*.md。
+"""⚠ RECOVERY TOOL —— 从 cache.db.v*R*.bak 的父块正文重建被误删的 data/notes/*.md。
 
-背景：本轮在**未隔离 workspace** 下跑 targeted tests，tests 的 reset_workspace()
-删除了 data/notes/*.md 与 cache.db（这两者在 .gitignore 里，git 无法恢复）。
-schema 升级时自动留下的 cache.db.v*R*.bak 仍保存着每篇笔记的全部父块正文 → 据此重建。
+**不是产品功能，也不在启动 / 构建 / 测试流程里被调用（禁止自动执行）** ——
+只在「笔记被破坏性操作误删」时，由人**手动**运行一次。
+默认**绝不覆盖**已存在的笔记（需要覆盖必须显式加 `--overwrite`），避免二次伤害。
+
+背景：2026-09-21 在**未隔离 workspace** 下跑 targeted tests，其 reset_workspace()
+删除了 data/notes/*.md 与 cache.db（两者在 .gitignore 里，git 无法恢复）。
+schema 升级时自动留下的 cache.db.v*R*.bak 仍保存每篇笔记的全部父块正文 → 据此重建。
 
 保真度说明：
 * 正文按 parent_blocks.ord 顺序拼接，段落文本与原文一致；
@@ -11,6 +15,7 @@ schema 升级时自动留下的 cache.db.v*R*.bak 仍保存着每篇笔记的全
 """
 from __future__ import annotations
 
+import argparse
 import datetime as _dt
 import shutil
 import sqlite3
@@ -21,6 +26,12 @@ NOTES = ROOT / "data" / "notes"
 BACKUP = ROOT / "data" / "cache.db.v16r20260920-185807.bak"
 
 NOTES.mkdir(parents=True, exist_ok=True)
+_ap = argparse.ArgumentParser(
+    description="RECOVERY TOOL —— 从索引备份重建 notes（默认不覆盖已存在文件）")
+_ap.add_argument("--overwrite", action="store_true",
+                 help="允许覆盖已存在的笔记（默认拒绝，防止二次伤害）")
+_args = _ap.parse_args()
+
 con = sqlite3.connect(str(BACKUP))
 con.row_factory = sqlite3.Row
 
@@ -51,11 +62,16 @@ for d in docs:
     fm.append(f'restored_at: "{_dt.datetime.now():%Y-%m-%d %H:%M:%S}"')
     fm.append("restored_from: \"" + BACKUP.name + "\"")
     fm.append("---")
-    (NOTES / name).write_text("\n".join(fm) + "\n\n" + body + "\n", encoding="utf-8")
+    target = NOTES / name
+    if target.exists() and not _args.overwrite:
+        skipped.append(f"{name}（已存在，默认不覆盖；需要时加 --overwrite）")
+        continue
+    target.write_text("\n".join(fm) + "\n\n" + body + "\n", encoding="utf-8")
     restored.append((name, len(body)))
 
 con.close()
-print(f"restored {len(restored)} notes:")
+print(f"RECOVERY TOOL —— 恢复 {len(restored)} 篇"
+      f"（模式：{'覆盖' if _args.overwrite else '不覆盖（默认）'}）")
 for n, chars in restored:
     print(f"  {n}  ({chars} chars)")
 if skipped:

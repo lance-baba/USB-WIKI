@@ -132,6 +132,8 @@ def run(ctx, check, section, skip) -> None:
     # ---- 清理：本测试造的文档必须全部撤掉，否则会污染共享 workspace 里
     #      后续测试的计数断言（test_index_and_search / test_graph 都按 docs 数断言）----
     from app.core import indexer
+    from tests import test_env
+    test_env.assert_test_library_safe()      # 破坏性清理前必须过保险丝
     for row in ctx.db.query(
         "SELECT doc_id, rel_path FROM documents WHERE rel_path LIKE '%证据跳转验证%'"
     ):

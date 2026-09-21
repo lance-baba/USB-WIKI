@@ -633,6 +633,11 @@ def _t_h_signature() -> None:
 
 
 def run_a42b_tests() -> None:
+    # 安全保险丝：本模块会往 Library 的 notes/ 写文件 —— 先确认处于隔离测试库
+    from tests import test_env as _te
+
+    _te.assert_test_library_safe()
+
     print("\n" + "=" * 66)
     print("  A4.2b —— Bundled Embedding 集成验收")
     print("=" * 66)

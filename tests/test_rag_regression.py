@@ -54,6 +54,11 @@ def _chunk_walk(db, chunk_ids: list[str]) -> list[str]:
 
 
 def run(ctx, check, section, skip) -> None:
+    # 安全保险丝：本模块会往 Library 的 notes/ 写文件 —— 先确认处于隔离测试库
+    from tests import test_env as _te
+
+    _te.assert_test_library_safe()
+
     """由 tests/test_suite.py 调用（复用其 section/check/skip）。"""
     section("RAG 检索回归（分层：fts / like / hybrid / noemb）")
     db = ctx.db

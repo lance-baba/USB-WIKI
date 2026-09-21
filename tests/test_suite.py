@@ -29,6 +29,15 @@ from pathlib import Path
 #   并让整个测试套件以 exit=1 崩掉（CI 上实测过）。这里主动切到 UTF-8，
 #   使测试在任意机器、任意代码页下都能跑，不依赖外部环境变量。
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+# ⚠ 安全保险丝（必须在导入 app.core.paths **之前**）：测试自己创建临时 Library 并写入
+#   WIKIUSB_LIBRARY + WIKIUSB_TEST_MODE=1 + sentinel —— 破坏性测试永远碰不到真实开发库。
+#   真实事故（2026-09-21）：reset_workspace() 在 repo/data 上跑，删掉了用户笔记与 cache.db。
+from tests import test_env  # noqa: E402
+
+TEST_LIBRARY = test_env.activate_test_library()
+test_env.print_banner(TEST_LIBRARY)
+
 from app.core.log_util import ensure_utf8_console  # noqa: E402
 from app.version import APP_VERSION  # noqa: E402
 
@@ -107,6 +116,13 @@ status: success
 
 
 def reset_workspace() -> None:
+    """清空**隔离测试 Library** 的 notes / snapshots / cache.db。
+
+    ⚠ 破坏性 helper —— 第一行就是硬闸门：库必须满足「TEST_MODE=1 + sentinel +
+    位于 TEMP」，且**不等于** repo/data 或 Documents/USB-WIKI-Data，否则 raise
+    REFUSING_DESTRUCTIVE_TEST_ON_NON_TEST_LIBRARY（真实事故后新增，见 tests/test_env.py）。
+    """
+    test_env.assert_test_library_safe()
     for p in paths.NOTES_DIR.glob("*.md"):
         p.unlink(missing_ok=True)
     for p in paths.SNAPSHOT_DIR.glob("*"):
@@ -3700,6 +3716,9 @@ def main() -> int:
         # Fast P0：引用 stable anchor（源行范围）+ 章节覆盖 + 日志格式化契约
         from tests.test_citation_anchor import run as _run_anchor
         _run_anchor(ctx, check, section, skip)
+        # 安全保险丝：破坏性测试只能碰隔离 Library（事故后新增，永远先跑）
+        from tests.test_harness_safety import run as _run_safety
+        _run_safety(ctx, check, section, skip)
         test_secret_redaction(ctx)
         test_import_security()
         test_archive_ssrf()
