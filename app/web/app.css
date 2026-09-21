@@ -120,12 +120,13 @@
   .cite:hover{transform:translateY(-1px)}
   /* UX-2：离线搜索结果里命中查询词的高亮（后端用哨兵标记，前端转 <mark>） */
   mark{background:rgba(250,204,21,.45);color:inherit;border-radius:3px;padding:0 1px;font-weight:600}
-  /* B：引用证据块高亮 —— 浅黄底 + 描边，数秒后背景淡化（关键词 mark 保留） */
+  /* B：引用跳转的视觉语义 —— 章节上下文=淡蓝块（3.5s 淡化）；证据句=黄色，保留 */
   .doc-md .ev-hl{
-    background:#fff7d6;border-radius:7px;box-shadow:inset 0 0 0 2px #fde68a;
+    background:#eef4ff;border-radius:7px;box-shadow:inset 0 0 0 2px #bfdbfe;
     transition:background 1.4s ease, box-shadow 1.4s ease;
   }
   .doc-md .ev-hl-fade{background:transparent;box-shadow:inset 0 0 0 2px transparent}
+  .doc-md mark.ev-ev{background:rgba(250,204,21,.55)}
   .cite[data-tip]:hover::after{
     content:attr(data-tip);position:absolute;bottom:135%;left:50%;transform:translateX(-50%);
     width:320px;max-width:70vw;padding:9px 11px;border-radius:10px;background:#0f172a;color:#f1f5f9;

@@ -567,7 +567,7 @@ async function openNoteItem(el, jump) {
     const btn = $("#segOriginal");
     btn.disabled = !orig;
     btn.title = orig
-      ? ("查看原版：" + orig.name + "（" + fmtSize(orig.size) + "）")
+      ? ("查看" + noteLabels(orig).original + "：" + orig.name + "（" + fmtSize(orig.size) + "）")
       : "该笔记没有留存原件（纯 Markdown / 纯文本导入）";
     if (jump) {
       // 证据跳转只在「渲染」视图里定位（B4：不做 PDF/DOCX 页面坐标）。
@@ -607,12 +607,12 @@ function _evBlocks(box) {
   return Array.from(box.children).filter(el =>
     /^(P|H1|H2|H3|H4|H5|H6|UL|OL|BLOCKQUOTE|TABLE|PRE|HR|DIV)$/.test(el.tagName));
 }
-/* 在元素内的文本节点上包 <mark>（不碰任何标签/属性；每个节点从最早命中开始，递归处理尾部） */
-function _markNode(node, terms) {
+/* 在元素内的文本节点上包高亮标签（不碰任何标签/属性；每个节点从最早命中开始，递归处理尾部） */
+function _markNode(node, phrases, tag, cls) {
   const text = node.nodeValue;
   if (!text || !text.trim()) return;
   let best = null;
-  for (const t of terms) {
+  for (const t of phrases) {
     if (!t) continue;
     const i = text.toLowerCase().indexOf(t);
     if (i >= 0 && (!best || i < best.i)) best = { i, t };
@@ -620,31 +620,33 @@ function _markNode(node, terms) {
   if (!best) return;
   const frag = document.createDocumentFragment();
   if (best.i > 0) frag.appendChild(document.createTextNode(text.slice(0, best.i)));
-  const mk = document.createElement("mark");
+  const mk = document.createElement(tag || "mark");
+  if (cls) mk.className = cls;
   mk.textContent = text.slice(best.i, best.i + best.t.length);
   frag.appendChild(mk);
   const tail = document.createTextNode(text.slice(best.i + best.t.length));
   frag.appendChild(tail);
   node.parentNode.replaceChild(frag, node);
-  _markNode(tail, terms);          // tail 严格更短 → 必然终止
+  _markNode(tail, phrases, tag, cls);     // tail 严格更短 → 必然终止
 }
-function _queryTerms(q) {
-  // 问题词二连字不作为高亮词（共有/几个/哪些…不是证据关键词）
-  const STOP = new Set(["共有", "几个", "多少", "哪些", "什么", "怎么", "如何", "哪里", "是否",
-    "需要", "要求", "使用", "进行", "可以", "能够", "应该", "以及", "通过", "根据"]);
-  const out = [];
-  (String(q || "").match(/[\u4e00-\u9fff]{2,}|[A-Za-z0-9][A-Za-z0-9\-_.]{2,}/g) || [])
-    .forEach(run => {
-      const k = run.toLowerCase();
-      if (/^[\u4e00-\u9fff]+$/.test(run)) {
-        if (run.length <= 4 && !STOP.has(run)) out.push(k);          // 短词整词
-        for (let i = 0; i + 2 <= run.length; i++) {                  // 2-gram（实际命中的才算）
-          const g = run.slice(i, i + 2).toLowerCase();
-          if (!STOP.has(g) && !out.includes(g)) out.push(g);
-        }
-      } else if (!out.includes(k)) out.push(k);
+/* 证据句子：从 ref.snippet（后端已给 query-centered 摘录）里取真正出现在正文中的片段。
+   注意剔除后端下发的**高亮哨兵**（\u0001/\u0002）—— 它们是给聊天气泡渲染 <mark> 用的，
+   留着会让这里做精确子串匹配时永远对不上正文。 */
+function _evidencePhrases(snippet) {
+  const clean = String(snippet || "")
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, "");
+  const parts = [];
+  // 先按省略号/换行切，再按句读切细：摘录常把「小节标题 + 正文」粘成一段，
+  // 不切细就永远匹配不到正文（正文里标题是独立的一行）。
+  clean.split(/[…\n]|\.\.\./).forEach(seg => {
+    seg.split(/[，。；：,;]/).forEach(piece => {
+      const t = piece.replace(/\s+/g, " ").trim();
+      if (t.length >= 8) parts.push(t);
     });
-  return out.slice(0, 12);
+  });
+  // 按**摘录顺序**取（后端摘录以命中词为中心 → 首片就是真正支持回答的那句），
+  // 不按长度排序：长片段往往落在句子尾部，会把高亮打到无关的从句上。
+  return parts.slice(0, 3);
 }
 async function jumpToEvidence(path, jump) {
   const box = $("#noteView");
@@ -700,21 +702,46 @@ async function jumpToEvidence(path, jump) {
   }
   const region = blocks.slice(start, end + 1);
   region.forEach(b => b.classList.add("ev-hl"));
-  const terms = _queryTerms(S.q);
-  if (terms.length) region.forEach(b => {
-    const walker = document.createTreeWalker(b, NodeFilter.SHOW_TEXT, null);
-    const nodes = [];
-    while (walker.nextNode()) nodes.push(walker.currentNode);
-    nodes.forEach(n => _markNode(n, terms));
-  });
+  // 视觉语义（本轮修正）：章节上下文 = 淡蓝块（3.5s 后淡化）；
+  // 真正支持回答的**证据句**（ref.snippet 的正文片段）= 黄色高亮并保留；
+  // 查询词不再做永久 mark —— 否则用户满屏都是「Qwen-Image-2.1 / 功能」的黄块。
+  const phrases = _evidencePhrases(jump.snippet);
+  if (phrases.length) {
+    region.forEach(b => {
+      const walker = document.createTreeWalker(b, NodeFilter.SHOW_TEXT, null);
+      const nodes = [];
+      while (walker.nextNode()) nodes.push(walker.currentNode);
+      nodes.forEach(n => _markNode(n, phrases, "mark", "ev-ev"));
+    });
+  }
   region[0].scrollIntoView({ block: "center", behavior: "smooth" });
-  // 证据块背景几秒后淡化，关键词 <mark> 保留（任务 B1 的视觉规范）
   setTimeout(() => region.forEach(b => b.classList.add("ev-hl-fade")), 3500);
 }
 
 /* -------- 笔记视图：渲染 / 原版 / 源码 -------- */
 const NOTE = { payload: null, view: "rendered" };
-const NOTE_LABEL = { rendered: "渲染", original: "原版", raw: "源码" };
+/* View 产品语义（本轮修正）：三个视图 = 阅读 / 原件（或网页快照）/ Markdown。
+   「源码」是误称 —— 它其实是转换后的 Markdown，不是 PDF/DOCX/HTML 的真源码。 */
+function noteLabels(orig) {
+  const isWeb = !!(orig && (orig.ext === ".html" || orig.ext === ".htm"));
+  return {
+    rendered: "阅读",
+    original: isWeb ? "网页快照" : "原件",
+    raw: "Markdown",
+  };
+}
+/* 阅读视图不显示内部 metadata：剥掉开头的 YAML frontmatter 块（磁盘上的真相源不动） */
+function stripFrontmatter(src) {
+  const m = String(src || "").match(/^\uFEFF?---\r?\n[\s\S]*?\r?\n---\r?\n?/);
+  return m ? String(src).slice(m[0].length) : String(src || "");
+}
+/* 从 Markdown 头部读一个 frontmatter 字段（只读展示用） */
+function frontmatterValue(src, key) {
+  const m = String(src || "").match(/^\uFEFF?---\r?\n([\s\S]*?)\r?\n---/);
+  if (!m) return "";
+  const hit = m[1].match(new RegExp("^" + key + ":\\s*\"?([^\"\\n]+?)\"?\\s*$", "m"));
+  return hit ? hit[1].trim() : "";
+}
 
 function fmtSize(n) {
   n = Number(n) || 0;
@@ -729,21 +756,34 @@ function setNoteView(view) {
   const orig = d.original;
   if (view === "original" && !orig) view = "rendered";
   NOTE.view = view;
-  $$("#noteSeg button").forEach(b => b.classList.toggle("on", b.dataset.view === view));
+  const labels = noteLabels(orig);
+  $$("#noteSeg button").forEach(b => {
+    b.textContent = labels[b.dataset.view] || b.textContent;
+    b.classList.toggle("on", b.dataset.view === view);
+  });
   const box = $("#noteView");
   box.className = "doc-md";
 
   if (view === "raw") {
+    // Markdown 视图：完整显示转换后的 Markdown（含 frontmatter，便于核对）
     box.innerHTML = '<pre class="doc" style="white-space:pre-wrap;margin:0">' + esc(d.content) + "</pre>";
     return;
   }
 
   if (view === "original") {
-    const url = "/api/notes/original?path=" + encodeURIComponent(d.path);
-    const meta = '<div class="doc-meta">原版：' + esc(orig.name) + "（" + fmtSize(orig.size) + "）" +
-      '　<a href="' + url + '" target="_blank" rel="noopener noreferrer">在新标签打开</a>' +
-      '　<a href="' + url + '?download=1" download>下载原件</a></div>';
     const isWeb = orig.ext === ".html" || orig.ext === ".htm";
+    const url = "/api/notes/original?path=" + encodeURIComponent(d.path);
+    // 「在新标签打开」实际打开的是本地离线快照 → 文案必须说清楚（网页剪藏）；
+    // PDF/Office 的它就是原件本身，保留「在新标签打开」。
+    const openLabel = isWeb ? "新标签打开快照" : "在新标签打开";
+    const srcUrl = frontmatterValue(d.content, "source_url");
+    const visit = (isWeb && /^https?:\/\//i.test(srcUrl))
+      ? '　<a href="' + esc(srcUrl) + '" target="_blank" rel="noopener noreferrer">访问原网页</a>'
+      : "";
+    const meta = '<div class="doc-meta">' + labels.original + "：" + esc(orig.name) +
+      "（" + fmtSize(orig.size) + "）" + visit +
+      '　<a href="' + url + '" target="_blank" rel="noopener noreferrer">' + openLabel + "</a>" +
+      '　<a href="' + url + '?download=1" download>下载原件</a></div>';
     const isPdf = orig.ext === ".pdf";
 
     // 剪藏页加宽度切换；PDF 用浏览器自带查看器（自带缩放），无需切换
@@ -795,7 +835,8 @@ function setNoteView(view) {
       const w = wrap.clientWidth, h = wrap.clientHeight;
       if (!w || !h) return;
       if (mode === "fit") {
-        const k = w / VIRTUAL_W;
+        // 原则：窄面板可以缩小，宽面板**绝不放大超过原尺寸**（>1280px 时保持 1:1）
+        const k = Math.min(1, w / VIRTUAL_W);
         frame.style.width = VIRTUAL_W + "px";
         frame.style.height = Math.max(400, Math.floor(h / k)) + "px";
         frame.style.transformOrigin = "0 0";
@@ -821,7 +862,8 @@ function setNoteView(view) {
     return;
   }
 
-  box.innerHTML = docToHtml(d.content);
+  // 阅读视图：剥掉内部 metadata（frontmatter），只渲染 Markdown 正文
+  box.innerHTML = docToHtml(stripFrontmatter(d.content));
 }
 
 /* -------- 文档级 Markdown 渲染（比聊天气泡版更完整：表格/多级标题/列表） -------- */

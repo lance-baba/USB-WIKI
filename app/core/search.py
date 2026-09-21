@@ -214,6 +214,10 @@ def content_terms(query: str) -> list[str]:
 # --------------------------------------------------------------------------
 #: 疑问类型 → 触发词。刻意只放**问句特征词**，不含任何项目内容。
 _QTYPE_PATTERNS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    # coverage 必须排在最前：「功能有哪些」里的「哪些」不是数量问题，而是覆盖型列举问题。
+    # 覆盖型的目标不是「找一个最高分分块」，而是覆盖同一资料的多个相关章节。
+    ("coverage", ("有哪些", "有什么", "都有什么", "哪些功能", "主要功能", "功能", "特点",
+                  "特性", "能力", "支持什么", "支持哪些", "用途", "总结一下", "介绍一下")),
     ("quantity", ("多少", "几个", "几台", "几人", "几根", "几处", "几次", "几遍",
                   "几条", "几件", "几组", "几套", "几层", "多大", "多长", "多重",
                   "多高", "多厚", "数量", "共有", "总共", "一共", "合计", "总计", "共计")),
@@ -228,14 +232,35 @@ _QTYPE_PATTERNS: tuple[tuple[str, tuple[str, ...]], ...] = (
 _SCOPE_SUFFIXES = ("中", "里", "内")
 _SCOPE_PREFIXES = ("关于", "对于", "针对")
 
+#: 问题短语尾巴（「…的功能有哪些」→ 功能）—— 整串拿去检索会 0 命中
+_QTAIL_RE = re.compile(
+    r"(?:的)?(?:具体|主要|核心|相关)?(?:功能|特点|特性|能力|用途|信息|内容|情况)?"
+    r"(?:都)?(?:有(?:哪)些|有什么|是什么|是啥|如何|怎么样)$")
+
+
+def _strip_question_tail(s: str) -> str:
+    """剥掉查询串末尾的问题短语；剥空则返回空串（调用方丢弃）。"""
+    m = _QTAIL_RE.search(s)
+    if not m:
+        return s
+    return s[:m.start()].strip("的的了 ") or ""
+
 
 def question_type(query: str) -> str:
-    """判断问句类型（quantity / person / datetime / model / location / general）。"""
+    """判断问句类型（coverage / quantity / person / datetime / model / location / general）。
+
+    coverage 与其他类型**同时命中**时，优先返回更具体的类型
+    （「观测人员有哪些」属于人员列举，不应被当成泛化的「覆盖型」）。
+    """
     q = query or ""
+    coverage_hit = False
     for name, kws in _QTYPE_PATTERNS:
         if any(k in q for k in kws):
+            if name == "coverage":
+                coverage_hit = True
+                continue
             return name
-    return "general"
+    return "coverage" if coverage_hit else "general"
 
 
 @dataclass
@@ -275,6 +300,13 @@ def analyze_query(query: str) -> QueryAnalysis:
                 break
         if not r:
             continue
+        # 覆盖型问句的尾巴（「Qwen-Image-2.1的功能有哪些」→「Qwen-Image-2.1」）：
+        # 整串含疑问短语时召回会塌缩，必须先剥掉。
+        stripped = _strip_question_tail(r)
+        if stripped != r:
+            r = stripped
+            if not r:
+                continue
         if len(r) >= 3 and r[-1] in _SCOPE_SUFFIXES and _CJK_RUN_RE.fullmatch(r):
             head = r[:-1]
             # 「X里」作为范围标记（如「方案里」「报告内」），但「在哪里 / 在哪里」
@@ -1065,15 +1097,80 @@ def _parent_rows(db: Database, pids: list[str]) -> dict[str, dict]:
     for i in range(0, len(pids), 400):
         batch = pids[i:i + 400]
         ph = ",".join("?" * len(batch))
-        sel = ("parent_id, doc_id, content, COALESCE(section_path,'') AS section_path"
-               if is_new else "parent_id, doc_id, content, '' AS section_path")
+        sel = ("parent_id, doc_id, content, COALESCE(section_path,'') AS section_path, "
+               "COALESCE(ord,0) AS ord"
+               if is_new else "parent_id, doc_id, content, '' AS section_path, COALESCE(ord,0) AS ord")
         try:
             for r in db.query(f"SELECT {sel} FROM parent_blocks WHERE parent_id IN ({ph})",
                               tuple(batch)):
                 out[r["parent_id"]] = {"doc_id": r["doc_id"], "content": r["content"] or "",
-                                       "section_path": r["section_path"] or ""}
+                                       "section_path": r["section_path"] or "",
+                                       "ord": r["ord"] or 0}
         except sqlite3.Error as exc:
             log.error("父块回查失败: %s", exc)
+    return out
+
+
+def _coverage_siblings(db: Database, doc_id: str, have: set[str],
+                       limit: int = 12) -> list[dict]:
+    """覆盖型问题用：取锚定文档的**同篇章节块**（章节级优先，按原文顺序）。
+
+    只用于 coverage 型问句（「功能有哪些」），目标是让答案覆盖同篇的多个 section。
+    不做全库放宽、也不放大 top_k —— 只在**已锚定的那一篇**资料内部补章节。
+    """
+    try:
+        rows = db.query(
+            "SELECT parent_id, doc_id, content, COALESCE(section_path,'') AS section_path, "
+            "COALESCE(ord,0) AS ord FROM parent_blocks WHERE doc_id = ? ORDER BY ord",
+            (doc_id,),
+        )
+    except sqlite3.Error:
+        return []
+    section_level, other = [], []
+    for r in rows:
+        if r["parent_id"] in have:
+            continue
+        sp = r["section_path"] or ""
+        # 「文档标题 > 章节」= 章节级（功能通常按章节并列）；文档根（引言/frontmatter）
+        # 与子小节（> 2 级）都排后面，避免占掉宝贵的 Top-K 名额。
+        (section_level if sp.count(" > ") == 1 else other).append(r)
+    return (section_level or other)[:limit]
+
+
+def _coverage_order(ranked: list[tuple[str, dict, dict, float]], k: int):
+    """覆盖型排序：保留最强单点，其余名额优先给**不同 section_path** 的章节。
+
+    不改变第 1 名（保证「找一个最相关分块」的能力不回退），只影响 2..k 的填充：
+    先同篇不同章节（按原文顺序），再其它文档，最后按分数补满。
+    """
+    if len(ranked) <= k:
+        return ranked
+    lead = ranked[0]
+    rest = ranked[1:]
+    lead_doc = lead[2].get("doc_id")
+    out = [lead]
+    used = {lead[2].get("section_path") or ""}
+    same_doc = sorted([r for r in rest if r[2].get("doc_id") == lead_doc],
+                      key=lambda r: r[2].get("ord", 0) or 0)
+    others = [r for r in rest if r[2].get("doc_id") != lead_doc]
+    for pool in (same_doc, others):
+        for r in pool:
+            if len(out) >= k:
+                break
+            sec = r[2].get("section_path") or ""
+            # 章节级块（深度 1）优先占不同 section 的名额；子小节/文档根不占额外名额
+            if r[2].get("section_path", "").count(" > ") != 1:
+                continue
+            if sec in used:
+                continue
+            used.add(sec)
+            out.append(r)
+    for pool in (same_doc, others):                 # 仍不满 k：退而求其次按顺序补
+        for r in pool:
+            if len(out) >= k:
+                break
+            if r not in out:
+                out.append(r)
     return out
 
 
@@ -1175,6 +1272,7 @@ def hybrid_search(
     # 父块聚合（P0-8）：max 之外还看**多块一致命中**，避免一个偶然高分 child 压过
     # 多个稳定相关 child 的章节。
     parent_acc: dict[str, dict] = {}
+    _coverage_pr: dict[str, dict] = {}          # coverage 补充块（不在 _parent_rows 里，单独缓存）
     for cid, entry in accepted:
         ci = info.get(cid) or {}
         pid = ci.get("parent_id") or ""
@@ -1189,7 +1287,25 @@ def hybrid_search(
     if not parent_acc:
         return result
 
+    # 覆盖型问题（「X 的功能有哪些」）：目标不是「一个最高分分块」，而是覆盖同一份
+    # 资料里的多个相关章节。实测「Qwen-Image-2.1的功能有哪些」召回塌缩到 1 个 parent
+    # （该文的 紧凑高效 / 多样化编辑 / 逼真纹理 等章节全部漏掉）。
+    # 做法：定位锚定文档 → 把它的**同篇章节块**补进候选（不放大 top_k），
+    # 排序时优先让不同 section_path 各占一席（section diversity）。
+    if ana.question_type == "coverage" and accepted:
+        best_cid = max(accepted, key=lambda kv: float(kv[1].get("score", 0.0)))[0]
+        anchor_doc = (info.get(best_cid) or {}).get("doc_id") or ""
+        if anchor_doc:
+            for sib in _coverage_siblings(db, anchor_doc, set(parent_acc),
+                                         limit=max(top_k_parents * 3, 10)):
+                parent_acc[sib["parent_id"]] = {"n": 1, "max": 0.0, "sim": None}
+                _coverage_pr[sib["parent_id"]] = {
+                    "doc_id": sib["doc_id"], "content": sib["content"] or "",
+                    "section_path": sib["section_path"] or "", "ord": sib["ord"] or 0,
+                }
+
     prows = _parent_rows(db, list(parent_acc))
+    prows.update(_coverage_pr)
     ranked: list[tuple[str, dict, dict, float]] = []
     for pid, acc in parent_acc.items():
         pr = prows.get(pid)
@@ -1210,7 +1326,10 @@ def hybrid_search(
         final = round(float(acc["max"]) + lex + ans + multi, 6)
         ranked.append((pid, acc, pr, final))
     ranked.sort(key=lambda x: x[3], reverse=True)
-    ranked = ranked[:max(top_k_parents, 1)]
+    if ana.question_type == "coverage":
+        ranked = _coverage_order(ranked, max(top_k_parents, 1))
+    else:
+        ranked = ranked[:max(top_k_parents, 1)]
 
     if debug is not None:
         debug["final_topk"] = [

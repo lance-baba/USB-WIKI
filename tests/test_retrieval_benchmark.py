@@ -128,6 +128,32 @@ CASES: list[tuple[str, str, str, str]] = [
 #: 硬门（用户指定）：Top1/Top3 必须包含 沉降观测点8个 与 CJ1-CJ8
 HARD_QUERY = "观测方案中，观测点共有几个？"
 
+#: coverage 回归 fixture（脱敏合成）：一篇「功能介绍型」文章，多个并列功能章节。
+#: 真实失败场景 = 问「X 的功能有哪些？」只答其中一个章节。
+COVERAGE_DOC = """---
+title: "Qwen-Image-2.1 功能介绍"
+source_type: "web"
+---
+
+# Qwen-Image-2.1 功能介绍
+
+## 紧凑高效
+
+该模型体积紧凑，推理高效，适合本地部署。
+
+## 原生透明度
+
+原生支持透明图像，统一了创作与编辑流程。
+
+## 多样化编辑
+
+支持多参考、局部编辑等多种编辑方式。
+
+## 逼真质感与精致美学
+
+生成结果纹理逼真，美学精致。
+"""
+
 
 def _bench_db(tmp: Path):
     db = db_mod.get_db(db_path=tmp / "cache.db", embedding_dim=512)
@@ -247,5 +273,36 @@ def run(ctx, check, section, skip) -> None:  # noqa: ARG001
               str(search_mod.hybrid_search.__defaults__))
         check("语料里不存在的词仍然如实返回空（不硬凑）",
               len(search_mod.hybrid_search(db, emb, "量子纠缠态装置", top_k_parents=3).references) == 0)
+
+        # ---------------------------------------------------------- coverage 覆盖型
+        # 真实失败样本：「Qwen-Image-2.1 的功能有哪些？」召回塌缩到 1 个 parent，
+        # 同篇的其它功能章节（紧凑高效/多样化编辑/逼真纹理）全被漏掉。
+        # 修复 = coverage 问题类型 + 同篇章节补充 + section 多样性排序（不放大 top_k）。
+        check("coverage：问句类型识别为 coverage",
+              search_mod.analyze_query("Qwen-Image-2.1的功能有哪些").question_type == "coverage")
+        check("coverage：问句尾巴被剥掉（不整串去检索）",
+              search_mod.analyze_query("Qwen-Image-2.1的功能有哪些").target
+              == ["Qwen", "Image", "2.1"],
+              str(search_mod.analyze_query("Qwen-Image-2.1的功能有哪些").target))
+        check("更具体的类型优先于 coverage（人员列举不当成泛化覆盖）",
+              search_mod.question_type("现场观测负责人是谁") == "person",
+              search_mod.question_type("现场观测负责人是谁"))
+
+        cov_dbg = {}
+        cov_doc = tmp / "notes" / "coverage-fixture.md"
+        cov_doc.write_text(COVERAGE_DOC, encoding="utf-8")
+        indexer.index_file(db, cov_doc, emb)
+        cov = search_mod.hybrid_search(db, emb, "Qwen-Image-2.1的功能有哪些",
+                                       top_k_parents=5, debug=cov_dbg)
+        cov_secs = {(r.get("section_path") or "").split(" > ")[-1].strip("# ")
+                    for r in cov_dbg.get("final_topk", [])
+                    if (r.get("section_path") or "").count(" > ") == 1}
+        checks_needed = {"紧凑高效", "原生透明度", "多样化编辑", "逼真质感与精致美学"}
+        check("coverage：Top5 覆盖 ≥4 个不同章节（功能列举不再只答一节）",
+              len(cov_secs) >= 4, str(sorted(cov_secs)))
+        check("coverage：用户点名的功能章节全部进 Top5",
+              checks_needed <= cov_secs, str(sorted(checks_needed - cov_secs)))
+        check("coverage：仍未放大 top_k（结果数 ≤ 5）",
+              len(cov.references) <= 5, str(len(cov.references)))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
