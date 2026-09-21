@@ -670,34 +670,45 @@ def test_original_base_injection() -> None:
 
 
 def test_orphan_original_cleanup() -> None:
-    """孤儿原件回收 —— 笔记删了，原件不能无限堆积在 U 盘上。
+    """原件安全 —— **Pilot 永不自动删除用户原件**（D1~D5）。
 
-    真实案例：测试期间反复剪藏又删笔记，data/originals/ 里堆了 28 份孤儿原件
-    共 13.48 MB（其中单份剪藏 HTML 就 1MB）。删除路径原本只清理孤儿切片，
-    没管原件。
+    真实事故：原件目录 4 份文件在「笔记本轮尚未建立」时被同步器判定为孤儿，
+    直接 unlink 掉了（用户导入的 PDF / 剪藏 HTML 不可再生）。
+    Data Contract：originals/ 是用户原始资料，属于 durable 数据 ——
+    「笔记暂时不存在」不是可删信号，`notes/==0 且 originals/>0` 是**合法状态**。
     """
-    section("孤儿原件回收")
+    section("原件安全（永不自动删除）")
 
     keep = "__keep_stem__"
+    orphan_a = "__orphan_a__"
+    orphan_b = "__orphan_b__"
     crawler.save_original(keep, ".pdf", b"%PDF-1.4 keep")
-    crawler.save_original("__orphan_stem__", ".pdf", b"%PDF-1.4 orphan")
+    crawler.save_original(orphan_a, ".pdf", b"%PDF-1.4 orphan-a")
+    crawler.save_original(orphan_b, ".docx", b"PK\x03\x04 orphan-b")
 
-    # 刻意传「相对路径」而不是 stem —— 这正是踩过的坑：口径不一致会导致全部误删
-    gone = crawler.purge_orphan_originals({f"notes/{keep}.md"})
-    check("孤儿原件被回收", "__orphan_stem__.pdf" in gone, str(gone))
-    check("传相对路径也能正确保留有主的原件（口径一致性）",
+    # 有主原件不被删（口径一致性：传相对路径也能正确算 stem）
+    removed = crawler.purge_orphan_originals({f"notes/{keep}.md"})
+    check("旧接口不再删除任何原件（恒返回空）", removed == [], str(removed))
+    check("有对应笔记的原件仍在",
           (paths.ORIGINALS_DIR / f"{keep}.pdf").exists())
-    check("有对应笔记的原件被保留",
-          (paths.ORIGINALS_DIR / f"{keep}.pdf").exists())
+    check("无对应笔记的原件**也**不被删除（D1 禁止自动回收）",
+          (paths.ORIGINALS_DIR / f"{orphan_a}.pdf").exists()
+          and (paths.ORIGINALS_DIR / f"{orphan_b}.docx").exists())
 
-    # 安全阀：笔记集合为空时拒绝回收，避免笔记目录异常导致原件被清空
-    crawler.save_original("__orphan2__", ".pdf", b"%PDF-1.4 x")
-    check("笔记集合为空时拒绝回收（防误删）",
-          crawler.purge_orphan_originals(set()) == [])
-    check("安全阀触发后文件仍在",
-          (paths.ORIGINALS_DIR / "__orphan2__.pdf").exists())
+    # D3：notes == 0 而 originals > 0 是合法状态，原件必须原样保留
+    crawler.purge_orphan_originals(set())
+    check("笔记集合为空时原件全部保留",
+          all((paths.ORIGINALS_DIR / n).exists()
+              for n in (f"{keep}.pdf", f"{orphan_a}.pdf", f"{orphan_b}.docx")))
 
-    for n in ("__keep_stem__.pdf", "__orphan2__.pdf"):
+    # 报告接口仍可用（只读，不删）
+    found = crawler.find_orphan_originals({f"notes/{keep}.md"})
+    check("仍能报告暂未关联原件（供日志/UI，不做删除）",
+          f"{orphan_a}.pdf" in found and f"{keep}.pdf" not in found, str(found))
+    check("报告路径也不改动磁盘",
+          (paths.ORIGINALS_DIR / f"{orphan_a}.pdf").exists())
+
+    for n in (f"{keep}.pdf", f"{orphan_a}.pdf", f"{orphan_b}.docx"):
         (paths.ORIGINALS_DIR / n).unlink(missing_ok=True)
 
 
@@ -3686,6 +3697,9 @@ def main() -> int:
         # A/B 轮：回答归因契约（禁同文共现→因果）+ 证据跳转接口
         from tests.test_attribution_contract import run as _run_attr
         _run_attr(ctx, check, section, skip)
+        # Fast P0：引用 stable anchor（源行范围）+ 章节覆盖 + 日志格式化契约
+        from tests.test_citation_anchor import run as _run_anchor
+        _run_anchor(ctx, check, section, skip)
         test_secret_redaction(ctx)
         test_import_security()
         test_archive_ssrf()

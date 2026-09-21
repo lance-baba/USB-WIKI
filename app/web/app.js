@@ -598,70 +598,29 @@ async function openNoteByPath(path, jump) {
   openNoteItem(el, jump);
 }
 
-/* -------- B：证据精确定位（parent_id 为主、snippet 文本兜底） -------- */
-function _normTxt(s) {
-  return String(s || "").replace(/\s+/g, "").replace(/[#>*`|]/g, "").toLowerCase();
-}
-function _evBlocks(box) {
-  // 渲染视图的顶层块级元素（docToHtml 的输出结构：p/h*/ul/ol/blockquote/table/pre/hr）
-  return Array.from(box.children).filter(el =>
-    /^(P|H1|H2|H3|H4|H5|H6|UL|OL|BLOCKQUOTE|TABLE|PRE|HR|DIV)$/.test(el.tagName));
-}
-/* 在元素内的文本节点上包高亮标签（不碰任何标签/属性；每个节点从最早命中开始，递归处理尾部） */
-function _markNode(node, phrases, tag, cls) {
-  const text = node.nodeValue;
-  if (!text || !text.trim()) return;
-  let best = null;
-  for (const t of phrases) {
-    if (!t) continue;
-    const i = text.toLowerCase().indexOf(t);
-    if (i >= 0 && (!best || i < best.i)) best = { i, t };
-  }
-  if (!best) return;
-  const frag = document.createDocumentFragment();
-  if (best.i > 0) frag.appendChild(document.createTextNode(text.slice(0, best.i)));
-  const mk = document.createElement(tag || "mark");
-  if (cls) mk.className = cls;
-  mk.textContent = text.slice(best.i, best.i + best.t.length);
-  frag.appendChild(mk);
-  const tail = document.createTextNode(text.slice(best.i + best.t.length));
-  frag.appendChild(tail);
-  node.parentNode.replaceChild(frag, node);
-  _markNode(tail, phrases, tag, cls);     // tail 严格更短 → 必然终止
-}
-/* 证据句子：从 ref.snippet（后端已给 query-centered 摘录）里取真正出现在正文中的片段。
-   注意剔除后端下发的**高亮哨兵**（\u0001/\u0002）—— 它们是给聊天气泡渲染 <mark> 用的，
-   留着会让这里做精确子串匹配时永远对不上正文。 */
-function _evidencePhrases(snippet) {
-  const clean = String(snippet || "")
-    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, "");
-  const parts = [];
-  // 先按省略号/换行切，再按句读切细：摘录常把「小节标题 + 正文」粘成一段，
-  // 不切细就永远匹配不到正文（正文里标题是独立的一行）。
-  clean.split(/[…\n]|\.\.\./).forEach(seg => {
-    seg.split(/[，。；：,;]/).forEach(piece => {
-      const t = piece.replace(/\s+/g, " ").trim();
-      if (t.length >= 8) parts.push(t);
-    });
-  });
-  // 按**摘录顺序**取（后端摘录以命中词为中心 → 首片就是真正支持回答的那句），
-  // 不按长度排序：长片段往往落在句子尾部，会把高亮打到无关的从句上。
-  return parts.slice(0, 3);
-}
+/* -------- B/A：证据精确定位（**源行锚点为主**，snippet 文本仅作旧索索引兜底） --------
+   A1/A4：parent_id → source_start_line/source_end_line → 与 DOM 块的
+   data-src-start/data-src-end 求交集 → 定位。同一文字在目录与正文各出现一次时，
+   两者源行号不同 → 必然落在正文（旧实现在全文搜第一处相同文字，会跳到目录）。 */
 async function jumpToEvidence(path, jump) {
   const box = $("#noteView");
   if (!box || !jump) return;
-  // 1) 取证据块原文（parent_id → /api/notes/evidence；失败则退 snippet）
+
+  // 1) 证据块元数据：parent_id → /api/notes/evidence（section_path + content + 源行范围）
   let ev = null;
   if (jump.parent_id) {
     try {
       const r = await api("/api/notes/evidence?path=" + encodeURIComponent(path) +
         "&parent_id=" + encodeURIComponent(jump.parent_id));
       if (r.code === 200) ev = r.data;
-    } catch (e) { /* 走 snippet 兜底 */ }
+    } catch (e) { /* 走兜底 */ }
   }
   const src = (ev && ev.content) || jump.snippet || "";
   if (!src) { toast("该引用缺少定位信息，已打开原文", 3000); return; }
+
+  // 源行范围：SSE 引用帧优先，其次 evidence 接口（两者同源，都为 0 表示老索引）
+  const rStart = Number(jump.source_start_line || 0) || Number((ev && ev.source_start_line) || 0);
+  const rEnd = Number(jump.source_end_line || 0) || Number((ev && ev.source_end_line) || 0);
 
   // 2) 清掉上一次的高亮（noteView 里的 <mark> 全部是本功能写入的）
   box.querySelectorAll("mark").forEach(m => {
@@ -673,38 +632,50 @@ async function jumpToEvidence(path, jump) {
   box.querySelectorAll(".ev-hl,.ev-hl-fade").forEach(el =>
     el.classList.remove("ev-hl", "ev-hl-fade"));
 
-  // 3) 文本定位：parent 原文的行 → 渲染块。parent_id 拿不到内容时才退 snippet。
   const blocks = _evBlocks(box);
   const texts = blocks.map(b => _normTxt(b.textContent));
-  const lines = src.split("\n").map(s => _normTxt(s)).filter(s => s.length >= 6);
-  let start = -1;
-  if (lines.length) {
-    for (let i = 0; i < blocks.length && start < 0; i++) {
-      for (const ln of lines) {
-        if (texts[i].indexOf(ln) >= 0) { start = i; break; }      // 块包含行
-        if (texts[i].length >= 8 && ln.indexOf(texts[i]) === 0) { start = i; break; } // 行起点
+  let region = [];
+
+  // 3) 主路径（stable anchor）：源行范围 ∩ 块的 data-src-* 范围
+  if (rStart > 0 && rEnd >= rStart) {
+    region = blocks.filter(b => {
+      const a = Number(b.dataset.srcStart || 0), z = Number(b.dataset.srcEnd || 0);
+      return a && z && a <= rEnd && z >= rStart;
+    });
+  }
+
+  // 4) 兜底（A5：老索引/陈旧引用没有源行范围）：才退回文本匹配
+  if (!region.length) {
+    const lines = src.split("\n").map(s => _normTxt(s)).filter(s => s.length >= 6);
+    let start = -1;
+    if (lines.length) {
+      for (let i = 0; i < blocks.length && start < 0; i++) {
+        for (const ln of lines) {
+          if (texts[i].indexOf(ln) >= 0) { start = i; break; }
+          if (texts[i].length >= 8 && ln.indexOf(texts[i]) === 0) { start = i; break; }
+        }
+      }
+      if (start < 0) {
+        const head = lines[0].slice(0, 12);
+        for (let i = 0; i < blocks.length; i++)
+          if (head.length >= 6 && texts[i].indexOf(head) >= 0) { start = i; break; }
       }
     }
-    if (start < 0) {                                              // 首行前缀兜底
-      const head = lines[0].slice(0, 12);
-      for (let i = 0; i < blocks.length; i++)
-        if (head.length >= 6 && texts[i].indexOf(head) >= 0) { start = i; break; }
+    if (start < 0) {
+      toast("该引用来自旧索引，已打开对应文档", 3400);
+      return;
     }
+    const targetLen = _normTxt(src).length;
+    let end = start, acc = 0;
+    for (let j = start; j < blocks.length && j <= start + 15; j++) {
+      end = j; acc += texts[j].length;
+      if (acc >= targetLen) break;
+    }
+    region = blocks.slice(start, end + 1);
   }
-  if (start < 0) { toast("未能精确定位证据块，已打开原文", 3000); return; }
 
-  // 4) 向后扩展到约覆盖整个 parent（上限 15 块，防止异常数据导致高亮半篇文档）
-  const targetLen = _normTxt(src).length;
-  let end = start, acc = 0;
-  for (let j = start; j < blocks.length && j <= start + 15; j++) {
-    end = j; acc += texts[j].length;
-    if (acc >= targetLen) break;
-  }
-  const region = blocks.slice(start, end + 1);
+  // 5) 高亮：上下文=淡蓝块（3.5s 淡化）；证据句=黄色保留；查询词不做永久 mark
   region.forEach(b => b.classList.add("ev-hl"));
-  // 视觉语义（本轮修正）：章节上下文 = 淡蓝块（3.5s 后淡化）；
-  // 真正支持回答的**证据句**（ref.snippet 的正文片段）= 黄色高亮并保留；
-  // 查询词不再做永久 mark —— 否则用户满屏都是「Qwen-Image-2.1 / 功能」的黄块。
   const phrases = _evidencePhrases(jump.snippet);
   if (phrases.length) {
     region.forEach(b => {
@@ -734,6 +705,11 @@ function noteLabels(orig) {
 function stripFrontmatter(src) {
   const m = String(src || "").match(/^\uFEFF?---\r?\n[\s\S]*?\r?\n---\r?\n?/);
   return m ? String(src).slice(m[0].length) : String(src || "");
+}
+/* frontmatter 占用的行数（阅读视图渲染正文时作为源行号偏移量，A3） */
+function frontmatterLineCount(src) {
+  const m = String(src || "").match(/^﻿?---\r?\n[\s\S]*?\r?\n---\r?\n?/);
+  return m ? (m[0].match(/\n/g) || []).length : 0;
 }
 /* 从 Markdown 头部读一个 frontmatter 字段（只读展示用） */
 function frontmatterValue(src, key) {
@@ -862,26 +838,42 @@ function setNoteView(view) {
     return;
   }
 
-  // 阅读视图：剥掉内部 metadata（frontmatter），只渲染 Markdown 正文
-  box.innerHTML = docToHtml(stripFrontmatter(d.content));
+  // 阅读视图：剥掉内部 metadata（frontmatter），只渲染 Markdown 正文。
+  // baseLine = 被剥掉的行数 —— 保证块上的 data-src-* 仍是**真相源行号**（引用锚点用）。
+  box.innerHTML = docToHtml(stripFrontmatter(d.content), frontmatterLineCount(d.content));
 }
 
-/* -------- 文档级 Markdown 渲染（比聊天气泡版更完整：表格/多级标题/列表） -------- */
-function docToHtml(src) {
+/* -------- 文档级 Markdown 渲染（比聊天气泡版更完整：表格/多级标题/列表） --------
+   A3：每个顶层块携带 **源行锚点** data-src-start / data-src-end（真相源行号，1-based）。
+   引用跳转据此做「源位置 → DOM 位置」定位，不再靠搜相似文字（目录与正文同文必跳错）。 */
+function docToHtml(src, baseLine) {
+  const off = baseLine || 0;                 // 前面被剥掉的行数（如 frontmatter）
   const fences = [];
   let text = String(src || "").replace(/\r\n/g, "\n");
+  // 围栏换成占位符时**必须保留原换行数**，否则之后所有行号会整体偏移
   text = text.replace(/```(\w*)\n?([\s\S]*?)```/g, (m, lang, code) => {
     fences.push("<pre><code>" + esc(code.replace(/\n$/, "")) + "</code></pre>");
-    return "\u0000F" + (fences.length - 1) + "\u0000";
+    return "\u0000F" + (fences.length - 1) + "\u0000" + "\n".repeat((m.match(/\n/g) || []).length);
   });
 
   const lines = esc(text).split("\n");
   const out = [];
   let list = null, para = [], quote = [];
+  let paraStart = 0, listStart = 0, quoteStart = 0;
+  const attr = (a, b) => ' data-src-start="' + (off + a + 1) + '" data-src-end="' + (off + b + 1) + '"';
 
-  const flushPara = () => { if (para.length) { out.push("<p>" + para.join("<br>") + "</p>"); para = []; } };
-  const flushList = () => { if (list) { out.push("<" + list.tag + ">" + list.items.join("") + "</" + list.tag + ">"); list = null; } };
-  const flushQuote = () => { if (quote.length) { out.push("<blockquote>" + quote.join("<br>") + "</blockquote>"); quote = []; } };
+  const flushPara = () => {
+    if (para.length) { out.push("<p" + attr(paraStart, paraStart + para.length - 1) + ">" + para.join("<br>") + "</p>"); para = []; }
+  };
+  const flushList = () => {
+    if (list) {
+      out.push("<" + list.tag + attr(listStart, listStart + list.count - 1) + ">" + list.items.join("") + "</" + list.tag + ">");
+      list = null;
+    }
+  };
+  const flushQuote = () => {
+    if (quote.length) { out.push("<blockquote" + attr(quoteStart, quoteStart + quote.length - 1) + ">" + quote.join("<br>") + "</blockquote>"); quote = []; }
+  };
   const flushAll = () => { flushPara(); flushList(); flushQuote(); };
 
   for (let i = 0; i < lines.length; i++) {
@@ -899,7 +891,7 @@ function docToHtml(src) {
       const head = cells(t);
       let j = i + 2, rows = [];
       while (j < lines.length && lines[j].trim().startsWith("|")) { rows.push(cells(lines[j].trim())); j++; }
-      out.push("<table><thead><tr>" + head.map(c => "<th>" + c + "</th>").join("") +
+      out.push("<table" + attr(i, j - 1) + "><thead><tr>" + head.map(c => "<th>" + c + "</th>").join("") +
         "</tr></thead><tbody>" +
         rows.map(r => "<tr>" + r.map(c => "<td>" + c + "</td>").join("") + "</tr>").join("") +
         "</tbody></table>");
@@ -908,24 +900,31 @@ function docToHtml(src) {
     }
 
     const h = t.match(/^(#{1,6})\s+(.*)$/);
-    if (h) { flushAll(); const lv = h[1].length; out.push("<h" + lv + ">" + inline(h[2]) + "</h" + lv + ">"); continue; }
+    if (h) {
+      flushAll();
+      const lv = h[1].length;
+      out.push("<h" + lv + attr(i, i) + ">" + inline(h[2]) + "</h" + lv + ">");
+      continue;
+    }
 
-    if (/^(-{3,}|\*{3,}|_{3,})$/.test(t)) { flushAll(); out.push("<hr>"); continue; }
+    if (/^(-{3,}|\*{3,}|_{3,})$/.test(t)) { flushAll(); out.push("<hr" + attr(i, i) + ">"); continue; }
 
     const q = t.match(/^&gt;\s?(.*)$/);
-    if (q) { flushPara(); flushList(); quote.push(inline(q[1])); continue; }
+    if (q) { flushPara(); flushList(); if (!quote.length) quoteStart = i; quote.push(inline(q[1])); continue; }
 
     const ul = t.match(/^[-*+]\s+(.*)$/);
     const ol = t.match(/^(\d+)[.)]\s+(.*)$/);
     if (ul || ol) {
       flushPara(); flushQuote();
       const tag = ul ? "ul" : "ol";
-      if (!list || list.tag !== tag) { flushList(); list = { tag, items: [] }; }
-      list.items.push("<li>" + inline(ul ? ul[1] : ol[2]) + "</li>");
+      if (!list || list.tag !== tag) { flushList(); list = { tag, items: [], count: 0 }; listStart = i; }
+      list.items.push("<li" + attr(i, i) + ">" + inline(ul ? ul[1] : ol[2]) + "</li>");
+      list.count += 1;
       continue;
     }
 
     flushList(); flushQuote();
+    if (!para.length) paraStart = i;
     para.push(inline(t));
   }
   flushAll();

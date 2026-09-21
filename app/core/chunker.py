@@ -59,6 +59,11 @@ class ParentBlock:
     content: str
     ord: int
     section_path: str = ""
+    #: 源行范围（1-based，含两端）——对应 **Markdown 真相源**里的行号。
+    #: 引用跳转的 stable anchor：用「源位置 → DOM 位置」定位，而不是在全文里
+    #: 搜相似文字（目录与正文同文时必然跳错）。0 表示未知（老索引）。
+    source_start_line: int = 0
+    source_end_line: int = 0
 
 
 def retrieval_text_of(section_path: str, content: str) -> str:
@@ -88,12 +93,18 @@ def doc_id_for(rel_path: str) -> str:
     return hashlib.sha1(norm.encode("utf-8")).hexdigest()[:16]
 
 
-def parse_frontmatter(text: str) -> tuple[dict, str]:
-    """解析 YAML frontmatter；无 PyYAML 时退化为极简 key: value 解析。"""
+def parse_frontmatter(text: str) -> tuple[dict, str, int]:
+    """解析 YAML frontmatter；无 PyYAML 时退化为极简 key: value 解析。
+
+    返回 ``(meta, body, body_start_line)`` —— body 第一行在**文件**中的行号（1-based），
+    供父块换算 source_start_line/source_end_line（A2：源行范围必须来自解析期，
+    不允许事后在全文里 find 猜位置）。
+    """
     m = _FRONTMATTER_RE.match(text)
     if not m:
-        return {}, text
+        return {}, text, 1
     raw, body = m.group(1), text[m.end():]
+    body_start_line = text[:m.end()].count("\n") + 1
     meta: dict = {}
     try:
         import yaml  # type: ignore
@@ -101,14 +112,14 @@ def parse_frontmatter(text: str) -> tuple[dict, str]:
         loaded = yaml.safe_load(raw)
         if isinstance(loaded, dict):
             meta = {str(k): v for k, v in loaded.items()}
-            return meta, body
+            return meta, body, body_start_line
     except Exception:  # noqa: BLE001 - yaml 缺失/语法异常均走兜底
         pass
     for line in raw.splitlines():
         if ":" in line and not line.lstrip().startswith("#"):
             k, _, v = line.partition(":")
             meta[k.strip()] = v.strip().strip('"').strip("'")
-    return meta, body
+    return meta, body, body_start_line
 
 
 def extract_title(body: str, meta: dict, fallback: str) -> str:
@@ -154,30 +165,48 @@ def _heading_of(block: str) -> tuple[int, str] | None:
     return None
 
 
-def _split_parents(body: str) -> list[tuple[str, str]]:
+def _split_parents(body: str, base_line: int = 1) -> list[tuple[str, str, int, int]]:
     """按 Markdown 逻辑段落聚合父分块；标题处强制起新块。
 
-    返回 ``[(parent_text, section_path)]`` —— section_path 是**该块所处章节的层级路径**
-    （P0-4），例如「三、观测目的和内容 > ㈡、观测内容 > 2、沉降点布设」。
-    只做检索用，不改写用户 Markdown。
+    返回 ``[(parent_text, section_path, source_start_line, source_end_line)]``：
+    * section_path（P0-4）是该块所处章节的层级路径，只用于检索；
+    * source_*_line 是**真相源行号**（1-based，含两端），由解析期逐行统计得出 ——
+      这是引用跳转的 stable anchor。同一文字在目录与正文各出现一次时，两者行号不同，
+      因此能精确区分（旧实现在全文里搜相似文字，必然可能跳到目录）。
     """
-    blocks: list[tuple[str, str]] = []
+    out: list[tuple[str, str, int, int]] = []
     stack: list[tuple[int, str]] = []
     buf = ""
+    buf_lines: list[int] = []          # buf 每行对应的源行号（与 buf 的行一一对应）
 
     def path() -> str:
         return " > ".join(t for _, t in stack)
 
     def flush() -> None:
-        nonlocal buf
-        if buf.strip():
-            blocks.append((buf.strip(), path()))
+        nonlocal buf, buf_lines
+        if buf.strip() and buf_lines:
+            out.append((buf.strip(), path(), buf_lines[0], buf_lines[-1]))
         buf = ""
+        buf_lines = []
 
-    for raw_block in re.split(r"\n{2,}", body):
-        block = raw_block.strip("\n")
-        if not block.strip():
+    # 逐块扫描并记录每块的源行范围。
+    # ⚠ 必须用**字符偏移**换算行号：空行分隔符会被 re.split 吞掉，只按块内行数自增
+    #   会让每个块之后的行号整体偏小（差多少取决于吞掉几行）。
+    def line_at(offset: int) -> int:
+        return base_line + body.count("\n", 0, offset)
+
+    cursor_pos = 0
+    for m in re.finditer(r"\n{2,}|\Z", body):
+        raw_block = body[cursor_pos:m.start()]
+        cursor_pos = m.end()
+        if not raw_block.strip():
             continue
+        block = raw_block.strip("\n")
+        lead_blank = len(raw_block) - len(raw_block.lstrip("\n"))
+        blk_start = line_at(cursor_pos - len(m.group(0)) - len(raw_block)) + lead_blank
+        blk_end = line_at(cursor_pos - len(m.group(0)) - len(raw_block)
+                          + len(raw_block.rstrip("\n")) - 1)
+        blk_end = max(blk_start, blk_end)
         h = _heading_of(block)
         if h is not None:
             flush()
@@ -186,19 +215,23 @@ def _split_parents(body: str) -> list[tuple[str, str]]:
                 stack.pop()
             stack.append((level, text))
             buf = block
+            buf_lines = list(range(blk_start, blk_end + 1))
             continue
         would_overflow = len(buf) + len(block) + 2 > PARENT_SIZE
         if buf and would_overflow:
             flush()
         buf = f"{buf}\n\n{block}" if buf else block
+        buf_lines = buf_lines + list(range(blk_start, blk_end + 1))
 
-        # 单块极长（如整段代码/长表格）时硬切
+        # 单块极长（如整段代码/长表格）时硬切：行号随字符切点一起分家
         while len(buf) > PARENT_HARD_LIMIT:
-            head, buf = buf[:PARENT_SIZE], buf[PARENT_SIZE:]
-            blocks.append((head.strip(), path()))
+            head, rest = buf[:PARENT_SIZE], buf[PARENT_SIZE:]
+            cut = head.count("\n") + 1                 # head 覆盖的行数
+            out.append((head.strip(), path(), buf_lines[0], buf_lines[min(cut, len(buf_lines)) - 1]))
+            buf, buf_lines = rest, buf_lines[cut - 1:]
 
     flush()
-    return [(b, p) for b, p in blocks if b]
+    return [b for b in out if b[0]]
 
 
 def _sentences(text: str) -> list[str]:
@@ -262,23 +295,33 @@ def _split_children(parent_text: str, parent_id: str, doc_id: str, start_idx: in
 # --------------------------------------------------------------------------
 def parse(text: str, rel_path: str) -> ParsedDoc:
     """把一个 Markdown 文档解析成 Parent-Child 切片集合。"""
-    meta, body = parse_frontmatter(text or "")
+    meta, body, body_start_line = parse_frontmatter(text or "")
     doc_id = doc_id_for(rel_path)
     fallback = rel_path.rsplit("/", 1)[-1].rsplit(".", 1)[0]
     title = extract_title(body, meta, fallback)
     status = str(meta.get("status", "success") or "success").strip()
 
-    # 剔除代码围栏后再做段落聚合，避免把代码块切得七零八落
-    structural = _CODE_FENCE_RE.sub(lambda m: m.group(0)[:PARENT_HARD_LIMIT], body)
-    parent_texts = _split_parents(structural)
+    # 剔除代码围栏后再做段落聚合，避免把代码块切得七零八落。
+    # ⚠ 截断必须**保留行数**（用等量换行补齐）——否则围栏之后的源行号全部错位，
+    #   引用跳转的 stable anchor 就废了。
+    def _truncate_fence(m: "re.Match[str]") -> str:
+        raw = m.group(0)
+        if len(raw) <= PARENT_HARD_LIMIT:
+            return raw
+        head = raw[:PARENT_HARD_LIMIT]
+        return head + "\n" * (raw.count("\n") - head.count("\n"))
+
+    structural = _CODE_FENCE_RE.sub(_truncate_fence, body)
+    parent_texts = _split_parents(structural, base_line=body_start_line)
 
     parents: list[ParentBlock] = []
     children: list[ChildChunk] = []
     cursor = 0
-    for i, (ptext, spath) in enumerate(parent_texts):
+    for i, (ptext, spath, s_line, e_line) in enumerate(parent_texts):
         pid = f"{doc_id}:p{i}"
         parents.append(ParentBlock(parent_id=pid, doc_id=doc_id, content=ptext, ord=i,
-                                   section_path=spath))
+                                   section_path=spath,
+                                   source_start_line=s_line, source_end_line=e_line))
         kids = _split_children(ptext, pid, doc_id, cursor, section_path=spath)
         children.extend(kids)
         cursor += len(kids)

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import sys
+from collections.abc import Mapping
 from logging.handlers import RotatingFileHandler
 
 from . import paths
@@ -23,15 +24,32 @@ class _RedactingFormatter(logging.Formatter):
         try:
             from . import redact  # noqa: PLC0415 - 延迟导入避免环
 
-            record.msg = redact.sanitize_text(str(record.msg))
-            if record.args:
-                record.args = tuple(
-                    redact.sanitize_text(a) if isinstance(a, str) else a
-                    for a in record.args
+            # 必须**在副本上**改：旧实现直接改 record.args，把 Mapping 强转成 keys 元组，
+            # 于是 log.info("初始化完成: %s", report) 变成 "%s" % ('app_version', ...)
+            # → TypeError: not all arguments converted during string formatting。
+            # 而且 record 已被写坏，except 里的 super().format(record) 会**再挂一次**。
+            safe = logging.makeLogRecord(record.__dict__)
+            safe.msg = redact.sanitize_text(str(record.msg))
+            args = record.args
+            if isinstance(args, Mapping):
+                # logging 对「单个 Mapping 参数」有**特殊语义**（%(key)s 插值）——
+                # 必须保持 Mapping 类型，只逐 value 脱敏。
+                safe.args = {
+                    k: (redact.sanitize_text(v) if isinstance(v, str) else v)
+                    for k, v in args.items()
+                }
+            elif isinstance(args, tuple):
+                safe.args = tuple(
+                    redact.sanitize_text(a) if isinstance(a, str) else a for a in args
                 )
-            return redact.sanitize_text(super().format(record))
+            else:
+                safe.args = redact.sanitize_text(args) if isinstance(args, str) else args
+            return redact.sanitize_text(super().format(safe))
         except Exception:  # noqa: BLE001 - 脱敏失败不能影响日志本身
-            return super().format(record)
+            # 用**未改动**的原 record 副本兜底（绝不能复用被 mutate 过的 record）
+            return logging.Formatter.format(
+                self, logging.makeLogRecord(record.__dict__)
+            )
 
 
 class _SafeStreamHandler(logging.StreamHandler):

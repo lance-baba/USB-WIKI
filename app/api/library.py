@@ -134,8 +134,13 @@ def note_evidence(h: "Handler", rel: str, parent_id: str) -> None:
         h._send_json({"code": 400, "message": "缺少 path 或 parent_id 参数"}, 400)
         return
     db = h.ctx.db
+    from ..core import search as _search  # noqa: PLC0415 - 复用列存在性探测
+
+    has_src = _search._has_source_lines(db)
+    src_cols = (", COALESCE(pb.source_start_line,0) AS s_line, "
+                "COALESCE(pb.source_end_line,0) AS e_line") if has_src else                (", 0 AS s_line, 0 AS e_line")
     row = db.query_one(
-        """SELECT pb.content, pb.section_path, d.rel_path
+        """SELECT pb.content, pb.section_path, d.rel_path""" + src_cols + """
            FROM parent_blocks pb JOIN documents d ON d.doc_id = pb.doc_id
            WHERE pb.parent_id = ?""",
         (parent_id,),
@@ -154,6 +159,9 @@ def note_evidence(h: "Handler", rel: str, parent_id: str) -> None:
                 "parent_id": parent_id,
                 "section_path": row["section_path"] or "",
                 "content": row["content"] or "",
+                # A: stable anchor —— 源行范围（0 表示老索引没有）
+                "source_start_line": row["s_line"] or 0,
+                "source_end_line": row["e_line"] or 0,
             },
         }
     )

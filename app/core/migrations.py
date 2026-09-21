@@ -43,7 +43,7 @@ from .log_util import get_logger
 log = get_logger()
 
 # 索引结构版本。唯一来源 —— db.py 从这里取，不再各写一份。
-CURRENT_SCHEMA_VERSION = "1.6"   # 1.6: chunks 增加 section_path / retrieval_text（P0-4 标题感知检索）
+CURRENT_SCHEMA_VERSION = "1.7"   # 1.7: parent_blocks 增加 source_start_line/end（引用 stable anchor）   # 1.6: chunks 增加 section_path / retrieval_text（P0-4 标题感知检索）
 
 META_SCHEMA_VERSION = "schema_version"
 

@@ -224,9 +224,11 @@ def index_parsed(
                 log.warning("doc_meta 写入失败 %s: %s", parsed.rel_path, exc)
 
             conn.executemany(
-                "INSERT OR REPLACE INTO parent_blocks(parent_id, doc_id, content, ord, section_path)"
-                " VALUES (?,?,?,?,?)",
-                [(p.parent_id, p.doc_id, p.content, p.ord, p.section_path) for p in parsed.parents],
+                "INSERT OR REPLACE INTO parent_blocks(parent_id, doc_id, content, ord, "
+                "section_path, source_start_line, source_end_line) VALUES (?,?,?,?,?,?,?)",
+                [(p.parent_id, p.doc_id, p.content, p.ord, getattr(p, "section_path", ""),
+                  getattr(p, "source_start_line", 0), getattr(p, "source_end_line", 0))
+                 for p in parsed.parents],
             )
             conn.executemany(
                 "INSERT OR REPLACE INTO chunk_metadata(chunk_id, doc_id, parent_id, char_len) VALUES (?,?,?,?)",

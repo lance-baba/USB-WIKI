@@ -559,6 +559,13 @@ class Gateway:
         """
         per_limit = max(80, config.get_int("AI", "inject_per_parent_chars", 400))
         total_budget = max(200, config.get_int("AI", "inject_total_chars", 1800))
+        # B3：概览/覆盖型问句（「X 是怎么样的」）要的是**整节**内容，按默认预算会把
+        # 章节后半段（如「出现下列情况应加强监测」的整份条件列表）截掉，模型只能答
+        # 「资料未明确列出」。这里对覆盖型做**有界放大**，仍然是硬封顶，不是无上限读全文。
+        if getattr(result, "coverage", False):
+            per_limit = max(per_limit, config.get_int("AI", "inject_per_parent_chars_coverage", 900))
+            total_budget = max(total_budget,
+                               config.get_int("AI", "inject_total_chars_coverage", 4000))
 
         parts: list[str] = ["【资料片段】"]
         if result.parents:
@@ -631,6 +638,9 @@ class Gateway:
                 "display_source": getattr(r, "display_source", "") or r.title,
                 "snippet": r.snippet, "parent_id": r.parent_id,
                 "score": r.score, "similarity": r.similarity,
+                # A: 引用 stable anchor（源行范围）—— 前端据此定位，不再搜相似文字
+                "source_start_line": getattr(r, "source_start_line", 0),
+                "source_end_line": getattr(r, "source_end_line", 0),
             }
             for r in result.references
         ]

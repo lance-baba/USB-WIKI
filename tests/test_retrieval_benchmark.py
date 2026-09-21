@@ -264,7 +264,9 @@ def run(ctx, check, section, skip) -> None:  # noqa: ARG001
         check("P0-9 诊断含 final_topk 且只暴露 id/score（无正文）",
               bool(trace.get("final_topk"))
               and all(set(x) <= {"rank", "parent_id", "doc_id", "section_path", "hits",
-                                 "rrf_max", "rank_score"} for x in trace["final_topk"]))
+                                 "rrf_max", "rank_score",
+                                 "source_start_line", "source_end_line"}
+                      for x in trace["final_topk"]))
         check("P0-9 诊断含 rejected 理由（便于定位召回/Grounding/重排）",
               isinstance(trace.get("rejected"), list) and bool(trace.get("grounded")))
 
@@ -302,7 +304,11 @@ def run(ctx, check, section, skip) -> None:  # noqa: ARG001
               len(cov_secs) >= 4, str(sorted(cov_secs)))
         check("coverage：用户点名的功能章节全部进 Top5",
               checks_needed <= cov_secs, str(sorted(checks_needed - cov_secs)))
-        check("coverage：仍未放大 top_k（结果数 ≤ 5）",
+        # B2/B3 起：coverage 的 **context（parents）** 允许有界扩展（整节覆盖），
+        # 但**引用角标**仍严格限 top_k —— 数字=证据，保持简洁。
+        check("coverage：引用角标仍 ≤ top_k（未放大）",
               len(cov.references) <= 5, str(len(cov.references)))
+        check("coverage：context 按章节扩展（parents ≥ references）",
+              len(cov.parents) >= len(cov.references), str((len(cov.parents), len(cov.references))))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

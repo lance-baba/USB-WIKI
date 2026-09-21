@@ -53,6 +53,10 @@ class Reference:
     #: UX-1 界面「来源」：导入文件→源文件名；剪藏→网页标题；笔记→笔记标题。
     #: 与内部 title 分离 —— title 仍用于 metadata / 检索 / 提示词。
     display_source: str = ""
+    #: A: 引用 stable anchor —— 父块在真相源里的行范围（1-based，含两端；0=老索引未知）。
+    #: 前端据此把引用定位到「源位置 → DOM 位置」，不再全文搜相似文字（目录/正文同文会跳错）。
+    source_start_line: int = 0
+    source_end_line: int = 0
 
 
 @dataclass
@@ -65,6 +69,8 @@ class SearchResult:
     warnings: list[str] = field(default_factory=list)
     #: 本次检索**实际落地**的词法实词（供离线结果做命中高亮；UX-2）
     lex_terms: list[str] = field(default_factory=list)
+    #: B3：概览/覆盖型问句 —— 提示词构造据此给「整节内容」更大的（有界）预算
+    coverage: bool = False
 
 
 # --------------------------------------------------------------------------
@@ -246,6 +252,22 @@ def _strip_question_tail(s: str) -> str:
     return s[:m.start()].strip("的的了 ") or ""
 
 
+#: 章节概览型问法（B1/B4）—— 「X 是怎么样的 / 怎么规定 / 有哪些规定 / 介绍一下 / 具体要求」。
+#: 这类问句要的是**整节内容**，不是某个点值；必须优先于点值类型
+#: （「监测频率是怎么样的」含「频率」，旧实现被判成 datetime，于是从不走章节覆盖）。
+_OVERVIEW_PHRASES = (
+    "是怎么样的", "是怎样的", "是什么样", "怎么样", "怎么规定", "怎么安排", "如何规定",
+    "有哪些规定", "有什么规定", "有哪些要求", "什么要求", "要求是什么", "介绍一下",
+    "说一下", "具体情况", "详细说明", "怎么回事", "包含哪些", "包括哪些", "有哪些内容",
+)
+
+
+def is_section_overview(query: str) -> bool:
+    """是否为「整节概况」型问句（coverage / section-summary）。"""
+    q = query or ""
+    return any(ph in q for ph in _OVERVIEW_PHRASES)
+
+
 def question_type(query: str) -> str:
     """判断问句类型（coverage / quantity / person / datetime / model / location / general）。
 
@@ -253,6 +275,8 @@ def question_type(query: str) -> str:
     （「观测人员有哪些」属于人员列举，不应被当成泛化的「覆盖型」）。
     """
     q = query or ""
+    if is_section_overview(q):
+        return "coverage"
     coverage_hit = False
     for name, kws in _QTYPE_PATTERNS:
         if any(k in q for k in kws):
@@ -1090,6 +1114,21 @@ def _is_grounded(info: dict, target: list[str], scope: list[str],
     return False, "vector-only(no-lexical-overlap)"
 
 
+_SRC_LINES_READY: bool | None = None
+
+
+def _has_source_lines(db: Database) -> bool:
+    """parent_blocks 是否已有源行范围列（A: schema 1.7）。老索引返回 False 并优雅降级。"""
+    global _SRC_LINES_READY
+    if _SRC_LINES_READY is None:
+        try:
+            cols = {r["name"] for r in db.query("PRAGMA table_info(parent_blocks)")}
+            _SRC_LINES_READY = "source_start_line" in cols
+        except sqlite3.Error:
+            _SRC_LINES_READY = False
+    return bool(_SRC_LINES_READY)
+
+
 def _parent_rows(db: Database, pids: list[str]) -> dict[str, dict]:
     """批量取父块（content + section_path）；旧库缺列时退回无 section_path。"""
     out: dict[str, dict] = {}
@@ -1097,18 +1136,87 @@ def _parent_rows(db: Database, pids: list[str]) -> dict[str, dict]:
     for i in range(0, len(pids), 400):
         batch = pids[i:i + 400]
         ph = ",".join("?" * len(batch))
+        has_src = _has_source_lines(db)
         sel = ("parent_id, doc_id, content, COALESCE(section_path,'') AS section_path, "
-               "COALESCE(ord,0) AS ord"
-               if is_new else "parent_id, doc_id, content, '' AS section_path, COALESCE(ord,0) AS ord")
+               "COALESCE(ord,0) AS ord, "
+               + ("COALESCE(source_start_line,0) AS s_line, COALESCE(source_end_line,0) AS e_line"
+                  if has_src else "0 AS s_line, 0 AS e_line")
+               if is_new else
+               "parent_id, doc_id, content, '' AS section_path, COALESCE(ord,0) AS ord, "
+               "0 AS s_line, 0 AS e_line")
         try:
             for r in db.query(f"SELECT {sel} FROM parent_blocks WHERE parent_id IN ({ph})",
                               tuple(batch)):
                 out[r["parent_id"]] = {"doc_id": r["doc_id"], "content": r["content"] or "",
                                        "section_path": r["section_path"] or "",
-                                       "ord": r["ord"] or 0}
+                                       "ord": r["ord"] or 0,
+                                       "source_start_line": r["s_line"] or 0,
+                                       "source_end_line": r["e_line"] or 0}
         except sqlite3.Error as exc:
             log.error("父块回查失败: %s", exc)
     return out
+
+
+def _coverage_section_blocks(db: Database, doc_id: str, anchor_section: str,
+                             anchor_ord: int, have: set[str],
+                             limit: int = 8) -> list[dict]:
+    """B2：以**章节为单位**扩展证据 —— 取锚定块之后、仍属于同一章节的连续父块。
+
+    章节归属用 section_path 前缀判断（anchor 本身或其子路径）；一旦遇到「下一个同级
+    或更高级标题」就停止。「监测频率是怎么样的」正是靠这一步把频率表之后的
+    「出现下列情况应加强监测」一类条件项一并纳入 context；旧实现只给到表格前半段，
+    模型只好回答「资料未明确列出其他情况」。
+    """
+    if not anchor_section:
+        return []
+    rows = [r for r in _coverage_doc_rows(db, doc_id)
+            if r["parent_id"] not in have and r["ord"] > anchor_ord]
+
+    def scan(prefix: str) -> list[dict]:
+        picked: list[dict] = []
+        for r in rows:
+            sp = r["section_path"] or ""
+            if sp == prefix or sp.startswith(prefix + " > "):
+                picked.append(r)
+                if len(picked) >= limit:
+                    break
+            elif sp:
+                break                  # 下一个同级/更高级标题 → 本段结束
+        return picked
+
+    same = scan(anchor_section)
+    if same:
+        return same
+    # 锚点本身是子小节时，条件项/清单往往与它**在同一段落里并列**：逐级向上试。
+    # 实测：附表里「㈠、监测频率」的 12 条「应加强监测」条件（⑴…⑿）与它并列在附件章节下，
+    # 只按锚点自身 section 找会全漏 —— 模型于是答「资料未明确列出其他情况」。
+    parts = anchor_section.split(" > ")
+    for i in range(len(parts) - 1, 0, -1):
+        picked = scan(" > ".join(parts[:i]))
+        if picked:
+            return picked
+    return []
+
+
+_COVERAGE_ROWS_CACHE: dict[str, list[dict]] = {}
+
+
+def _coverage_doc_rows(db: Database, doc_id: str) -> list[dict]:
+    """某文档的全部父块（section_path / ord / 源行范围），进程内缓存。"""
+    if doc_id in _COVERAGE_ROWS_CACHE:
+        return _COVERAGE_ROWS_CACHE[doc_id]
+    has_src = _has_source_lines(db)
+    sql = ("SELECT parent_id, doc_id, content, COALESCE(section_path,'') AS section_path, "
+           "COALESCE(ord,0) AS ord"
+           + (", COALESCE(source_start_line,0) AS s_line, COALESCE(source_end_line,0) AS e_line"
+              if has_src else ", 0 AS s_line, 0 AS e_line")
+           + " FROM parent_blocks WHERE doc_id = ? ORDER BY ord")
+    try:
+        rows = list(db.query(sql, (doc_id,)))
+    except sqlite3.Error:
+        rows = []
+    _COVERAGE_ROWS_CACHE[doc_id] = rows
+    return rows
 
 
 def _coverage_siblings(db: Database, doc_id: str, have: set[str],
@@ -1118,13 +1226,8 @@ def _coverage_siblings(db: Database, doc_id: str, have: set[str],
     只用于 coverage 型问句（「功能有哪些」），目标是让答案覆盖同篇的多个 section。
     不做全库放宽、也不放大 top_k —— 只在**已锚定的那一篇**资料内部补章节。
     """
-    try:
-        rows = db.query(
-            "SELECT parent_id, doc_id, content, COALESCE(section_path,'') AS section_path, "
-            "COALESCE(ord,0) AS ord FROM parent_blocks WHERE doc_id = ? ORDER BY ord",
-            (doc_id,),
-        )
-    except sqlite3.Error:
+    rows = _coverage_doc_rows(db, doc_id)
+    if not rows:
         return []
     section_level, other = [], []
     for r in rows:
@@ -1217,6 +1320,7 @@ def hybrid_search(
         # 实词一个都不在语料里：**不早退** —— 向量照跑，但 Grounding 会全部拒绝
         lex_ids, tier_of, route = [], {}, "like"
     result.route = route
+    result.coverage = (ana.question_type == "coverage")
     result.lex_terms = list(search_terms)
     idf = _idf_map(db, search_terms)            # 预算 IDF：稀有答案词主导重排（P0-8）
 
@@ -1292,18 +1396,6 @@ def hybrid_search(
     # （该文的 紧凑高效 / 多样化编辑 / 逼真纹理 等章节全部漏掉）。
     # 做法：定位锚定文档 → 把它的**同篇章节块**补进候选（不放大 top_k），
     # 排序时优先让不同 section_path 各占一席（section diversity）。
-    if ana.question_type == "coverage" and accepted:
-        best_cid = max(accepted, key=lambda kv: float(kv[1].get("score", 0.0)))[0]
-        anchor_doc = (info.get(best_cid) or {}).get("doc_id") or ""
-        if anchor_doc:
-            for sib in _coverage_siblings(db, anchor_doc, set(parent_acc),
-                                         limit=max(top_k_parents * 3, 10)):
-                parent_acc[sib["parent_id"]] = {"n": 1, "max": 0.0, "sim": None}
-                _coverage_pr[sib["parent_id"]] = {
-                    "doc_id": sib["doc_id"], "content": sib["content"] or "",
-                    "section_path": sib["section_path"] or "", "ord": sib["ord"] or 0,
-                }
-
     prows = _parent_rows(db, list(parent_acc))
     prows.update(_coverage_pr)
     ranked: list[tuple[str, dict, dict, float]] = []
@@ -1326,15 +1418,59 @@ def hybrid_search(
         final = round(float(acc["max"]) + lex + ans + multi, 6)
         ranked.append((pid, acc, pr, final))
     ranked.sort(key=lambda x: x[3], reverse=True)
-    if ana.question_type == "coverage":
-        ranked = _coverage_order(ranked, max(top_k_parents, 1))
-    else:
+    ref_cap = max(top_k_parents, 1)          # 正文引用角标数量不变
+
+    # B2/B3：概览/覆盖型问句（「X 是怎么样的」「X 的功能有哪些」）要的是**整节**内容。
+    # 用**排序第一的父块**自带 metadata（doc_id / section_path / ord）做章节扩展：
+    #   ① 先取同章节的后续块（条件项/清单常续在其后）；
+    #   ② 若锚点是子小节，逐级向上找**并列的兄弟块**（实测：附表里「㈠、监测频率」的
+    #      12 条「应加强监测」条件与它并列）；
+    #   ③ 都没有才退回同级章节。
+    # 只影响 context（parents），引用角标仍限 top_k；数量硬封顶，绝不读全文。
+    if ana.question_type == "coverage" and ranked:
+        lead_pid, _lead_acc, lead_pr, lead_score = ranked[0]
+        have = {pid for pid, _, _, _ in ranked}
+        blocks = _coverage_section_blocks(
+            db, lead_pr["doc_id"], lead_pr.get("section_path") or "",
+            int(lead_pr.get("ord") or 0), have, limit=max(top_k_parents, 14))
+        if not blocks:
+            blocks = _coverage_siblings(db, lead_pr["doc_id"], have,
+                                        limit=max(top_k_parents * 3, 10))
+        for k, b in enumerate(blocks, start=1):
+            pid = b["parent_id"]
+            if pid in have:
+                continue
+            have.add(pid)
+            ranked.append((pid, {"n": 1, "max": 0.0, "sim": None},
+                           {"doc_id": b["doc_id"], "content": b["content"] or "",
+                            "section_path": b["section_path"] or "",
+                            "ord": b["ord"] or 0,
+                            "source_start_line": b["s_line"] or 0,
+                            "source_end_line": b["e_line"] or 0},
+                           round(float(lead_score) - 1e-6 * k, 6)))
+        ranked.sort(key=lambda x: x[3], reverse=True)
+        # 显式排布（不靠分数）：lead → **章节续块**（客观条件项/清单，必须完整进 context）
+        # → 至多 3 个其它相关块。这样提示词预算先给续块，不会被大章节挤掉
+        # （实测：22 个块时后面的条件项会被 per/total budget 截断，模型又答「未明确列出」）。
+        cont_pids = {b["parent_id"] for b in blocks}
+        lead_item = ranked[0]
+        cont_items = [r for r in ranked[1:] if r[0] in cont_pids]
+        cont_items.sort(key=lambda r: r[2].get("ord", 0) or 0)
+        # 有章节续块时（点值+条件项型）只留 3 个其它块，把预算让给续块；
+        # 没有续块时（同篇并列章节型，如「功能有哪些」）多留几个不同章节。
+        rest_cap = 3 if cont_items else max(top_k_parents - 1, 5)
+        rest_items = [r for r in ranked[1:] if r[0] not in cont_pids][:rest_cap]
+        ranked = [lead_item] + cont_items + rest_items
+
+    if ana.question_type != "coverage":
         ranked = ranked[:max(top_k_parents, 1)]
 
     if debug is not None:
         debug["final_topk"] = [
             {"rank": i, "parent_id": pid, "doc_id": pr["doc_id"],
-             "section_path": pr["section_path"], "hits": acc["n"],
+             "section_path": pr["section_path"],
+            "source_start_line": int(pr.get("source_start_line") or 0),
+            "source_end_line": int(pr.get("source_end_line") or 0), "hits": acc["n"],
              "rrf_max": round(acc["max"], 6), "rank_score": score}
             for i, (pid, acc, pr, score) in enumerate(ranked, start=1)
         ]
@@ -1348,10 +1484,23 @@ def hybrid_search(
             doc_cache[did] = " ".join(x for x in (t, disp, rel) if x)
         title, rel_path, display_source = _doc_row(db, did)
         title = title or did
+        if idx > ref_cap:
+            # 覆盖型扩展块：只进 context，不占引用角标（数字=证据，保持简洁）
+            parents.append({
+                "parent_id": pid, "doc_id": did, "title": title,
+                "display_source": display_source or title, "path": rel_path,
+                "content": pr["content"], "section_path": pr["section_path"],
+                "source_start_line": int(pr.get("source_start_line") or 0),
+                "source_end_line": int(pr.get("source_end_line") or 0),
+                "score": round(acc["max"], 6), "similarity": acc["sim"],
+            })
+            continue
         references.append(Reference(
             id=idx, title=title, path=rel_path, snippet=_snippet(pr["content"], query),
             parent_id=pid, doc_id=did, score=round(acc["max"], 6), similarity=acc["sim"],
             display_source=display_source or title,
+            source_start_line=int(pr.get("source_start_line") or 0),
+            source_end_line=int(pr.get("source_end_line") or 0),
         ))
         parents.append({
             "parent_id": pid,

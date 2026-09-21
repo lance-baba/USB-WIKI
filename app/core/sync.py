@@ -132,7 +132,8 @@ class NoteSyncer:
             except OSError:
                 continue
 
-        report = {"indexed": 0, "updated": 0, "unchanged": 0, "removed": [], "errors": []}
+        report = {"indexed": 0, "updated": 0, "unchanged": 0, "removed": [],
+                  "errors": [], "notes": []}
 
         for rel, p in sorted(disk.items()):
             try:
@@ -181,12 +182,15 @@ class NoteSyncer:
         except Exception as exc:  # noqa: BLE001
             report["errors"].append(f"orphan-sweep: {exc}")
 
-        # 孤儿原件回收：笔记没了，导入时留存的原件也就没有存在意义（可达数十 MB）
+        # 原件安全（Pilot D1）：**永不自动删除** originals/ —— 它们是用户原始资料。
+        # 后台只能报告「暂未关联」，绝不 unlink/移入回收站。
         try:
             from . import crawler as crawler_mod  # noqa: PLC0415
 
-            for name in crawler_mod.purge_orphan_originals(set(disk.keys())):
-                report["removed"].append({"path": f"originals/{name}", "chunks": 0})
+            kept = crawler_mod.find_orphan_originals(set(disk.keys()))
+            if kept:
+                report["notes"].append(
+                    f"发现 {len(kept)} 份暂未关联原件，已保留（不自动删除用户原件）")
         except Exception as exc:  # noqa: BLE001
             report["errors"].append(f"original-sweep: {exc}")
 

@@ -749,42 +749,43 @@ def inject_base_href(html_text: str, source_url: str) -> str:
     return tag + html_text
 
 
-def purge_orphan_originals(note_paths) -> list:
-    """删除已无对应笔记的原件，返回被删文件名列表。
+def find_orphan_originals(note_paths) -> list:
+    """**只报告、不删除**：列出暂未关联到笔记的原件文件名。
 
-    入参是**笔记路径**（`notes/x.md` 或绝对路径都可以），函数内部按文件名
-    去扩展名取 stem 再与原件比对。刻意不让调用方传 stem ——
-    踩过的坑：调用方传了 `notes/x.md` 这种相对路径，却拿去和原件的 stem `x`
-    比对，永远不匹配，结果把**全部原件都误删了**。
+    USB-WIKI Data Contract：``originals/`` 是用户导入/保存的**原始资料**，
+    是 durable 数据 —— 不能因为「Markdown 暂时不存在 / 索引未加载 / Library 切换 /
+    同步基线异常 / 测试环境状态」就被后台自动删除。真实事故：原件目录 4 份文件暂时
+    没有对应笔记（首次启动、索引尚未建立），同步器把它们当孤儿**删掉了**。
 
-    安全阀：若当前一份笔记都没有却存在原件，说明可能是笔记目录读取异常
-    （而不是用户真的清空了），此时拒绝删除并留下日志，交给人来判断。
+    Pilot 口径（D1/D3）：
+    * NEVER AUTO DELETE ORIGINALS —— 任何后台路径都不得 unlink/delete/recycle/移入回收站；
+    * ``notes/ == 0 而 originals/ > 0`` 是**合法状态**（不是异常，更不是可删信号）；
+    * 宁可留占位空间，也不可丢失用户原始资料。
+
+    仍然提供 stem 比对的结果（供 UI / debug 展示），但调用方**不得**据此删除文件。
     """
     stems = {Path(str(x)).stem for x in (note_paths or ())}
     if not paths.ORIGINALS_DIR.exists():
         return []
-    victims = [f for f in paths.ORIGINALS_DIR.iterdir()
-               if f.is_file() and f.stem not in stems]
-    if not victims:
-        return []
-    if not stems:
-        log.warning(
-            "原件目录有 %d 份文件，却未发现任何笔记 —— 疑似笔记目录异常，跳过回收以防误删",
-            len(victims),
-        )
-        return []
-    removed = []
-    for f in victims:
-        try:
-            f.unlink()
-            removed.append(f.name)
-        except OSError as exc:
-            log.warning("原件回收失败 %s: %s", f.name, exc)
-    if removed:
-        # 记录具体文件名：万一判断有误，事后还能从日志追溯被删了什么
-        log.info("孤儿原件回收 %d 份（笔记已不存在）: %s",
-                 len(removed), ", ".join(removed[:10]) + (" …" if len(removed) > 10 else ""))
-    return removed
+    orphans = [
+        f.name for f in paths.ORIGINALS_DIR.iterdir()
+        if f.is_file() and f.stem not in stems
+    ]
+    if orphans:
+        log.info("发现 %d 份暂未关联原件，已保留（Pilot 不自动删除用户原件）: %s",
+                 len(orphans),
+                 ", ".join(sorted(orphans)[:10]) + (" …" if len(orphans) > 10 else ""))
+    return sorted(orphans)
+
+
+def purge_orphan_originals(note_paths) -> list:      # noqa: D401 - 保留旧名兼容
+    """已停用（Pilot）：原件永不自动删除。保留本函数只为兼容旧调用点，恒返回 []。
+
+    历史实现会 unlink 孤儿原件 —— 那违反 Data Contract（用户原件属于 durable 数据）。
+    现在改为只报告：名字保留、行为变成 :func:`find_orphan_originals` 的报告路径。
+    """
+    find_orphan_originals(note_paths)
+    return []
 
 
 def import_document(

@@ -58,6 +58,10 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         content   TEXT NOT NULL,
         ord       INTEGER DEFAULT 0,
         section_path TEXT DEFAULT '',
+        -- A: 引用 stable anchor —— 父块在 Markdown 真相源中的行范围（1-based，含两端）。
+        -- 派生索引字段，可全量重建；不改变 durable 数据（notes/*.md 格式不变）。
+        source_start_line INTEGER DEFAULT 0,
+        source_end_line   INTEGER DEFAULT 0,
         FOREIGN KEY(doc_id) REFERENCES documents(doc_id) ON DELETE CASCADE
     );""",
     # 子切片正文表：短词降级走 LIKE 全表扫描（PRD 4.3）
