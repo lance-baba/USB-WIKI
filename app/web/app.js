@@ -45,7 +45,14 @@ function attrEsc(v) {
 }
 function api(path, opts) {
   return fetch(path, Object.assign({ headers: { "Content-Type": "application/json" } }, opts || {}))
-    .then(r => r.json());
+    .then(r => r.json())
+    // 把「连不上本地服务」翻译成人话 —— 典型场景：用户把启动窗口关掉了，
+    // 后端进程随之结束，页面还留在浏览器里。没有这层包装时 fetch 只会静默 reject，
+    // 表现为「点笔记标题变、内容不变」，看起来像 bug，其实是服务已经没了。
+    .catch(err => {
+      throw new Error("无法连接本地服务（Wiki-USB 可能已退出）："
+        + ((err && err.message) || err));
+    });
 }
 
 /* -------------------- 轻量 Markdown 渲染 -------------------- */
@@ -579,7 +586,14 @@ function initDropZone() {
 /* ---------------------------- 笔记 ---------------------------- */
 let noteCache = [];
 async function loadNotes() {
-  const r = await api("/api/notes?limit=500");
+  let r;
+  try {
+    r = await api("/api/notes?limit=500");
+  } catch (e) {
+    // 服务已停（如启动窗口被关）时给出明确提示，而不是静默保持旧列表
+    toast(e.message || "读取文档列表失败", 5200);
+    return;
+  }
   noteCache = r.data || [];
   $("#docCount").textContent = noteCache.length;
   renderNoteList();
@@ -608,7 +622,18 @@ async function openNoteItem(el, jump, nav, terms) {
     $$("#noteList .list-item").forEach(x => x.classList.remove("active"));
     el.classList.add("active");
     $("#noteTitleBar").textContent = el.querySelector(".t").textContent;
-    const r = await api("/api/notes/content?path=" + encodeURIComponent(el.dataset.path));
+    let r;
+    try {
+      r = await api("/api/notes/content?path=" + encodeURIComponent(el.dataset.path));
+    } catch (e) {
+      // 关键：失败必须**显式**呈现。旧实现没有 try/catch，连接失败时
+      // 「标题变了、内容不动」，用户会误以为程序坏了（真机反馈过）。
+      NOTE.payload = null;
+      $("#noteSeg").hidden = true;
+      $("#noteView").innerHTML = '<div class="alert err" style="margin:8px 0">'
+        + esc(e.message || "读取失败") + "<br>请重新启动 Wiki-USB（双击启动脚本）后刷新本页。</div>";
+      return;
+    }
     if (nav != null && nav !== NOTE_NAV_SEQ) return;                 // B：有更新的导航已发生 → 放弃
     if (r.code !== 200) {
       NOTE.payload = null;

@@ -38,6 +38,58 @@ _CALLBACK_REF = []  # 保持 ctypes 回调引用，防止被 GC 回收
 
 
 # --------------------------------------------------------------------------
+def _notify(msg: str) -> None:
+    """把重要消息同时送到「日志 + 控制台 + 系统对话框（仅无控制台时）」。
+
+    为什么要对话框兜底：以 `pythonw.exe` 无窗口启动时，``sys.stdout`` /
+    ``sys.stderr`` 都是 ``None``，`print` 会**静默丢弃**。若不弹窗，启动失败
+    就等于「双击了没反应」，用户无从判断（也没有日志窗口可看）。
+    """
+    log.error("%s", msg)
+    try:
+        print(msg, file=sys.stderr, flush=True)
+    except Exception:  # noqa: BLE001 - 无控制台时 print 可能失败
+        pass
+    if sys.stderr is None and os.name == "nt":  # 无控制台（pythonw）→ 弹窗
+        try:
+            import ctypes  # noqa: PLC0415
+
+            ctypes.windll.user32.MessageBoxW(0, msg, "Wiki-USB", 0x10)  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _fatal(msg: str, code: int = 2) -> int:
+    """致命错误出口：通知（可能弹窗）后返回退出码。"""
+    _notify(msg)
+    return code
+
+
+#: PID 文件放在**程序根目录**（而非数据目录）—— 停止脚本按自身位置相对查找，
+#: 不用去猜用户把 Library 放到了哪个盘。
+_PID_FILE = paths.BASE_DIR / "wiki-usb.pid"
+
+
+def _write_pid(port: int = 0) -> None:
+    """写 PID 文件（两行：PID / 端口），供「停止-Windows.bat」精确停止服务。
+
+    记录端口是为了让停止脚本能**先走 /api/system/shutdown 优雅退出**（触发 WAL
+    检查点），失败再退回 taskkill。无控制台运行时没有窗口可关，这是主要的停止入口。
+    """
+    try:
+        _PID_FILE.write_text(f"{os.getpid()}\n{int(port or 0)}\n", encoding="ascii")
+    except OSError:
+        pass
+
+
+def _clear_pid() -> None:
+    try:
+        _PID_FILE.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+# --------------------------------------------------------------------------
 def probe_port(host: str, start_port: int, attempts: int = PORT_ATTEMPTS) -> tuple[int, int]:
     """返回 (可用端口, 实际尝试次数)。全部失败抛 OSError。
 
@@ -112,7 +164,9 @@ def _banner(host: str, port: int, ctx_report: dict | None) -> str:
         f"   控制台地址： http://{host}:{port}",
         f"   数据目录　： {paths.DATA_DIR}",
         "   ────────────────────────────────────────────────────",
-        "   关闭本窗口 或 点击界面右上角「安全退出」可触发 WAL 检查点并释放锁",
+        "   停止服务：界面右上角「安全退出」（推荐，会做 WAL 检查点）",
+        "             或双击程序目录下的「停止-Windows.bat」",
+        "   注意：本程序默认**不显示控制台窗口**，关掉浏览器并不会停止服务。",
         "",
     ]
     if ctx_report:
@@ -155,13 +209,11 @@ def main(argv: list[str] | None = None) -> int:
     from app.core import security as _security  # noqa: PLC0415
 
     if not _security.is_loopback(host) and not args.allow_lan:
-        print(
-            f"\n  拒绝监听 {host}：该地址会向本机之外暴露整个知识库。"
-            "\n  本服务没有登录鉴权，默认只允许本机访问。"
-            "\n  确实需要时请显式加上 --allow-lan，并自行确保网络环境可信。\n",
-            file=sys.stderr,
-        )
-        sys.exit(2)
+        sys.exit(_fatal(
+            f"拒绝监听 {host}：该地址会向本机之外暴露整个知识库。\n"
+            "本服务没有登录鉴权，默认只允许本机访问。\n"
+            "确实需要时请显式加上 --allow-lan，并自行确保网络环境可信。"
+        ))
     if not _security.is_loopback(host):
         print(
             f"\n  ⚠️  已按 --allow-lan 监听 {host}：**同一局域网内的任何人都能访问**"
@@ -174,9 +226,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         port, tries = probe_port(host, start_port)
     except OSError as exc:
-        log.error(str(exc))
-        print(f"\n  [启动失败] {exc}\n", file=sys.stderr)
-        return 2
+        return _fatal(f"[启动失败] {exc}")
     if tries > 1:
         log.info("端口避让成功：%d -> %d（尝试 %d 次）", start_port, port, tries)
 
@@ -199,6 +249,7 @@ def main(argv: list[str] | None = None) -> int:
             ctx.shutdown()
         except Exception as exc:  # noqa: BLE001
             log.error("安全退出异常: %s", exc)
+        _clear_pid()
         log.info("安全退出完成，用时 %.0fms", (time.time() - t0) * 1000)
         # ⚠ 必须唤醒主循环。
         # 此前这里只关了库和 HTTP server，**从不设置 SHUTDOWN_EVENT**，
@@ -218,25 +269,22 @@ def main(argv: list[str] | None = None) -> int:
         _state = _migrations.FRESH
     if _state == _migrations.DOWNGRADE:
         _probe = _migrations.probe(_paths.CACHE_DB)
-        print(
-            "\n  无法打开该知识库：索引结构为 " + _probe.version
-            + "，而当前程序只支持 " + _migrations.CURRENT_SCHEMA_VERSION + "。"
-            + "\n  该索引由更新版本的 USB-WIKI 创建，请升级 USB-WIKI 后再打开。"
-            + "\n  （不会自动重建或降级，以免破坏新版本产生的数据状态）\n",
-            file=sys.stderr,
-        )
-        sys.exit(2)
+        sys.exit(_fatal(
+            "无法打开该知识库：索引结构为 " + _probe.version
+            + "，而当前程序只支持 " + _migrations.CURRENT_SCHEMA_VERSION + "。\n"
+            "该索引由更新版本的 USB-WIKI 创建，请升级 USB-WIKI 后再打开。\n"
+            "（不会自动重建或降级，以免破坏新版本产生的数据状态）"
+        ))
     # 3) 先起服务框架（此时 /api/status 返回 ready:false，前端显示初始化中）
     try:
         server = Server((host, port), ctx, on_shutdown=on_exit,
                         allow_lan=bool(args.allow_lan or not _security.is_loopback(host)))
     except OSError as exc:
-        log.error("服务绑定失败: %s", exc)
-        print(f"\n  [启动失败] 无法绑定 {host}:{port} —— {exc}\n", file=sys.stderr)
-        return 2
+        return _fatal(f"[启动失败] 无法绑定 {host}:{port} —— {exc}")
     ctx.port = port
 
     _install_exit_hooks(on_exit)
+    _write_pid(port)                  # 无控制台运行时，停止脚本靠它找到进程
     server.serve_in_thread()
     url = f"http://{host}:{port}"
 
@@ -269,7 +317,7 @@ def main(argv: list[str] | None = None) -> int:
     _print_banner(ctx.boot_report)
 
     if boot_error:
-        print(f"\n  [初始化异常] {boot_error[0]}\n", file=sys.stderr)
+        _notify(f"[初始化异常] {boot_error[0]}")
 
     # 6) 主线程等待退出信号
     try:

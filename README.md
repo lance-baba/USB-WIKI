@@ -25,9 +25,14 @@
    python setup_runtime_windows.py
 
 2) 之后任意电脑插入 U 盘，双击：
-   启动-Windows.bat
+   启动-Windows.bat        ← 默认不显示控制台窗口
 ```
-浏览器会自动打开 `http://127.0.0.1:28765`。关闭控制台窗口或点击界面右上角「安全退出」即可安全拔盘。
+浏览器会自动打开 `http://127.0.0.1:28765`。
+
+- **停止服务**：界面右上角「安全退出」（推荐，会做 WAL 检查点），或双击 `停止-Windows.bat`。
+- **需要排错**：双击 `启动-Windows-调试.bat`（保留控制台窗口，可看启动横幅与报错）；
+  两种方式都会把日志写入数据目录的 `wiki-usb.log`。
+- ⚠ 默认无控制台窗口，所以**关掉浏览器不会停止服务**；请用上面两种方式之一停止后再拔盘。
 
 > **发布包体积**：核心运行时含自包含 Python 解释器与全部依赖。
 > 最重的一项 `babel`（32MB）来自 `trafilatura` 依赖链上游的 `courlan` ——
@@ -117,7 +122,9 @@ chmod +x 启动-macOS.command 启动-Linux.sh
 
 ```
 Wiki-USB/
-├── 启动-Windows.bat            # Windows 入口（UTF-8 编码锁死 + 内置环境静默呼出）
+├── 启动-Windows.bat            # Windows 入口（默认无控制台窗口；UTF-8 编码锁死）
+├── 启动-Windows-调试.bat       # 排错入口：保留控制台窗口，便于看启动横幅与报错
+├── 停止-Windows.bat            # 停止无窗口运行的服务（优先 /api/system/shutdown 优雅退出）
 ├── 启动-macOS.command          # macOS 入口（权限与依赖检测）
 ├── 启动-Linux.sh               # Linux 入口
 ├── setup_runtime_windows.py    # 嵌入式运行时安装器 / 体检器 / 发布校验器 / 垃圾清理

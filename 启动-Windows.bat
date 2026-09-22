@@ -1,16 +1,19 @@
 @echo off
 rem =====================================================================
-rem  Wiki-USB v1.2  --  Windows launcher
+rem  Wiki-USB  --  Windows launcher  (NO console window)
 rem
 rem  IMPORTANT: keep this file ASCII-only.
-rem  Localized output is produced by Python (UTF-8). cmd.exe parses batch
-rem  files using the ACTIVE console codepage, so embedding CJK literals
-rem  here would garble them on a CP936 host -- the #1 cause of silent
-rem  crashes for portable Python distributions.
+rem  cmd.exe parses batch files using the ACTIVE console codepage, so CJK
+rem  literals here would garble on a CP936 host. All localized output is
+rem  produced by Python (UTF-8); startup failures raise a system dialog.
 rem
-rem  NOTE: deliberately avoids parenthesised blocks around %ERRORLEVEL%,
-rem  because cmd expands %VAR% at parse time for a whole block, which
-rem  would capture a stale exit code.
+rem  Runs the server through pythonw.exe (no console). If you need the
+rem  console for troubleshooting, use "Start-Debug.bat" instead.
+rem  To stop a hidden server, use "Stop.bat" (or the in-app safe-exit).
+rem
+rem  NOTE: deliberately avoids parenthesised blocks around %VAR% /
+rem  %ERRORLEVEL%, because cmd expands them at parse time for a whole
+rem  block and would capture a stale value.
 rem =====================================================================
 chcp 65001 > nul
 set PYTHONIOENCODING=utf-8
@@ -20,36 +23,60 @@ setlocal enableextensions
 cd /d "%~dp0"
 title Wiki-USB
 
+set "EMBED_PYW=%~dp0runtime\python-3.11-embed\pythonw.exe"
 set "EMBED_PY=%~dp0runtime\python-3.11-embed\python.exe"
 set "LAUNCHER=%~dp0app\launcher.py"
-set "RC=0"
 
 if not exist "%LAUNCHER%" goto :no_app
 
-if exist "%EMBED_PY%" (
-    echo [Wiki-USB] embedded runtime detected
-    "%EMBED_PY%" "%LAUNCHER%" %*
-    goto :finish
-)
-
+if exist "%EMBED_PYW%" goto :embedded_pyw
+if exist "%EMBED_PY%" goto :embedded_py
 echo [Wiki-USB] embedded runtime absent, probing host Python...
+goto :probe_host
 
+:embedded_pyw
+echo [Wiki-USB] starting WITHOUT a console window ...
+start "" "%EMBED_PYW%" "%LAUNCHER%" %*
+goto :done
+
+:embedded_py
+echo [Wiki-USB] pythonw.exe missing - falling back to a console window.
+"%EMBED_PY%" "%LAUNCHER%" %*
+goto :done
+
+:probe_host
+where pyw >nul 2>nul
+if not errorlevel 1 goto :host_pyw
+where pythonw >nul 2>nul
+if not errorlevel 1 goto :host_pythonw
+echo [Wiki-USB] pythonw not found - falling back to a console window.
 where py >nul 2>nul
-if errorlevel 1 goto :try_python
-py -3 "%LAUNCHER%" %*
-goto :finish
-
-:try_python
+if not errorlevel 1 goto :host_py
 where python >nul 2>nul
-if errorlevel 1 goto :try_python3
-python "%LAUNCHER%" %*
-goto :finish
-
-:try_python3
+if not errorlevel 1 goto :host_python
 where python3 >nul 2>nul
-if errorlevel 1 goto :no_python
+if not errorlevel 1 goto :host_python3
+goto :no_python
+
+:host_pyw
+start "" pyw -3 "%LAUNCHER%" %*
+goto :done
+
+:host_pythonw
+start "" pythonw "%LAUNCHER%" %*
+goto :done
+
+:host_py
+py -3 "%LAUNCHER%" %*
+goto :done
+
+:host_python
+python "%LAUNCHER%" %*
+goto :done
+
+:host_python3
 python3 "%LAUNCHER%" %*
-goto :finish
+goto :done
 
 :no_app
 echo.
@@ -69,11 +96,5 @@ echo.
 pause
 endlocal & exit /b 3
 
-:finish
-set "RC=%ERRORLEVEL%"
-if not "%RC%"=="0" (
-    echo.
-    echo  [Wiki-USB] launcher exited with code %RC%
-    pause
-)
-endlocal & exit /b %RC%
+:done
+endlocal & exit /b 0
