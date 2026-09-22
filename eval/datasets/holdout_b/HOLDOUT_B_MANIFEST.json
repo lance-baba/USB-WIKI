@@ -1,0 +1,62 @@
+{
+  "name": "HOLDOUT_B",
+  "purpose": "Release Candidate Gate 1 最终验收集（只用一次，不复用 B 做二次验收）",
+  "generated_at": "2026-09-23 07:44:46",
+  "case_count": 57,
+  "hard_case_count": 18,
+  "hard_case_ratio": 0.316,
+  "fixture_count": 8,
+  "fixtures": {
+    "hb_bridge2.md": {
+      "sha256": "479f5b0cc45aaa40211be165b1cca53bbdb3100b52734bad8cd2da34dedeb0db",
+      "bytes": 942
+    },
+    "hb_clinic.md": {
+      "sha256": "c4fa9ff3a4bcd70d104253b5214ab92d56be9d62fe12f39830fafba8891f5cf5",
+      "bytes": 906
+    },
+    "hb_flood.md": {
+      "sha256": "9ce5f492c5f61383c3905c691a8bb33eec1a2974e847b20b2a94399d1383a03d",
+      "bytes": 914
+    },
+    "hb_lab.md": {
+      "sha256": "a6e341e675924f8ca74bc8d6185484e0faf7ea521fb55e2d432acf8eef89af0a",
+      "bytes": 793
+    },
+    "hb_software.md": {
+      "sha256": "8fb3d1ab703da203531a5228277c8848c4e825399cd382f5253ca8865584f02f",
+      "bytes": 850
+    },
+    "hb_substation.md": {
+      "sha256": "cecbd6f6bf069caec0932f7970f660f9fc4057f5b0692c133ab74ae6c3613326",
+      "bytes": 940
+    },
+    "hb_subway.md": {
+      "sha256": "07e8a98b8bf74ae16d1951935cafead8f36bd63c3d62570b08e8210a1f0d1745",
+      "bytes": 1711
+    },
+    "hb_warehouse.md": {
+      "sha256": "d2adbde8eca10a4eb93d19342f781885ba5c0a7fb2a3255b38075b10e44e686b",
+      "bytes": 808
+    }
+  },
+  "gold_file": "datasets\\holdout_b\\holdout_b_gold.jsonl",
+  "gold_sha256": "a244cd8693c9fe9d16e53029148f96f52a2bc383b63d197eaaa6c11d6b88806d",
+  "categories": {
+    "direct_fact": 5,
+    "quantity": 5,
+    "person": 4,
+    "model_spec": 5,
+    "table_relation": 5,
+    "similar_entity": 5,
+    "section_overview": 4,
+    "list_coverage": 4,
+    "negative_no_answer": 4,
+    "causal": 6,
+    "event": 3,
+    "responsibility": 4,
+    "citation": 3
+  },
+  "frozen": true,
+  "frozen_at": "2026-09-23 07:46:54"
+}

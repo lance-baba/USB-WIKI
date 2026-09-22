@@ -10,8 +10,10 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
+import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -588,6 +590,275 @@ def _units_of(text: str) -> list[str]:
     return [u["text"] for u in RG.units_of(text)]
 
 
+
+# ==========================================================================
+# HOLDOUT B（Release Candidate Gate 1 · 最终验收集）
+# 与 DEV72 / Attribution DEV / Router DEV / Holdout A **全部不同**，不复用、不改写旧题。
+# 冻结后禁止修改 fixture / gold / expected（见 HOLDOUT_B_MANIFEST.json）。
+# ==========================================================================
+FIXTURES_HB = HERE / "fixtures_holdout_b"
+OUT_HB = HERE / "datasets" / "holdout_b" / "holdout_b_gold.jsonl"
+MANIFEST_HB = HERE / "datasets" / "holdout_b" / "HOLDOUT_B_MANIFEST.json"
+
+SUB = "hb_subway.md"
+ST = "hb_substation.md"
+FLD = "hb_flood.md"
+CLI = "hb_clinic.md"
+SOF = "hb_software.md"
+WH = "hb_warehouse.md"
+BR = "hb_bridge2.md"
+LAB = "hb_lab.md"
+
+# (id, category, query, doc, must_contain, must_not_contain, relation, groups, state, hard)
+HB: list[tuple] = [
+    # ---------- direct_fact ----------
+    ("hb_df_struct", "direct_fact", "地铁车站基坑的围护结构采用什么形式？", SUB,
+     ["地下连续墙", "内支撑"], [], None, None, "answered", False),
+    ("hb_df_clinic_purpose", "direct_fact", "体检中心规程的目的是什么？", CLI,
+     ["规范体检中心样本采集"], [], None, None, "answered", False),
+    ("hb_df_software_pos", "direct_fact", "OrbitSync 是什么产品？", SOF,
+     ["文档同步与协作", "私有部署"], [], None, None, "answered", False),
+    ("hb_df_win7", "direct_fact", "OrbitSync 是否支持 Windows 7 客户端？", SOF,
+     ["不再支持 Windows 7"], [], None, None, "answered", False),
+    ("hb_df_calib_org", "direct_fact", "力学类仪器由哪个机构校准？", LAB,
+     ["省计量院"], [], None, None, "answered", False),
+    # ---------- quantity ----------
+    ("hb_q_depth", "quantity", "车站基坑开挖深度约多少米？", SUB,
+     ["17.6"], [], ("开挖深度", "17.6"), None, "answered", False),
+    ("hb_q_inclino_tube", "quantity", "墙体测斜管共有几根？", SUB,
+     ["8 根", "CX-01 至 CX-08"], [], ("测斜管", "8"), None, "answered", False),
+    ("hb_q_baseline", "quantity", "基准点设置了几个？", SUB,
+     ["4 个", "BM-01 至 BM-04"], [], None, None, "answered", False),
+    ("hb_q_breaker", "quantity", "变电站断路器有多少台？", ST,
+     ["8台"], [], ("断路器", "8台"), None, "answered", False),
+    ("hb_q_material_total", "quantity", "本次盘点共覆盖多少项物料？", WH,
+     ["128 项"], [], None, None, "answered", False),
+    # ---------- person ----------
+    ("hb_p_leader", "person", "地铁基坑项目负责人是谁？", SUB,
+     ["赵鹏"], [], ("项目负责人", "赵鹏"), None, "answered", False),
+    ("hb_p_data", "person", "谁负责数据平差与报表编制？", SUB,
+     ["李岚"], [], None, None, "answered", False),
+    ("hb_p_bridge", "person", "桥梁检测的负责人是谁？", BR,
+     ["何建国"], [], None, None, "answered", False),
+    ("hb_p_wdw300", "person", "WDW-300 的责任人是谁？", LAB,
+     ["马丽"], [], ("WDW-300", "马丽"), None, "answered", True),
+    # ---------- model_spec ----------
+    ("hb_m_total_station", "model_spec", "地铁监测使用全站仪是什么型号？", SUB,
+     ["徕卡TS30"], [], None, None, "answered", False),
+    ("hb_m_level", "model_spec", "电子水准仪的型号是什么？", SUB,
+     ["天宝DINI-05"], [], None, None, "answered", False),
+    ("hb_m_crack", "model_spec", "裂缝宽度观测仪是什么型号？", BR,
+     ["ZBL-F120"], [], None, None, "answered", False),
+    ("hb_m_transformer2", "model_spec", "2号主变的型号是什么？", ST,
+     ["SZ11-63000/110"], ["SZ11-50000/110"], None, None, "answered", True),
+    ("hb_m_protect978", "model_spec", "变压器保护装置的型号是什么？", ST,
+     ["PCS-978"], ["PCS-931"], None, None, "answered", True),
+    # ---------- table_relation ----------
+    ("hb_tr_freq_remove", "table_relation", "支撑拆除阶段的监测频率是多少？", SUB,
+     ["2次/1d"], [], ("支撑拆除阶段", "2次/1d"), None, "answered", False),
+    ("hb_tr_level_valid", "table_relation", "电子水准仪的检定有效期到什么时候？", SUB,
+     ["2027-01-09"], [], ("天宝DINI-05", "2027-01-09"), None, "answered", False),
+    ("hb_tr_a1001", "table_relation", "A-1001 的实盘数是多少？", WH,
+     ["2396"], ["1500"], ("A-1001", "2396"), None, "answered", True),
+    ("hb_tr_single_file", "table_relation", "OrbitSync 单文件上限是多少？", SOF,
+     ["2GB"], [], ("单文件上限", "2GB"), None, "answered", False),
+    ("hb_tr_transformer2_date", "table_relation", "2号主变的投运日期是什么？", ST,
+     ["2021-09-03"], [], None, None, "answered", True),
+    # ---------- similar_entity（易混淆） ----------
+    ("hb_se_tube_range", "similar_entity", "测斜管的编号范围是什么？", SUB,
+     ["CX-01 至 CX-08"], ["CX-806"], None, None, "answered", True),
+    ("hb_se_device_model", "similar_entity", "测斜仪的型号是什么？", SUB,
+     ["CX-806"], ["CX-01"], None, None, "answered", True),
+    ("hb_se_well_count", "similar_entity", "坑外地下水位观测井有几口？", SUB,
+     ["6 口"], ["SWJ-30"], None, None, "answered", True),
+    ("hb_se_meter_model", "similar_entity", "水位计的型号是什么？", SUB,
+     ["SWJ-30"], ["SW-01"], None, None, "answered", True),
+    ("hb_se_b1001", "similar_entity", "B-1001 物料的实盘数是多少？", WH,
+     ["1500"], ["2396"], None, None, "answered", True),
+    # ---------- section_overview ----------
+    ("hb_so_freq", "section_overview", "地铁基坑的监测频率是怎么规定的？", SUB,
+     ["1次/1d", "2次/1d", "1次/3d", "1次/7d"], [], None, None, "answered", False),
+    ("hb_so_alert", "section_overview", "地铁基坑的预警值是怎么规定的？", SUB,
+     ["24mm", "2mm/d", "30mm"], [], None, None, "answered", False),
+    ("hb_so_overhaul", "section_overview", "变电站设备的检修周期分别是多少？", ST,
+     ["10 年", "6 年", "3 年"], [], None, None, "answered", False),
+    ("hb_so_compat", "section_overview", "OrbitSync 的兼容性情况如何？", SOF,
+     ["Linux", "Windows Server", "macOS"], [], None, None, "answered", False),
+    # ---------- list_coverage ----------
+    ("hb_lc_subway_items", "list_coverage", "地铁基坑的监测项目包括哪些？", SUB,
+     ["地连墙顶水平位移", "墙顶竖向位移", "墙体测斜", "支撑轴力", "坑外地表沉降"],
+     [], None,
+     [["地连墙顶水平位移"], ["墙顶竖向位移"], ["墙体测斜"], ["支撑轴力"], ["坑外地表沉降"], ["坑外地下水位"]],
+     "answered", False),
+    ("hb_lc_clinic_items", "list_coverage", "体检中心开展哪些检测项目？", CLI,
+     ["血常规", "尿常规", "肝功能", "肾功能", "血脂四项"], [], None,
+     [["血常规"], ["尿常规"], ["肝功能"], ["肾功能"], ["血脂四项"], ["心电图"], ["胸部正位片"]],
+     "answered", False),
+    ("hb_lc_software_feat", "list_coverage", "OrbitSync 3.2 有哪些新功能？", SOF,
+     ["离线编辑", "细粒度权限", "全文检索中文分词"], [], None,
+     [["离线编辑"], ["细粒度权限"], ["全文检索中文分词"]], "answered", False),
+    ("hb_lc_bridge_defect", "list_coverage", "本次桥梁检测记录了哪些病害？", BR,
+     ["支座脱空", "支座剪切变形", "伸缩缝止水带破损"], [], None,
+     [["支座脱空"], ["支座剪切变形"], ["伸缩缝止水带破损"]], "answered", False),
+    # ---------- negative_no_answer ----------
+    ("hb_neg_cost", "negative_no_answer", "地铁基坑监测的总费用是多少？", SUB,
+     [], ["费用", "万元"], None, None, "insufficient", False),
+    ("hb_neg_price", "negative_no_answer", "OrbitSync 的授权价格是多少？", SOF,
+     [], ["价格", "元"], None, None, "insufficient", False),
+    ("hb_neg_design_life", "negative_no_answer", "该桥的设计使用年限是多少年？", BR,
+     [], ["使用年限", "设计年限"], None, None, "insufficient", False),
+    ("hb_neg_lab_env", "negative_no_answer", "试验室的恒温恒湿要求是多少？", LAB,
+     [], ["恒温", "湿度"], None, None, "insufficient", False),
+    # ---------- causal（positive / negative / insufficient） ----------
+    ("hb_c_pos1", "causal", "强降雨是否导致城区 14 处低洼点积水？", FLD,
+     ["强降雨", "城区 14 处低洼点积水"], [], ("强降雨", "城区 14 处低洼点积水"), None, "yes", False),
+    ("hb_c_pos2", "causal", "泄洪是否导致下游滩地受淹？", FLD,
+     ["泄洪", "下游滩地受淹"], [], ("泄洪", "下游滩地受淹"), None, "yes", False),
+    ("hb_c_neg1", "causal", "强降雨是否导致下游滩地受淹？", FLD,
+     ["强降雨", "下游滩地受淹"], [], ("强降雨", "下游滩地受淹"), None, "no", True),
+    ("hb_c_neg2", "causal", "上游来水是否导致城区 14 处低洼点积水？", FLD,
+     ["上游来水", "城区 14 处低洼点积水"], [], ("上游来水", "城区 14 处低洼点积水"), None, "no", True),
+    ("hb_c_ins1", "causal", "强降雨是否导致人员伤亡？", FLD,
+     ["强降雨", "人员伤亡"], [], ("强降雨", "人员伤亡"), None, "insufficient", True),
+    ("hb_c_ins2", "causal", "上游来水是否导致转移群众？", FLD,
+     ["上游来水", "转移群众"], [], ("上游来水", "转移群众"), None, "insufficient", True),
+    # ---------- event ----------
+    ("hb_e_pos1", "event", "哪个过程导致库区水位上涨 2.4 米？", FLD,
+     ["上游来水", "库区水位上涨 2.4 米"], [], ("上游来水", "库区水位上涨 2.4 米"), None, "yes", False),
+    ("hb_e_pos2", "event", "ZZ-07 支座剪切变形是由什么原因引起的？", BR,
+     ["温度变化", "ZZ-07 支座剪切变形"], [], ("温度变化", "ZZ-07 支座剪切变形"), None, "yes", True),
+    ("hb_e_neg", "event", "哪个过程导致转移群众？", FLD,
+     ["转移群众"], [], None, None, "insufficient", True),
+    # ---------- responsibility ----------
+    ("hb_r_pos1", "responsibility", "城市排涝由谁负责？", FLD,
+     ["城市排涝", "排水管理处"], [], ("城市排涝", "排水管理处"), None, "yes", False),
+    ("hb_r_pos2", "responsibility", "试剂采购由谁负责？", CLI,
+     ["试剂采购", "器械科"], [], ("试剂采购", "器械科"), None, "yes", False),
+    ("hb_r_neg1", "responsibility", "水库调度是否由排水管理处负责？", FLD,
+     ["水库调度", "排水管理处"], [], ("水库调度", "排水管理处"), None, "no", True),
+    ("hb_r_neg2", "responsibility", "医疗废物处置是否由器械科负责？", CLI,
+     ["医疗废物处置", "器械科"], [], ("医疗废物处置", "器械科"), None, "no", True),
+    # ---------- citation ----------
+    ("hb_cit_freq", "citation", "地铁基坑开挖阶段的监测频率是多少？", SUB,
+     ["1次/1d"], [], None, None, "answered", False),
+    ("hb_cit_model", "citation", "地铁监测用测斜仪是什么型号？", SUB,
+     ["CX-806"], [], None, None, "answered", False),
+    ("hb_cit_person", "citation", "地铁基坑数据处理员是谁？", SUB,
+     ["李岚"], [], None, None, "answered", False),
+]
+
+
+def _build_holdout_b() -> int:
+    """Holdout B 专用校验：比 DEV 更严 —— 关系类必须能被**生产**解析器解出，
+    且正/负/无答案的关系结构必须各自成立。"""
+    from app.core import relation_guard as RG  # noqa: PLC0415
+
+    docs = {p.name: p.read_text(encoding="utf-8") for p in FIXTURES_HB.glob("*.md")}
+    rows, problems = [], []
+    n_hard = 0
+    for (cid, cat, q, doc, must, mustnot, rel, groups, state, hard) in HB:
+        text = docs.get(doc)
+        if text is None:
+            problems.append(f"{cid}: fixture {doc} 不存在")
+            continue
+        if hard:
+            n_hard += 1
+        for t in must:
+            if t not in text:
+                problems.append(f"{cid}: must_contain {t!r} 不在 {doc} 中")
+        if cat == "negative_no_answer":
+            if not mustnot:
+                problems.append(f"{cid}: 负例题必须有 must_not_contain")
+            for t in mustnot:
+                if t in text:
+                    problems.append(f"{cid}: must_not_contain {t!r} 出现在 {doc}（不成立）")
+        if cat in ("causal", "event", "responsibility"):
+            pa = RG.analyze_relation(q)
+            if pa.route != RG.ROUTE_GUARD:
+                problems.append(f"{cid}: 关系题但生产 Router 判 {pa.route}（应进 Guard）")
+            if pa.relation_type != cat:
+                problems.append(f"{cid}: 解析 relation_type={pa.relation_type} != {cat}")
+        if rel and cat in ("causal", "event", "responsibility"):
+            a, t = rel
+            if a not in text or t not in text:
+                problems.append(f"{cid}: relation {rel} 不在 {doc} 中")
+            same = any(a in u and t in u for u in _units_of(text))
+            if state == "yes" and not same:
+                problems.append(f"{cid}: 正例但无同一 evidence unit 共现")
+            if state in ("no", "insufficient") and same:
+                problems.append(f"{cid}: 负例/无答案却在同一 unit 共现")
+            pa = RG.analyze_relation(q)
+            if pa.anchor and pa.anchor != a:
+                problems.append(f"{cid}: 解析 anchor={pa.anchor!r} != 声明 {a!r}")
+            pt = pa.value or pa.target
+            if pa.target and pt != t:
+                problems.append(f"{cid}: 解析 target={pt!r} != 声明 {t!r}")
+        for grp in (groups or []):
+            for t in grp:
+                if t not in text:
+                    problems.append(f"{cid}: evidence_group {t!r} 不在 {doc} 中")
+        rows.append({
+            "id": cid, "category": cat, "split": "holdout_b", "hard": hard, "query": q,
+            "expected": {"doc": doc, "must_contain": must, "must_not_contain": mustnot,
+                         "answer_state": state, "relation": list(rel) if rel else None},
+            "evidence_groups": groups or [],
+        })
+
+    if problems:
+        print("HOLDOUT B INTEGRITY FAILED:")
+        for p in problems:
+            print("  -", p)
+        return 1
+
+    OUT_HB.parent.mkdir(parents=True, exist_ok=True)
+    with OUT_HB.open("w", encoding="utf-8") as fh:
+        for r in rows:
+            fh.write(json.dumps(r, ensure_ascii=False) + "\n")
+    from collections import Counter
+    cnt = Counter(r["category"] for r in rows)
+    print(f"OK [holdout_b] 写出 {len(rows)} 条 → {OUT_HB}")
+    for k, v in sorted(cnt.items()):
+        print(f"   {k:20s} {v}")
+    print(f"   hard cases: {n_hard}/{len(rows)} = {n_hard/len(rows)*100:.0f}%")
+    _write_manifest(rows)
+    return 0
+
+
+def _write_manifest(rows: list[dict]) -> None:
+    """冻结清单：case 数 / fixture hash / gold hash / 生成时间。"""
+    from collections import Counter  # noqa: PLC0415
+    fx = {}
+    for p in sorted(FIXTURES_HB.glob("*.md")):
+        fx[p.name] = {"sha256": _sha256(p), "bytes": p.stat().st_size}
+    gold_sha = _sha256(OUT_HB)
+    man = {
+        "name": "HOLDOUT_B",
+        "purpose": "Release Candidate Gate 1 最终验收集（只用一次，不复用 B 做二次验收）",
+        "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "case_count": len(rows),
+        "hard_case_count": sum(1 for r in rows if r.get("hard")),
+        "hard_case_ratio": round(sum(1 for r in rows if r.get("hard")) / len(rows), 3),
+        "fixture_count": len(fx),
+        "fixtures": fx,
+        "gold_file": str(OUT_HB.relative_to(HERE)),
+        "gold_sha256": gold_sha,
+        "categories": dict(Counter(r["category"] for r in rows)),
+        "frozen": False,
+        "frozen_at": None,
+    }
+    MANIFEST_HB.write_text(json.dumps(man, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"   清单 → {MANIFEST_HB}  (gold sha256 {gold_sha[:16]}…, frozen=False)")
+
+
+def _sha256(p: Path) -> str:
+    """文件 SHA256（用于 Holdout B 冻结清单与完整性校验）。"""
+    h = hashlib.sha256()
+    with p.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def main() -> int:
     rc = _build(C, FIXTURES, OUT, "dev")
     if rc != 0:
@@ -599,7 +870,10 @@ def main() -> int:
     if _build_attr() != 0:
         return 1
     print()
-    return _build_router()
+    if _build_router() != 0:
+        return 1
+    print()
+    return _build_holdout_b()
 
 
 def _build(case_list, fixtures_dir: Path, out: Path, split: str) -> int:
@@ -664,3 +938,11 @@ def _build(case_list, fixtures_dir: Path, out: Path, split: str) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+def _sha256(p: Path) -> str:
+    h = hashlib.sha256()
+    with p.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
