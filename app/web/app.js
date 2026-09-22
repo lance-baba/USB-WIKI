@@ -18,7 +18,10 @@ const S = {
   rendered: "",      // 已渲染的文本（不含滞留缓冲）
   holding: "",       // 未闭合角标滞留缓冲
   full: "",          // 收到的完整文本
-  q: "",             // 最近一次提问（证据跳转的高亮词源）
+  q: "",             // 最近一次提问
+  // 本轮「问题实词」（后端 meta 帧下发）：引用跳转后据此在证据区域内高亮关键字。
+  // 不用 snippet 文本匹配 —— 那带 Markdown 语法，必然匹配失败。
+  terms: [],
   busy: false,
 };
 
@@ -255,11 +258,12 @@ async function send() {
   pushMsg("user", mdToHtml(q));
   input.value = "";
 
-  S.full = ""; S.rendered = ""; S.holding = ""; S.refs = [];
+  S.full = ""; S.rendered = ""; S.holding = ""; S.refs = []; S.terms = [];
   S.turn = ++S.turnSeq;                // A：新的一轮，分配独立 turn id
-  S.q = q;                              // B：证据跳转时高亮查询关键词
+  S.q = q;
   const bub = pushMsg("assistant", '<span class="hint">检索知识库…</span>');
   bub._refs = [];                      // 本轮的 refs 快照（随 references 帧到达而填充）
+  bub._terms = [];                     // 本轮的「问题实词」（随 meta 帧到达而填充）
 
   try {
     const resp = await fetch("/api/chat/completions", {
@@ -328,8 +332,12 @@ function handleFrame(f, bub) {
     if (bub) bub._refs = refs;                 // 本轮 bubble 自身携带
   } else if (f.type === "meta") {
     (f.warnings || []).forEach(w => toast("⚠ " + w, 3600));
+    // 关键词高亮词：随本轮 bubble 保存（turn-scoped，旧轮点击不会串用新轮关键词）
+    S.terms = f.terms || [];
+    if (bub) bub._terms = S.terms;
     const [safe] = splitHold(S.full);
-    bub.innerHTML = mdToHtml(safe) + '<span class="pending-dot"></span>' +
+    // 注意：必须带 bub._refs，否则 meta 帧重绘会丢掉角标的 data-* 身份（点不动）
+    bub.innerHTML = mdToHtml(safe, bub._refs) + '<span class="pending-dot"></span>' +
       '<div class="hint" style="margin-top:6px">提供方：' + esc(f.provider || "—") +
       " · 检索路由：" + esc(f.route || "—") + "</div>";
   } else if (f.type === "notice") {
@@ -596,7 +604,7 @@ function renderNoteList() {
 
 /* 打开一条笔记（列表项已渲染时使用）。抽成具名函数，供问答引用跳转复用。
  * jump 非空时（B）：证据跳转 —— 打开后按 parent_id 定位证据块并高亮。 */
-async function openNoteItem(el, jump, nav) {
+async function openNoteItem(el, jump, nav, terms) {
     $$("#noteList .list-item").forEach(x => x.classList.remove("active"));
     el.classList.add("active");
     $("#noteTitleBar").textContent = el.querySelector(".t").textContent;
@@ -621,7 +629,7 @@ async function openNoteItem(el, jump, nav) {
       // 若该笔记默认开「原版」，先切回渲染视图再定位。
       NOTE.view = "rendered";
       setNoteView(NOTE.view);
-      await jumpToEvidence(el.dataset.path, jump, nav);
+      await jumpToEvidence(el.dataset.path, jump, nav, terms);
       return;
     }
     // C：打开一篇笔记即清掉上一次引用的持久高亮（用户主动切换了上下文）
@@ -631,7 +639,7 @@ async function openNoteItem(el, jump, nav) {
 }
 
 /* 按路径打开笔记：供问答内文角标 / 底部来源 chips 跳转使用 */
-async function openNoteByPath(path, jump, nav) {
+async function openNoteByPath(path, jump, nav, terms) {
   if (!path) return;
   if (nav != null && nav !== NOTE_NAV_SEQ) return;                 // B：守卫
   switchTab("notes");
@@ -647,7 +655,7 @@ async function openNoteByPath(path, jump, nav) {
   }
   if (!el) { toast("找不到该笔记（可能已被删除）", 3200); return; }
   el.scrollIntoView({ block: "center" });
-  await openNoteItem(el, jump, nav);
+  await openNoteItem(el, jump, nav, terms);
 }
 
 /* -------- B/A：证据精确定位（**源行锚点为主**，snippet 文本仅作旧索索引兜底） --------
@@ -668,7 +676,7 @@ function _clearEvidenceHighlight() {
     el.classList.remove("ev-hl", "ev-hl-persist"));
 }
 
-async function jumpToEvidence(path, jump, nav) {
+async function jumpToEvidence(path, jump, nav, terms) {
   const box = $("#noteView");
   if (!box || !jump) return;
   if (nav != null && nav !== NOTE_NAV_SEQ) return;                 // B：有更新的导航已覆盖
@@ -742,21 +750,27 @@ async function jumpToEvidence(path, jump, nav) {
     region = blocks.slice(start, end + 1);
   }
 
-  // 5) 高亮：上下文=淡蓝块；证据句=黄色保留；查询词不做永久 mark（A7 视觉语义）。
-  // C2：证据标识**持续可见** —— 首次 1s 较明显 pulse，然后转入较浅的 persistent 状态，
-  //     直到用户点击另一个 citation 或打开另一篇笔记才清除（不再 3.5s 后完全消失）。
+  // 5) 高亮：上下文=持久浅色块（左侧色边线）；**关键字=黄色 mark**。
+  //    跳过去必须「一眼看清命中在哪」—— 这是最基本的可用性，不能没有。
+  // 关键字来源优先级：
+  //   ① 后端 meta 帧下发的**问题实词**（干净，无 Markdown 污染）—— 主路径；
+  //   ② 退回从 ref.snippet 提炼的证据句（老帧/离线帧没有 terms 时才用）。
+  // 只在**已定位正确的 region 内**标记，绝不跨全文 fuzzy —— 不会重新引入目录误跳。
   region.forEach(b => { b.classList.remove("ev-hl-fade"); b.classList.add("ev-hl"); });
-  const phrases = _evidencePhrases(jump.snippet);
-  if (phrases.length) {
+  let kws = (terms || []).map(t => String(t || "").trim()).filter(t => t.length >= 2);
+  if (!kws.length) kws = _evidencePhrases(jump.snippet);
+  // 长词优先：避免「监测频率」先被短词「频率」切碎成两段 mark
+  kws.sort((a, b) => String(b).length - String(a).length);
+  if (kws.length) {
     region.forEach(b => {
       const walker = document.createTreeWalker(b, NodeFilter.SHOW_TEXT, null);
       const nodes = [];
       while (walker.nextNode()) nodes.push(walker.currentNode);
-      nodes.forEach(n => _markNode(n, phrases, "mark", "ev-ev"));
+      nodes.forEach(n => _markNode(n, kws, "mark", "ev-ev"));
     });
   }
   region[0].scrollIntoView({ block: "center", behavior: "smooth" });
-  // 1s 后从 pulse 转 persistent（仅调淡背景，保留左色边线 + 黄色证据句）
+  // 1s 后从 pulse 转 persistent（仅调淡背景，保留左色边线 + 黄色关键字）
   setTimeout(() => region.forEach(b => {
     if (b.classList.contains("ev-hl")) b.classList.replace("ev-hl", "ev-hl-persist");
   }), 1000);
@@ -771,15 +785,21 @@ function _evBlocks(box) {
   return Array.prototype.filter.call(box.children, b => b.dataset && b.dataset.srcStart);
 }
 function _evidencePhrases(snippet) {
-  // 从 ref.snippet 取真正出现在正文中的证据句：剥离高亮哨兵 \u0001/\u0002，按摘录顺序取前 3 片。
-  // 只负责「高亮哪一句」，不参与「跳到哪里」（跳转只用 source range，见 jumpToEvidence 主路径）。
+  // 从 ref.snippet 提炼**能真正匹配正文**的证据句片段（仅作老帧/离线帧兜底；
+  // 主路径是后端 meta 帧下发的 terms）。两个必踩的坑：
+  //   ① snippet 带 Markdown 语法（### / | / --- / ` ）→ 必须先剥掉，否则永远匹配不上；
+  //   ② 长句会跨越多个文本节点（标题/列表各自成节点）→ 必须按句读切成**短片段**。
   return String(snippet || "")
     .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, "")
-    .split(/[…\n]|\.\.\./)
-    .map(s => s.replace(/[  - 　]/g, " ").replace(/\s+/g, " ").trim())
-    .filter(s => s.length >= 8)
-    .slice(0, 3);
+    .replace(/[#>*`|]/g, " ")
+    .replace(/[-=]{3,}/g, " ")
+    .split(/[…\n]|\.\.\.|[。！？；;]/)
+    .map(t => t.replace(/\s+/g, " ").trim())
+    .filter(t => t.length >= 4)
+    .slice(0, 6);
 }
+
+
 function _markNode(node, terms, tag, cls) {
   // 在文本节点上包 <tag class=cls>，命中最长最靠前的一组 terms；不碰任何标签/属性。
   const text = node.nodeValue;
@@ -1449,8 +1469,11 @@ document.addEventListener("click", async function (ev) {
     source_start_line: Number(chip.dataset.srcStart) || 0,
     source_end_line: Number(chip.dataset.srcEnd) || 0,
   } : null;
+  // 高亮词取**本 bubble 自己那一轮**（turn-scoped），不用全局最新一轮
+  const bubble = chip.closest ? chip.closest(".bubble") : null;
+  const terms = (bubble && bubble._terms) || S.terms || [];
   const nav = ++NOTE_NAV_SEQ;             // B：本次导航序号
-  await openNoteByPath(path, jump, nav);
+  await openNoteByPath(path, jump, nav, terms);
 });
 
 /* ---------------------------- 绑定 ---------------------------- */

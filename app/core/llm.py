@@ -650,11 +650,18 @@ class Gateway:
             }
             for r in result.references
         ]
+        # 关键词高亮（UX）：把「问题实词」随 meta 帧下发，前端在**证据区域内**高亮这些词，
+        # 引用跳转后一眼看到命中点。为什么不让前端自己从 snippet 提取：ref.snippet 是带
+        # Markdown 语法（### / | / ---）的摘录，按文本精确匹配必然失败（用户真机反馈）。
+        hl_terms = [t for t in (search_mod.content_terms(query) or []) if len(t) >= 2]
+        if not hl_terms:
+            hl_terms = [t for t in (getattr(result, "lex_terms", None) or []) if len(t) >= 2]
         # 首帧注入引用溯源字典（PRD 5.3）
         yield {"type": "references", "refs": refs}
         yield {
             "type": "meta", "provider": provider, "route": result.route,
             "counts": result.counts, "warnings": warns + result.warnings,
+            "terms": hl_terms[:12],
         }
 
         if provider == "error":

@@ -121,6 +121,17 @@ title: "重复标题 fixture"
                                     "支护结构开裂", "其它异常情况")),
           prompt[-200:])
 
+    # F：引用跳转后的**关键字高亮** —— 高亮词来自「问题实词」，由后端 meta 帧下发。
+    # 为什么不让前端从 snippet 提取：snippet 带 Markdown 语法（### / | / ---），
+    # 文本精确匹配必然失败（用户真机反馈「跳过去后没有高亮」）。
+    f_terms = [t for t in search_mod.content_terms(q) if len(t) >= 2]
+    check("F 问题实词可作为高亮词（meta 帧 terms 来源）",
+          "监测频率" in f_terms, str(f_terms))
+    # 脏词过滤：单字/疑问词不进高亮词表（否则满屏乱标）
+    dirty = [t for t in search_mod.content_terms("水准仪是什么型号的") if len(t) < 2]
+    check("F 高亮词表按长度过滤（单字疑问词不入表）",
+          all(len(t) >= 2 for t in f_terms), str(dirty))
+
     section("C：日志格式化（Mapping 参数不得被强转）")
     import io
     import logging
