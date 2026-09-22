@@ -304,12 +304,138 @@ HO_C: list[tuple] = [
 ]
 
 
+# --------------------------------------------------------------------------
+# ATTRIBUTION DEV PACK（V1.1+）：专门测「相关 ≠ 存在事实关系」。
+# **与 Holdout 语料完全不同**；本轮算法开发只允许看这一套 + 原 DEV 72。
+# 正负样本接近 1:1；正例必须有 STRONG evidence unit，负例必须**不能**有。
+# --------------------------------------------------------------------------
+FIXTURES_ATTR = HERE / "fixtures_attribution"
+OUT_ATTR = HERE / "datasets" / "attribution_dev.jsonl"
+
+RF = "reservoir_flood.md"
+EQ = "equipment_ledger.md"
+SI = "storm_impact.md"
+BI = "bridge_inspection.md"
+
+# (id, category, query, doc, answer_state, anchor, target)
+AT_C: list[tuple] = [
+    # ---- causal：正例（同一 evidence unit 内成立）
+    ("ad_c01", "causal", "强降雨是否导致河流水位上涨？", RF, "yes", "强降雨", "河流水位上涨"),
+    ("ad_c02", "causal", "大风是否导致航班取消？", RF, "yes", "大风", "航班取消"),
+    ("ad_c03", "causal", "开闸泄洪是否导致下游水位下降？", RF, "yes", "开闸泄洪", "下游水位下降"),
+    ("ad_c06", "causal", "暴雨是否造成供电线路故障？", SI, "yes", "暴雨", "供电线路故障"),
+    ("ad_c07", "causal", "雷电是否造成通信基站受损？", SI, "yes", "雷电", "通信基站受损"),
+    ("ad_c10", "causal", "伸缩缝渗水是否由排水管堵塞引起？", BI, "yes", "排水管堵塞", "伸缩缝渗水"),
+    ("ad_c12", "causal", "主桥支座开裂是否由车辆超载引起？", BI, "yes", "车辆超载", "主桥支座开裂"),
+    # ---- causal：负例（两者都在文档里，但**不在同一 evidence unit**，且 target 归属他事件）
+    ("ad_c04", "causal", "强降雨是否导致航班取消？", RF, "no", "强降雨", "航班取消"),
+    ("ad_c05", "causal", "大风是否导致河流水位上涨？", RF, "no", "大风", "河流水位上涨"),
+    ("ad_c08", "causal", "暴雨是否造成通信基站受损？", SI, "no", "暴雨", "通信基站受损"),
+    ("ad_c09", "causal", "高温是否造成道路积水？", SI, "no", "高温", "道路积水"),
+    ("ad_c11", "causal", "引桥桥面铺装破损是否由车辆超载引起？", BI, "no", "车辆超载", "引桥桥面铺装破损"),
+    # ---- causal：INSUFFICIENT（anchor/target 都在，但没有任何关系证据）
+    ("ad_n01", "causal", "强降雨是否造成直接经济损失？", RF, "insufficient", "强降雨", "直接经济损失"),
+    ("ad_n02", "causal", "暴雨是否造成人员伤亡？", SI, "insufficient", "暴雨", "人员伤亡"),
+    ("ad_n03", "causal", "高温是否造成人员伤亡？", SI, "insufficient", "高温", "人员伤亡"),
+    # ---- impact
+    ("ad_i01", "impact", "强降雨造成了哪些影响？", RF, "yes", "强降雨", "农田受淹"),
+    ("ad_i02", "impact", "暴雨造成了哪些影响？", SI, "yes", "暴雨", "道路积水"),
+    ("ad_i03", "impact", "雷电造成了哪些影响？", SI, "yes", "雷电", "停电"),
+    # ---- property ownership
+    ("ad_p01", "property", "AQ-100 的量程是多少？", EQ, "yes", "AQ-100", "量程"),
+    ("ad_p02", "property", "AQ-110 的量程是多少？", EQ, "yes", "AQ-110", "量程"),
+    ("ad_p03", "property", "AQ-100 的责任人是谁？", EQ, "yes", "AQ-100", "责任人"),
+    ("ad_p06", "property", "AQ-100 的检定周期是 24 个月吗？", EQ, "no", "AQ-100", "24 个月"),
+    # ---- responsibility
+    ("ad_r01", "responsibility", "汛期水位调度由谁负责？", RF, "yes", "汛期水位调度", "水库管理局"),
+    ("ad_r02", "responsibility", "日常巡检由谁负责？", BI, "yes", "日常巡检", "养护一班"),
+    ("ad_r03", "responsibility", "专项检测由谁负责？", BI, "yes", "专项检测", "结构检测中心"),
+    ("ad_r05", "responsibility", "农田排涝是否由水库管理局负责？", RF, "no", "农田排涝", "水库管理局"),
+    ("ad_r06", "responsibility", "检定送检是否由测绘队负责？", EQ, "no", "检定送检", "测绘队"),
+    ("ad_r07", "responsibility", "应急检查是否由结构检测中心负责？", BI, "no", "应急检查", "结构检测中心"),
+    # ---- entity confusion（名称接近的实体，属性不同）
+    ("ad_x01", "confusion", "AQ-110 是否由张工负责？", EQ, "no", "AQ-110", "张工"),
+    ("ad_x02", "confusion", "AQ-110 的量程是 50m 吗？", EQ, "no", "AQ-110", "50m"),
+    ("ad_x03", "confusion", "AQ-100 的责任人是李工吗？", EQ, "no", "AQ-100", "李工"),
+    # ---- event attribution
+    ("ad_e01", "event", "哪个过程造成沥青软化？", SI, "yes", "高温", "沥青软化"),
+    ("ad_e02", "event", "航班取消是由哪个过程造成的？", RF, "yes", "大风", "航班取消"),
+]
+
+
+def _build_attr() -> int:
+    """Attribution Pack 专用校验：不仅要词在，还要**关系结构**成立。"""
+    from _relation import analyze_query, units_of           # noqa: PLC0415
+
+    docs = {p.name: p.read_text(encoding="utf-8") for p in FIXTURES_ATTR.glob("*.md")}
+    rows, problems = [], []
+    for (cid, cat, q, doc, state, anchor, target) in AT_C:
+        text = docs.get(doc)
+        if text is None:
+            problems.append(f"{cid}: fixture {doc} 不存在")
+            continue
+        for t in (anchor, target):
+            if t not in text:
+                problems.append(f"{cid}: {t!r} 不在 {doc} 中（题目不成立）")
+        units = units_of(text)
+        same_unit = [u for u in units
+                     if anchor in u["text"] and target in u["text"]]
+        if state == "yes" and not same_unit:
+            problems.append(f"{cid}: 正例但找不到同一 evidence unit 内共现 —— "
+                            f"anchor={anchor!r} target={target!r}")
+        if state in ("no", "insufficient") and same_unit:
+            problems.append(f"{cid}: 负例/无证据题却在同一 unit 内共现 "
+                            f"（{same_unit[0]['kind']}: {same_unit[0]['text'][:40]!r}）")
+        # 解析器自检：确定性解析必须能从 query 里还原出 anchor / target
+        pa = analyze_query(q)
+        if anchor is not None and pa["anchor"] and pa["anchor"] != anchor:
+            problems.append(f"{cid}: 解析 anchor={pa['anchor']!r} != 声明 {anchor!r}")
+        if anchor is not None and not pa["anchor"] and cat != "event":
+            problems.append(f"{cid}: 解析不出 anchor（声明 {anchor!r}）")
+        pt = pa.get("value") or pa.get("target")
+        if target and pt and pt != target and cat not in ("impact",):
+            problems.append(f"{cid}: 解析 target={pt!r} != 声明 {target!r}")
+        rows.append({
+            "id": cid, "category": cat, "split": "attribution_dev", "query": q,
+            "expected": {
+                "doc": doc, "answer_state": state,
+                "anchor": anchor, "target": target,
+                "relation_type": pa.get("relation_type"),
+                "must_contain": [anchor, target], "must_not_contain": [],
+            },
+            "evidence_groups": [],
+        })
+
+    if problems:
+        print("ATTRIBUTION GOLD INTEGRITY FAILED:")
+        for p in problems:
+            print("  -", p)
+        return 1
+    OUT_ATR_SAFE = OUT_ATTR
+    OUT_ATR_SAFE.parent.mkdir(parents=True, exist_ok=True)
+    with OUT_ATTR.open("w", encoding="utf-8") as fh:
+        for r in rows:
+            fh.write(json.dumps(r, ensure_ascii=False) + "\n")
+    from collections import Counter
+    cnt = Counter(r["category"] for r in rows)
+    st = Counter(r["expected"]["answer_state"] for r in rows)
+    print(f"OK [attribution_dev] 写出 {len(rows)} 条 → {OUT_ATTR}")
+    for k, v in sorted(cnt.items()):
+        print(f"   {k:20s} {v}")
+    print(f"   answer_state: {dict(st)}  → 正例 {st['yes']} / 非正例 "
+          f"{st['no'] + st['insufficient']}")
+    return 0
+
+
 def main() -> int:
     rc = _build(C, FIXTURES, OUT, "dev")
     if rc != 0:
         return rc
     print()
-    return _build(HO_C, FIXTURES_HOLDOUT, OUT_HOLDOUT, "holdout")
+    if _build(HO_C, FIXTURES_HOLDOUT, OUT_HOLDOUT, "holdout") != 0:
+        return 1
+    print()
+    return _build_attr()
 
 
 def _build(case_list, fixtures_dir: Path, out: Path, split: str) -> int:

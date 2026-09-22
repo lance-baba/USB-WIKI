@@ -217,6 +217,66 @@ python3 eval/run_eval.py compare --candidate reranker
 这类"实体↔值"问题上启用（这两类确实 +20~40pp）；② 按需加载 + 高配才开，避免常驻内存；
 ③ 先解决 rerank 后 top-1 反而变差的 5~6 题再谈上线。
 
+## Attribution Guard Spike V1（2026-09-22，`attribution_guard_spike.py`）
+
+命题：**「相关」≠「存在事实关系」。** 同一 parent 共现、同一文档、相邻章节、名称相近的实体，
+都**不构成**「A 导致 B / A 具有 B 属性 / A 负责 B」的证据。
+
+Pipeline（生产检索**不变**，只在后面加一层）：
+`hybrid_search()` → candidate parents → **Evidence Unit 切分** → **Attribution Guard** → YES / NO / INSUFFICIENT_RELATION
+
+- **Evidence Unit**（`_relation.units_of`）：同一 table row（**表头+数据行合并**，否则「量程」这类
+  属性名只在表头、数据行永远匹配不到）＞ 同一 list item ＞ 同一句。
+  「只在同一 parent / 同一文档 / 分属 sibling section」= **INVALID**，不得作为关系证据。
+- **Query Relation Analysis**（`_relation.analyze_query`）：纯正则、**无 LLM**，解析出
+  `{anchor, target, relation_type}`，支持 causal（含 `X 是否由 Y 引起` 的角色互换）、
+  responsibility（含 `X 由谁负责`）、property（含属性断言 `X 的 Y 是 Z 吗`）、impact、event。
+
+### Attribution DEV Pack（`datasets/attribution_dev.jsonl`，33 题）
+
+语料 `fixtures_attribution/`（4 篇：汛情通报 / 仪器台账 / 天气影响 / 桥梁巡检），
+**与 Holdout 语料完全不同**；正例 **18** : 非正例 **15**（≈1.2:1）。
+`build_gold.py` 的校验不仅要求词存在，还要求**关系结构**成立：
+正例必须存在同一 evidence unit 的共现；负例**禁止**同 unit 共现；且**每条 query 必须能被
+确定性解析器解出正确的 anchor/target**（这条自检当场抓出 11 处解析器/语料缺陷）。
+
+| 指标 | Baseline（只看共现） | Candidate（guard） | 门槛 |
+| --- | --- | --- | --- |
+| False Association Rate | 86.7% | **0.0%** | ≤5% ✅ |
+| Positive Relation Accuracy | 100% | **100%** | ≥90% ✅ |
+| Negative Relation Accuracy | 0% | **100%** | ≥90% ✅ |
+| Abstention Accuracy | 0% | **100%** | — |
+| Attribution Precision | 58.1% | **100%** | — |
+| guard 自身耗时 | — | **2.4 ms/query** | <20ms ✅ |
+
+> 「Baseline」= 现系统的语义：anchor 与 target 都出现就当有关系 → **误关联 86.7%**。
+> 这就是 holdout 上 attribution 25% 的同一个病根。
+
+### 原 DEV 72 回归（同口径，`depth_control.A0`）
+
+Recall@1/@3/@5 **+0.0pp** · Coverage group/full **+0.0pp** · Relation **+0.0pp** ·
+Wrong-doc **+0.0pp** · No-answer FP **+0.0pp** · Attribution err **+0.0pp**。
+（guard 是**加法标注层**，不改排序；MRR/wrong-doc 若与 `baseline.json` 比会出现 ±1.5pp 的
+差异，那纯粹是两者 gold 匹配口径不同，必须换同口径基线比较，否则会把「口径差」误报成退化。）
+
+### ⚠ 最重要的风险：guard 会误伤普通事实题
+
+**不加限制地套用 guard：DEV 72 的 24 道关系型查询里有 15 道（62%）被误拦**，
+例如「监测的目的是什么？」「Qwen-Image-2.1 的功能有哪些？」——它们本该正常回答。
+
+按解析类型拆开看：DEV 的关系型查询 **22/24 是 `property`**，被误拦的 15 道里 **13 道是 `property`**。
+
+**结论：guard 不能作为全局层。** 作用域应限定为
+**`causal` / `event` / `responsibility`（+ 实体归属冲突）**：
+
+| 作用域 | DEV 误拦 | Attribution 覆盖 |
+| --- | --- | --- |
+| 全部关系型 | 15 / 24 | 33 / 33 |
+| 仅 causal + event + responsibility | **1 / 2** | **24 / 33** |
+
+被排除的 9 题（property 4 + impact 3 + confusion 2）需要**另一套更温和的处理**
+（属性归属校验，而不是直接弃答）。**本轮到此为止，不改生产。**
+
 ## 下一实验（仅登记设计，本轮不实现）
 
 ```text
