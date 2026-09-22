@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-09-22 21:50:25",
+  "generated_at": "2026-09-22 22:01:17",
   "attribution": {
     "baseline": {
       "n": 33,
@@ -143,7 +143,7 @@
         "state": "no",
         "guard": "NO",
         "naive": "YES",
-        "reason": "该结果归属于「冻融循环」，不是「车辆超载」",
+        "reason": "该结果归属于「引桥桥面铺装破损由冻融循环」，不是「车辆超载」",
         "unit": "引桥桥面铺装破损由冻融循环引起。"
       },
       {
@@ -357,7 +357,7 @@
         "unit": "大风导致 12 个航班取消。"
       }
     ],
-    "guard_ms_per_query": 2.36,
+    "guard_ms_per_query": 2.39,
     "cases": 33,
     "by_category": {
       "causal": 15,
@@ -381,10 +381,10 @@
       "no_answer_fp_rate": 0.0,
       "attribution_violation_rate": 0.0
     },
-    "relation_type_queries": 24,
+    "relation_type_queries": 25,
     "cases": 72,
-    "pipeline_ms_per_query": 2.41,
-    "guard_blocked_normal_queries": 15,
+    "pipeline_ms_per_query": 2.44,
+    "guard_blocked_normal_queries": 16,
     "guard_blocked_ids": [
       {
         "id": "jkj_df_purpose",
@@ -475,6 +475,12 @@
         "category": "similar_entity",
         "query": "预警时对应的监测频率是多少？",
         "guard": "INSUFFICIENT_RELATION"
+      },
+      {
+        "id": "wea_at_temp_drop",
+        "category": "attribution",
+        "query": "哪个天气过程导致气温下降 6～8℃？",
+        "guard": "INSUFFICIENT_RELATION"
       }
     ]
   },
@@ -490,202 +496,8 @@
     "no_answer_fp_rate": 0.0,
     "attribution_violation_rate": 0.0
   },
-  "holdout": {
-    "ho_df_calib": {
-      "query": "裂缝观测仪的校准有效期是多久？",
-      "state": "answered",
-      "guard": "INSUFFICIENT_RELATION",
-      "naive": "INSUFFICIENT_RELATION",
-      "reason": "分别找到 anchor / target，但没有直接关系证据",
-      "forbidden": []
-    },
-    "ho_df_who_report": {
-      "query": "桥梁监测报告的编制由谁负责？",
-      "state": "answered",
-      "guard": "INSUFFICIENT_RELATION",
-      "naive": "INSUFFICIENT_RELATION",
-      "reason": "检索证据中未出现 anchor/target",
-      "forbidden": []
-    },
-    "ho_q_temp_range": {
-      "query": "结构温度测点的编号范围是什么？",
-      "state": "answered",
-      "guard": "INSUFFICIENT_RELATION",
-      "naive": "INSUFFICIENT_RELATION",
-      "reason": "分别找到 anchor / target，但没有直接关系证据",
-      "forbidden": []
-    },
-    "ho_p_detectors": {
-      "query": "桥梁的现场检测员是谁？",
-      "state": "answered",
-      "guard": "INSUFFICIENT_RELATION",
-      "naive": "INSUFFICIENT_RELATION",
-      "reason": "分别找到 anchor / target，但没有直接关系证据",
-      "forbidden": []
-    },
-    "ho_p_tunnel_leader": {
-      "query": "隧道监测的负责人是谁？",
-      "state": "answered",
-      "guard": "INSUFFICIENT_RELATION",
-      "naive": "INSUFFICIENT_RELATION",
-      "reason": "分别找到 anchor / target，但没有直接关系证据",
-      "forbidden": []
-    },
-    "ho_m_bridge_station": {
-      "query": "桥梁监测使用的是哪种全站仪？",
-      "state": "answered",
-      "guard": "INSUFFICIENT_RELATION",
-      "naive": "INSUFFICIENT_RELATION",
-      "reason": "检索证据中未出现 anchor/target",
-      "forbidden": [
-        "徕卡TS09"
-      ]
-    },
-    "ho_m_crack_model": {
-      "query": "桥梁监测的裂缝观测仪是什么型号？",
-      "state": "answered",
-      "guard": "NO",
-      "naive": "INSUFFICIENT_RELATION",
-      "reason": "该属性属于「LF-20」，不是「桥梁监测」",
-      "forbidden": []
-    },
-    "ho_m_tunnel_station": {
-      "query": "隧道监测使用的全站仪是什么型号？",
-      "state": "answered",
-      "guard": "INSUFFICIENT_RELATION",
-      "naive": "INSUFFICIENT_RELATION",
-      "reason": "分别找到 anchor / target，但没有直接关系证据",
-      "forbidden": [
-        "TS16"
-      ]
-    },
-    "ho_m_level_bridge": {
-      "query": "桥梁监测使用的静力水准仪是什么型号？",
-      "state": "answered",
-      "guard": "NO",
-      "naive": "INSUFFICIENT_RELATION",
-      "reason": "该属性属于「JZ-5」，不是「桥梁监测使用」",
-      "forbidden": []
-    },
-    "ho_tr_bridge_table": {
-      "query": "桥梁监测仪器表中静力水准仪的数量是多少？",
-      "state": "answered",
-      "guard": "NO",
-      "naive": "INSUFFICIENT_RELATION",
-      "reason": "该属性属于「JZ-5」，不是「桥梁监测仪器表中静力水准仪」",
-      "forbidden": []
-    },
-    "ho_tr_tunnel_table": {
-      "query": "隧道监测仪器表中收敛计的型号与数量？",
-      "state": "answered",
-      "guard": "INSUFFICIENT_RELATION",
-      "naive": "INSUFFICIENT_RELATION",
-      "reason": "检索证据中未出现 anchor/target",
-      "forbidden": []
-    },
-    "ho_tr_lf_resolution": {
-      "query": "LF-20 的分辨率是多少？",
-      "state": "answered",
-      "guard": "NO",
-      "naive": "YES",
-      "reason": "该属性属于「LF-30」，不是「LF-20」",
-      "forbidden": []
-    },
-    "ho_tr_lf30_weight": {
-      "query": "LF-30 的整机重量是多少？",
-      "state": "answered",
-      "guard": "YES",
-      "naive": "YES",
-      "reason": "同一 line 内共现",
-      "forbidden": []
-    },
-    "ho_lc_bridge_items": {
-      "query": "本桥的监测项目包括哪些？",
-      "state": "answered",
-      "guard": "INSUFFICIENT_RELATION",
-      "naive": "INSUFFICIENT_RELATION",
-      "reason": "分别找到 anchor / target，但没有直接关系证据",
-      "forbidden": []
-    },
-    "ho_se_lf_resolution_diff": {
-      "query": "LF-20 与 LF-30 的分辨率有什么区别？",
-      "state": "answered",
-      "guard": "INSUFFICIENT_RELATION",
-      "naive": "INSUFFICIENT_RELATION",
-      "reason": "检索证据中未出现 anchor/target",
-      "forbidden": []
-    },
-    "ho_se_jz5_what": {
-      "query": "JZ-5 是什么类型的仪器？",
-      "state": "answered",
-      "guard": "NO",
-      "naive": "INSUFFICIENT_RELATION",
-      "reason": "该属性属于「JZ-5」，不是「JZ-5 是什么类型」",
-      "forbidden": [
-        "裂缝观测仪"
-      ]
-    },
-    "ho_at_cold_area": {
-      "query": "寒潮影响了哪些地区？",
-      "state": "answered",
-      "guard": "PASS_THROUGH",
-      "naive": "PASS_THROUGH",
-      "reason": "非关系型查询",
-      "forbidden": [
-        "江苏南部"
-      ]
-    },
-    "ho_at_sand_area": {
-      "query": "沙尘过程影响了哪些地区？",
-      "state": "answered",
-      "guard": "PASS_THROUGH",
-      "naive": "PASS_THROUGH",
-      "reason": "非关系型查询",
-      "forbidden": [
-        "内蒙古"
-      ]
-    },
-    "ho_at_fog_effect": {
-      "query": "大雾造成了什么影响？",
-      "state": "answered",
-      "guard": "YES",
-      "naive": "YES",
-      "reason": "找到「大雾」的因果单元",
-      "forbidden": [
-        "PM10"
-      ]
-    },
-    "ho_at_sand_fog": {
-      "query": "沙尘天气是否导致高速公路临时封闭？",
-      "state": "insufficient",
-      "guard": "INSUFFICIENT_RELATION",
-      "naive": "INSUFFICIENT_RELATION",
-      "reason": "分别找到 anchor / target，但没有直接关系证据",
-      "forbidden": [
-        "高速公路"
-      ]
-    },
-    "ho_neg_waterproof": {
-      "query": "LF 系列裂缝观测仪的防水等级是多少？",
-      "state": "insufficient",
-      "guard": "INSUFFICIENT_RELATION",
-      "naive": "INSUFFICIENT_RELATION",
-      "reason": "分别找到 anchor / target，但没有直接关系证据",
-      "forbidden": [
-        "防水",
-        "IP"
-      ]
-    },
-    "ho_so_alert": {
-      "query": "桥梁监测的预警指标有哪些？",
-      "state": "answered",
-      "guard": "INSUFFICIENT_RELATION",
-      "naive": "INSUFFICIENT_RELATION",
-      "reason": "检索证据中未出现 anchor/target",
-      "forbidden": []
-    }
-  },
-  "ho_at_sand_fog_fixed": true,
+  "holdout": null,
+  "ho_at_sand_fog_fixed": null,
   "dev_baseline_source": "depth_control.A0（同口径）",
-  "elapsed_s": 0.6
+  "elapsed_s": 0.5
 }

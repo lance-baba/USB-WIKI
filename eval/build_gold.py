@@ -427,6 +427,164 @@ def _build_attr() -> int:
     return 0
 
 
+# --------------------------------------------------------------------------
+# ROUTER DEV PACK（V1.1+）：测 Scope Router —— 该不该进 Attribution Guard。
+# ≥50% 是**边界负例**：看起来像关系问题，实际必须 PASS_THROUGH。
+# 覆盖 工程 / 设备 / 天气 / 制度 四个领域。
+# --------------------------------------------------------------------------
+FIXTURES_ROUTER = HERE / "fixtures_router"
+OUT_ROUTER = HERE / "datasets" / "router_dev.jsonl"
+
+RR = "router_reservoir.md"
+RD = "router_device.md"
+RW = "router_weather.md"
+RP = "router_policy.md"
+
+G = "ATTRIBUTION_GUARD"
+P_ = "PASS_THROUGH"
+
+# (id, domain, query, doc, route, relation_type, anchor, target, answer_state)
+RT_C: list[tuple] = [
+    # ================= causal（进 Guard） =================
+    ("rt_c01", "工程", "强降雨是否导致河水水位上涨？", RR, G, "causal", "强降雨", "河水水位上涨", "yes"),
+    ("rt_c02", "工程", "大风是否导致航班取消？", RR, G, "causal", "大风", "航班取消", "yes"),
+    ("rt_c03", "工程", "强降雨是否导致堤防渗水？", RR, G, "causal", "强降雨", "堤防渗水", "yes"),
+    ("rt_c04", "工程", "强降雨是否导致航班取消？", RR, G, "causal", "强降雨", "航班取消", "no"),
+    ("rt_c05", "工程", "大风是否导致河水水位上涨？", RR, G, "causal", "大风", "河水水位上涨", "no"),
+    ("rt_c06", "天气", "高温是否导致用电负荷上升？", RW, G, "causal", "高温", "用电负荷上升", "yes"),
+    ("rt_c07", "天气", "台风是否导致乡镇停电？", RW, G, "causal", "台风", "乡镇停电", "yes"),
+    ("rt_c08", "天气", "高温是否导致停航？", RW, G, "causal", "高温", "停航", "no"),
+    ("rt_c09", "天气", "台风是否导致路面软化？", RW, G, "causal", "台风", "路面软化", "no"),
+    ("rt_c10", "工程", "强降雨是否导致广告牌坠落？", RR, G, "causal", "强降雨", "广告牌坠落", "no"),
+    ("rt_c11", "设备", "采集中断是否由供电不稳引起？", RD, G, "causal", "供电不稳", "采集中断", "yes"),
+    ("rt_c12", "设备", "数据跳变是否由供电不稳引起？", RD, G, "causal", "供电不稳", "数据跳变", "no"),
+    ("rt_c13", "设备", "数据跳变是否由接地不良引起？", RD, G, "causal", "接地不良", "数据跳变", "yes"),
+    ("rt_c14", "工程", "强降雨是否导致直接经济损失？", RR, G, "causal", "强降雨", "直接经济损失", "insufficient"),
+    # ================= event（进 Guard） =================
+    ("rt_e01", "天气", "哪个过程导致停航？", RW, G, "event", "台风", "停航", "yes"),
+    ("rt_e02", "工程", "航班取消是由哪个过程造成的？", RR, G, "event", "大风", "航班取消", "yes"),
+    ("rt_e03", "天气", "哪个过程导致路面软化？", RW, G, "event", "高温", "路面软化", "yes"),
+    ("rt_e04", "天气", "停电是由哪个天气过程造成的？", RW, G, "event", "台风", "停电", "yes"),
+    ("rt_e05", "设备", "采集中断是由什么原因引起的？", RD, G, "event", "供电不稳", "采集中断", "yes"),
+    ("rt_e06", "设备", "哪个原因导致数据跳变？", RD, G, "event", "接地不良", "数据跳变", "yes"),
+    ("rt_e07", "工程", "堤防渗水是由哪个过程造成的？", RR, G, "event", "强降雨", "堤防渗水", "yes"),
+    ("rt_e08", "工程", "广告牌坠落是由哪个过程造成的？", RR, G, "event", "大风", "广告牌坠落", "yes"),
+    # ================= responsibility（进 Guard） =================
+    ("rt_r01", "工程", "泄洪调度由谁负责？", RR, G, "responsibility", "泄洪调度", "水库调度中心", "yes"),
+    ("rt_r02", "工程", "堤防巡查由谁负责？", RR, G, "responsibility", "堤防巡查", "河道管理站", "yes"),
+    ("rt_r03", "设备", "日常维护由谁负责？", RD, G, "responsibility", "日常维护", "现场组", "yes"),
+    ("rt_r04", "设备", "故障返修由谁负责？", RD, G, "responsibility", "故障返修", "厂家技术支持", "yes"),
+    ("rt_r05", "制度", "设备采购由谁负责？", RP, G, "responsibility", "设备采购", "综合管理部", "yes"),
+    ("rt_r06", "制度", "成果归档由谁负责？", RP, G, "responsibility", "成果归档", "资料室", "yes"),
+    ("rt_r07", "制度", "安全培训由谁负责？", RP, G, "responsibility", "安全培训", "安全办", "yes"),
+    ("rt_r08", "制度", "安全培训是否由安全办负责？", RP, G, "responsibility", "安全培训", "安全办", "yes"),
+    ("rt_r09", "制度", "设备采购是否由资料室负责？", RP, G, "responsibility", "设备采购", "资料室", "no"),
+    ("rt_r10", "制度", "成果归档是否由综合管理部负责？", RP, G, "responsibility", "成果归档", "综合管理部", "no"),
+    ("rt_r11", "工程", "泄洪调度是否由河道管理站负责？", RR, G, "responsibility", "泄洪调度", "河道管理站", "no"),
+    ("rt_r12", "设备", "日常维护是否由厂家技术支持负责？", RD, G, "responsibility", "日常维护", "厂家技术支持", "no"),
+    ("rt_r13", "工程", "堤防巡查是否由水库调度中心负责？", RR, G, "responsibility", "堤防巡查", "水库调度中心", "no"),
+    ("rt_r14", "设备", "故障返修是否由现场组负责？", RD, G, "responsibility", "故障返修", "现场组", "no"),
+    # ============ 边界负例：必须 PASS_THROUGH ============
+    ("rt_p01", "工程", "大坝的设计库容是多少？", RR, P_, None, None, None, None),
+    ("rt_p02", "工程", "坝顶高程是多少？", RR, P_, None, None, None, None),
+    ("rt_p03", "设备", "RT-100 的通道数是多少？", RD, P_, None, None, None, None),
+    ("rt_p04", "设备", "RT-200 的采样率是多少？", RD, P_, None, None, None, None),
+    ("rt_p05", "设备", "RT-100 的责任工程师是谁？", RD, P_, None, None, None, None),
+    ("rt_p06", "制度", "项目负责人的职责是什么？", RP, P_, None, None, None, None),
+    ("rt_p07", "制度", "监测组长的职责是什么？", RP, P_, None, None, None, None),
+    ("rt_p08", "制度", "数据处理员负责什么工作？", RP, P_, None, None, None, None),
+    ("rt_p09", "设备", "RT 系列采集仪是什么型号？", RD, P_, None, None, None, None),
+    ("rt_p10", "设备", "采集仪支持哪些功能？", RD, P_, None, None, None, None),
+    ("rt_p11", "设备", "RT 采集仪用于什么？", RD, P_, None, None, None, None),
+    ("rt_p12", "设备", "采集仪有哪些型号？", RD, P_, None, None, None, None),
+    ("rt_p13", "工程", "本轮共接报多少起灾情？", RR, P_, None, None, None, None),
+    ("rt_p14", "天气", "8 月共发布多少次预警？", RW, P_, None, None, None, None),
+    ("rt_p15", "天气", "停电影响了多少个村？", RW, P_, None, None, None, None),
+    ("rt_p16", "设备", "RT-200 有多少个通道？", RD, P_, None, None, None, None),
+    ("rt_p17", "制度", "监测项目有哪些岗位？", RP, P_, None, None, None, None),
+    ("rt_p18", "设备", "RT 系列的责任工程师有哪些人？", RD, P_, None, None, None, None),
+    ("rt_p19", "天气", "8 月天气过程包括哪些？", RW, P_, None, None, None, None),
+    ("rt_p20", "制度", "本项目有哪些管理人员？", RP, P_, None, None, None, None),
+    ("rt_p21", "设备", "RT 系列采集仪有哪些功能？", RD, P_, None, None, None, None),
+    ("rt_p22", "制度", "监测项目的工作流程包括哪些环节？", RP, P_, None, None, None, None),
+    ("rt_p23", "工程", "强降雨过程造成了哪些损失？", RR, P_, None, None, None, None),
+    ("rt_p24", "天气", "台风过程造成了哪些影响？", RW, P_, None, None, None, None),
+    ("rt_p25", "制度", "责任划分是怎么规定的？", RP, P_, None, None, None, None),
+    ("rt_p26", "制度", "岗位职责是怎么规定的？", RP, P_, None, None, None, None),
+    ("rt_p27", "天气", "8 月天气过程情况怎么样？", RW, P_, None, None, None, None),
+    ("rt_p28", "制度", "本制度的目的是什么？", RP, P_, None, None, None, None),
+    ("rt_p29", "天气", "本轮天气过程的预警发布情况如何？", RW, P_, None, None, None, None),
+    ("rt_p30", "设备", "采集中断的常见原因有哪些？", RD, P_, None, None, None, None),
+    ("rt_p31", "工程", "停航影响范围是什么？", RW, P_, None, None, None, None),
+    ("rt_p32", "设备", "数据跳变的常见原因是什么？", RD, P_, None, None, None, None),
+    ("rt_p33", "工程", "强降雨影响了哪些地区？", RR, P_, None, None, None, None),
+    ("rt_p34", "天气", "台风影响了哪些地区？", RW, P_, None, None, None, None),
+    ("rt_p35", "天气", "高温有哪些影响？", RW, P_, None, None, None, None),
+    ("rt_p36", "天气", "停电影响了哪些对象？", RW, P_, None, None, None, None),
+]
+
+
+def _build_router() -> int:
+    """Router Pack 专用校验：**路由期望必须与确定性解析器一致**。"""
+    from _relation import route_attribution  # noqa: PLC0415
+
+    docs = {p.name: p.read_text(encoding="utf-8") for p in FIXTURES_ROUTER.glob("*.md")}
+    rows, problems = [], []
+    n_guard = n_pass = 0
+    for (cid, dom, q, doc, rte, rtype, anchor, target, state) in RT_C:
+        text = docs.get(doc)
+        if text is None:
+            problems.append(f"{cid}: fixture {doc} 不存在")
+            continue
+        got = route_attribution(q)
+        if got != rte:
+            problems.append(f"{cid}: 路由期望 {rte} 但解析器给出 {got} —— {q}")
+        if rte == G:
+            n_guard += 1
+            if rtype not in ("causal", "event", "responsibility"):
+                problems.append(f"{cid}: 进 Guard 的 relation_type 必须是 causal/event/responsibility")
+            if state not in ("yes", "no", "insufficient"):
+                problems.append(f"{cid}: 进 Guard 必须有 answer_state")
+            a, t = anchor, target
+            if a not in text or t not in text:
+                problems.append(f"{cid}: anchor/target 不在 {doc} 中")
+            same = any(a in u and t in u for u in _units_of(text))
+            if state == "yes" and not same:
+                problems.append(f"{cid}: 正例但无同一 evidence unit 共现")
+            if state == "no" and same:
+                problems.append(f"{cid}: 负例却在同一 unit 共现")
+        else:
+            n_pass += 1
+        rows.append({
+            "id": cid, "split": "router_dev", "domain": dom, "query": q,
+            "expected_route": rte,
+            "expected": {"doc": doc, "relation_type": rtype, "anchor": anchor,
+                         "target": target, "answer_state": state},
+        })
+
+    if problems:
+        print("ROUTER GOLD INTEGRITY FAILED:")
+        for p in problems:
+            print("  -", p)
+        return 1
+    OUT_ROUTER.parent.mkdir(parents=True, exist_ok=True)
+    with OUT_ROUTER.open("w", encoding="utf-8") as fh:
+        for r in rows:
+            fh.write(json.dumps(r, ensure_ascii=False) + "\n")
+    from collections import Counter
+    dom = Counter(r["domain"] for r in rows)
+    print(f"OK [router_dev] 写出 {len(rows)} 条 → {OUT_ROUTER}")
+    print(f"   GUARD {n_guard} / PASS_THROUGH {n_pass} "
+          f"（边界负例占比 {n_pass/len(rows)*100:.0f}%）")
+    print(f"   领域分布: {dict(dom)}")
+    return 0
+
+
+def _units_of(text: str) -> list[str]:
+    from _relation import units_of  # noqa: PLC0415
+    return [u["text"] for u in units_of(text)]
+
+
 def main() -> int:
     rc = _build(C, FIXTURES, OUT, "dev")
     if rc != 0:
@@ -435,7 +593,10 @@ def main() -> int:
     if _build(HO_C, FIXTURES_HOLDOUT, OUT_HOLDOUT, "holdout") != 0:
         return 1
     print()
-    return _build_attr()
+    if _build_attr() != 0:
+        return 1
+    print()
+    return _build_router()
 
 
 def _build(case_list, fixtures_dir: Path, out: Path, split: str) -> int:

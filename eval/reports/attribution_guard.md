@@ -1,6 +1,6 @@
 # USB-WIKI · Attribution Guard Spike V1
 
-- 生成：2026-09-22 21:50:25
+- 生成：2026-09-22 22:01:17
 - Attribution DEV Pack：**33 题**（{'causal': 15, 'impact': 3, 'property': 4, 'responsibility': 6, 'confusion': 3, 'event': 2}）
 - 生产代码未改动；**未加载任何 reranker**；guard 为纯确定性逻辑。
 
@@ -32,7 +32,7 @@
 | ad_c05 | causal | no | `NO` | 该结果归属于「强降雨」，不是「大风」 |
 | ad_c08 | causal | no | `NO` | 该结果归属于「雷电」，不是「暴雨」 |
 | ad_c09 | causal | no | `NO` | 该结果归属于「暴雨」，不是「高温」 |
-| ad_c11 | causal | no | `NO` | 该结果归属于「冻融循环」，不是「车辆超载」 |
+| ad_c11 | causal | no | `NO` | 该结果归属于「引桥桥面铺装破损由冻融循环」，不是「车辆超载」 |
 | ad_n01 | causal | insufficient | `INSUFFICIENT_RELATION` | 分别找到 anchor / target，但没有直接关系证据 |
 | ad_n02 | causal | insufficient | `INSUFFICIENT_RELATION` | 分别找到 anchor / target，但没有直接关系证据 |
 | ad_n03 | causal | insufficient | `INSUFFICIENT_RELATION` | 分别找到 anchor / target，但没有直接关系证据 |
@@ -71,39 +71,10 @@
 | no_answer_fp_rate | 0.0% | +0.0pp |
 | attribution_violation_rate | 0.0% | +0.0pp |
 
-- 关系型查询数：24 / 72
-- ⚠ **guard 在 DEV 72 上误拦了 15 道本可回答的普通题** → 说明 guard 不能无差别地套在所有关系型查询上
-- 端到端耗时（检索+guard）：2.41 ms/query
-- **guard 自身耗时：2.36 ms/query**（目标 < 20ms）
-
-## Holdout A 验证（算法定稿后仅跑一次）
-
-| id | 期望 | guard | baseline | 说明 |
-| --- | --- | --- | --- | --- |
-| ho_df_calib | answered | `INSUFFICIENT_RELATION` | INSUFFICIENT_RELATION | 分别找到 anchor / target，但没有直接关系证据 |
-| ho_df_who_report | answered | `INSUFFICIENT_RELATION` | INSUFFICIENT_RELATION | 检索证据中未出现 anchor/target |
-| ho_q_temp_range | answered | `INSUFFICIENT_RELATION` | INSUFFICIENT_RELATION | 分别找到 anchor / target，但没有直接关系证据 |
-| ho_p_detectors | answered | `INSUFFICIENT_RELATION` | INSUFFICIENT_RELATION | 分别找到 anchor / target，但没有直接关系证据 |
-| ho_p_tunnel_leader | answered | `INSUFFICIENT_RELATION` | INSUFFICIENT_RELATION | 分别找到 anchor / target，但没有直接关系证据 |
-| ho_m_bridge_station | answered | `INSUFFICIENT_RELATION` | INSUFFICIENT_RELATION | 检索证据中未出现 anchor/target |
-| ho_m_crack_model | answered | `NO` | INSUFFICIENT_RELATION | 该属性属于「LF-20」，不是「桥梁监测」 |
-| ho_m_tunnel_station | answered | `INSUFFICIENT_RELATION` | INSUFFICIENT_RELATION | 分别找到 anchor / target，但没有直接关系证据 |
-| ho_m_level_bridge | answered | `NO` | INSUFFICIENT_RELATION | 该属性属于「JZ-5」，不是「桥梁监测使用」 |
-| ho_tr_bridge_table | answered | `NO` | INSUFFICIENT_RELATION | 该属性属于「JZ-5」，不是「桥梁监测仪器表中静力水准仪」 |
-| ho_tr_tunnel_table | answered | `INSUFFICIENT_RELATION` | INSUFFICIENT_RELATION | 检索证据中未出现 anchor/target |
-| ho_tr_lf_resolution | answered | `NO` | YES | 该属性属于「LF-30」，不是「LF-20」 |
-| ho_tr_lf30_weight | answered | `YES` | YES | 同一 line 内共现 |
-| ho_lc_bridge_items | answered | `INSUFFICIENT_RELATION` | INSUFFICIENT_RELATION | 分别找到 anchor / target，但没有直接关系证据 |
-| ho_se_lf_resolution_diff | answered | `INSUFFICIENT_RELATION` | INSUFFICIENT_RELATION | 检索证据中未出现 anchor/target |
-| ho_se_jz5_what | answered | `NO` | INSUFFICIENT_RELATION | 该属性属于「JZ-5」，不是「JZ-5 是什么类型」 |
-| ho_at_cold_area | answered | `PASS_THROUGH` | PASS_THROUGH | 非关系型查询 |
-| ho_at_sand_area | answered | `PASS_THROUGH` | PASS_THROUGH | 非关系型查询 |
-| ho_at_fog_effect | answered | `YES` | YES | 找到「大雾」的因果单元 |
-| ho_at_sand_fog | insufficient | `INSUFFICIENT_RELATION` | INSUFFICIENT_RELATION | 分别找到 anchor / target，但没有直接关系证据 |
-| ho_neg_waterproof | insufficient | `INSUFFICIENT_RELATION` | INSUFFICIENT_RELATION | 分别找到 anchor / target，但没有直接关系证据 |
-| ho_so_alert | answered | `INSUFFICIENT_RELATION` | INSUFFICIENT_RELATION | 检索证据中未出现 anchor/target |
-
-- `ho_at_sand_fog` 是否自然修复：**True**
+- 关系型查询数：25 / 72
+- ⚠ **guard 在 DEV 72 上误拦了 16 道本可回答的普通题** → 说明 guard 不能无差别地套在所有关系型查询上
+- 端到端耗时（检索+guard）：2.44 ms/query
+- **guard 自身耗时：2.39 ms/query**（目标 < 20ms）
 
 ---
 

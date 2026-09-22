@@ -1,0 +1,152 @@
+{
+  "generated_at": "2026-09-22 22:01:10",
+  "router": {
+    "cases": 72,
+    "n_guard_gold": 36,
+    "n_pass_gold": 36,
+    "precision": 1.0,
+    "recall": 1.0,
+    "f1": 1.0,
+    "false_route_rate": 0.0,
+    "false_route_n": 0,
+    "missed_n": 0,
+    "confusions": [],
+    "latency_ms_per_query": 0.0018,
+    "by_domain": {
+      "工程": 20,
+      "天气": 16,
+      "设备": 21,
+      "制度": 15
+    }
+  },
+  "dev72": {
+    "cases": 72,
+    "routed_to_guard": [
+      "jkj_df_data_person",
+      "wea_at_temp_drop",
+      "wea_at_typhoon_frost"
+    ],
+    "routed_n": 3,
+    "unnecessary": [
+      {
+        "id": "jkj_df_data_person",
+        "category": "direct_fact",
+        "query": "谁负责数据处理？"
+      }
+    ],
+    "unnecessary_n": 1,
+    "unnecessary_rate": 0.013888888888888888,
+    "latency_ms_per_query": 0.0024
+  },
+  "attr_dev": {
+    "cases": 33,
+    "highrisk": 24,
+    "covered": 24,
+    "coverage": 1.0,
+    "missed": [],
+    "non_highrisk_routed_in": []
+  },
+  "combination": {
+    "guard_cases_scored": 36,
+    "false_association_rate": 0.0,
+    "positive_relation_accuracy": 1.0,
+    "negative_relation_accuracy": 1.0,
+    "abstention_accuracy": 1.0,
+    "unnecessary_block_rate_router": 0.0,
+    "unnecessary_block_rate_no_router": 0.25,
+    "would_be_blocked": [
+      {
+        "id": "rt_p01",
+        "query": "大坝的设计库容是多少？",
+        "guard": "INSUFFICIENT_RELATION",
+        "reason": "分别找到 anchor / target，但没有直接关系证据"
+      },
+      {
+        "id": "rt_p06",
+        "query": "项目负责人的职责是什么？",
+        "guard": "INSUFFICIENT_RELATION",
+        "reason": "分别找到 anchor / target，但没有直接关系证据"
+      },
+      {
+        "id": "rt_p07",
+        "query": "监测组长的职责是什么？",
+        "guard": "INSUFFICIENT_RELATION",
+        "reason": "分别找到 anchor / target，但没有直接关系证据"
+      },
+      {
+        "id": "rt_p24",
+        "query": "台风过程造成了哪些影响？",
+        "guard": "INSUFFICIENT_RELATION",
+        "reason": "未找到「台风过程」的因果证据单元"
+      },
+      {
+        "id": "rt_p28",
+        "query": "本制度的目的是什么？",
+        "guard": "INSUFFICIENT_RELATION",
+        "reason": "检索证据中未出现 anchor/target"
+      },
+      {
+        "id": "rt_p29",
+        "query": "本轮天气过程的预警发布情况如何？",
+        "guard": "INSUFFICIENT_RELATION",
+        "reason": "检索证据中未出现 anchor/target"
+      },
+      {
+        "id": "rt_p30",
+        "query": "采集中断的常见原因有哪些？",
+        "guard": "INSUFFICIENT_RELATION",
+        "reason": "分别找到 anchor / target，但没有直接关系证据"
+      },
+      {
+        "id": "rt_p32",
+        "query": "数据跳变的常见原因是什么？",
+        "guard": "INSUFFICIENT_RELATION",
+        "reason": "分别找到 anchor / target，但没有直接关系证据"
+      },
+      {
+        "id": "rt_p35",
+        "query": "高温有哪些影响？",
+        "guard": "INSUFFICIENT_RELATION",
+        "reason": "未找到「高温有」的因果证据单元"
+      }
+    ],
+    "sample_final_state": [
+      {
+        "id": "rt_c01",
+        "route": "ATTRIBUTION_GUARD",
+        "guard": "YES",
+        "allow_relation_claim": true,
+        "reason": "同一 line 内共现"
+      },
+      {
+        "id": "rt_c02",
+        "route": "ATTRIBUTION_GUARD",
+        "guard": "YES",
+        "allow_relation_claim": true,
+        "reason": "同一 line 内共现"
+      },
+      {
+        "id": "rt_c03",
+        "route": "ATTRIBUTION_GUARD",
+        "guard": "YES",
+        "allow_relation_claim": true,
+        "reason": "同一 line 内共现"
+      },
+      {
+        "id": "rt_c04",
+        "route": "ATTRIBUTION_GUARD",
+        "guard": "NO",
+        "allow_relation_claim": false,
+        "reason": "该结果归属于「大风」，不是「强降雨」"
+      },
+      {
+        "id": "rt_c05",
+        "route": "ATTRIBUTION_GUARD",
+        "guard": "NO",
+        "allow_relation_claim": false,
+        "reason": "该结果归属于「强降雨」，不是「大风」"
+      }
+    ]
+  },
+  "elapsed_s": 0.3
+}

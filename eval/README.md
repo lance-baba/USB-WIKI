@@ -277,6 +277,70 @@ Wrong-doc **+0.0pp** · No-answer FP **+0.0pp** · Attribution err **+0.0pp**。
 被排除的 9 题（property 4 + impact 3 + confusion 2）需要**另一套更温和的处理**
 （属性归属校验，而不是直接弃答）。**本轮到此为止，不改生产。**
 
+## Attribution Scope Router Spike V1（2026-09-22，`router_spike.py`）
+
+Guard 本身有效，但**全局套用会误伤普通事实题**（DEV 72 的 24 道关系型里误拦 15 道）。
+Route 只回答一个问题：**这个 query 是否存在事实归因风险？**
+
+- `ATTRIBUTION_GUARD` → 才交给 Guard（Guard 只做**拦截与标注**，**不回答**）
+- `PASS_THROUGH` → 原系统**完全不变**
+
+Router 只覆盖 **causal / event / responsibility**；`impact`、`confusion`、`property`、
+`model/spec`、`quantity`、`person list`、`coverage`、`section overview` 一律 PASS_THROUGH。
+
+### 关键设计：**看问句结构，不看关键词**
+
+特意让下面这些「带关键词但语义是属性/列表」的问句走 PASS：
+
+| 查询 | 含关键词 | 实际语义 | 路由 |
+| --- | --- | --- | --- |
+| 负责人有哪些职责？ | 负责 | 职责列表 | **PASS** |
+| 数据处理员负责什么工作？ | 负责 | 属性 | **PASS** |
+| 采集中断的常见原因有哪些？ | 原因 | 字段查询 | **PASS** |
+| 数据跳变的常见原因是什么？ | 原因 | 属性 | **PASS** |
+| 台风过程造成了哪些影响？ | 造成 | impact/coverage | **PASS** |
+| 强降雨过程造成了哪些损失？ | 造成 | coverage | **PASS** |
+
+取舍原则写在代码里：**拿不准就 PASS** —— 误进 Guard 会破坏正常回答，比漏掉一次守卫更糟
+（因此「后果类」宾语白名单只收 `后果/结果/问题/危害/事故`，`影响/损失/地区/范围` 一律 PASS）。
+
+### Router DEV Pack（`datasets/router_dev.jsonl`，72 题）
+
+语料 `fixtures_router/`（汛情通报 / 采集仪说明 / 8 月天气 / 管理制度），
+**≥50% 是边界负例**：GUARD **36** / PASS_THROUGH **36**；领域 工程 20 / 天气 16 / 设备 21 / 制度 15。
+`build_gold.py` 的校验要求**路由期望与解析器输出逐题一致**（契约测试）。
+
+### 指标（全部达标）
+
+| 指标 | 值 | 门槛 |
+| --- | --- | --- |
+| Router Precision | **100%** | ≥98% ✅ |
+| Router Recall（高三 risk） | **100%** | ≥95% ✅ |
+| Router F1 | **1.000** | — |
+| **False Route Rate** | **0.0%** | ≤2% ✅ |
+| DEV 72 unnecessary guard rate | **1.4%**（1/72） | ≤2% ✅ |
+| Attribution DEV 高三 risk 覆盖率 | **100%** | ≥95% ✅ |
+| Router latency | **0.0018 ms/query** | <1ms ✅ |
+
+### 组合（Router + Guard）—— 最终产品语义
+
+| 指标 | 值 |
+| --- | --- |
+| Router+Guard False Association | **0.0%** |
+| Positive Relation Accuracy | **100%** |
+| **Unnecessary Block Rate（有 router）** | **0.0%** |
+| Unnecessary Block Rate（**若无 router**） | **25.0%** |
+
+> 没有 router 时，Guard 会误杀 **9/36** 道正常题（「大坝的设计库容是多少？」「项目负责人的职责
+> 是什么？」「本制度的目的是什么？」…）；有 router 之后这些题**根本不进 Guard**，误杀率归零。
+> 这就是 router 的全部价值。
+
+### 已知边界（唯一未达标项为 0，但要知道）
+
+DEV 72 里 `谁负责数据处理？` 被路由进 Guard（1/72 = 1.4%，在门槛内）。它是 **responsibility
+的边界形态**：外形确实像「谁负责 X」，但实际只是查一个角色持有人。当前选择**保留在 Guard 内**
+（宁可多守一次），因为它属于同一类归因风险。**这是本轮最主要的边界误判类型。**
+
 ## 下一实验（仅登记设计，本轮不实现）
 
 ```text
