@@ -1,13 +1,13 @@
 {
   "meta": {
     "app_version": "1.3.0",
-    "generated_at": "2026-09-22 21:23:25",
+    "generated_at": "2026-09-23 07:29:00",
     "split": "dev",
     "cases": 72,
     "top_k": 5,
     "embedder": "local_hash(512)  # 离线可复现；不依赖 ollama",
-    "elapsed_s": 0.37,
-    "library": "C:\\Users\\huqih\\AppData\\Local\\Temp\\usb-wiki-eval-97dv16y1"
+    "elapsed_s": 0.39,
+    "library": "C:\\Users\\huqih\\AppData\\Local\\Temp\\usb-wiki-eval-cymzopa_"
   },
   "counts_by_category": {
     "attribution": 5,

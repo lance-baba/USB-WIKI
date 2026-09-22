@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-09-22 22:01:10",
+  "generated_at": "2026-09-23 07:28:42",
   "router": {
     "cases": 72,
     "n_guard_gold": 36,
@@ -11,7 +11,7 @@
     "false_route_n": 0,
     "missed_n": 0,
     "confusions": [],
-    "latency_ms_per_query": 0.0018,
+    "latency_ms_per_query": 0.0042,
     "by_domain": {
       "工程": 20,
       "天气": 16,
@@ -36,7 +36,7 @@
     ],
     "unnecessary_n": 1,
     "unnecessary_rate": 0.013888888888888888,
-    "latency_ms_per_query": 0.0024
+    "latency_ms_per_query": 0.005
   },
   "attr_dev": {
     "cases": 33,
@@ -53,7 +53,7 @@
     "negative_relation_accuracy": 1.0,
     "abstention_accuracy": 1.0,
     "unnecessary_block_rate_router": 0.0,
-    "unnecessary_block_rate_no_router": 0.25,
+    "unnecessary_block_rate_no_router": 0.9166666666666666,
     "would_be_blocked": [
       {
         "id": "rt_p01",
@@ -62,22 +62,142 @@
         "reason": "分别找到 anchor / target，但没有直接关系证据"
       },
       {
+        "id": "rt_p02",
+        "query": "坝顶高程是多少？",
+        "guard": "INSUFFICIENT_RELATION",
+        "reason": "检索证据中未出现 anchor/target"
+      },
+      {
         "id": "rt_p06",
         "query": "项目负责人的职责是什么？",
         "guard": "INSUFFICIENT_RELATION",
-        "reason": "分别找到 anchor / target，但没有直接关系证据"
+        "reason": "检索证据中未出现 anchor/target"
       },
       {
         "id": "rt_p07",
         "query": "监测组长的职责是什么？",
         "guard": "INSUFFICIENT_RELATION",
-        "reason": "分别找到 anchor / target，但没有直接关系证据"
+        "reason": "检索证据中未出现 anchor/target"
+      },
+      {
+        "id": "rt_p08",
+        "query": "数据处理员负责什么工作？",
+        "guard": "INSUFFICIENT_RELATION",
+        "reason": "检索证据中未出现 anchor/target"
+      },
+      {
+        "id": "rt_p09",
+        "query": "RT 系列采集仪是什么型号？",
+        "guard": "INSUFFICIENT_RELATION",
+        "reason": "检索证据中未出现 anchor/target"
+      },
+      {
+        "id": "rt_p10",
+        "query": "采集仪支持哪些功能？",
+        "guard": "INSUFFICIENT_RELATION",
+        "reason": "检索证据中未出现 anchor/target"
+      },
+      {
+        "id": "rt_p11",
+        "query": "RT 采集仪用于什么？",
+        "guard": "INSUFFICIENT_RELATION",
+        "reason": "检索证据中未出现 anchor/target"
+      },
+      {
+        "id": "rt_p12",
+        "query": "采集仪有哪些型号？",
+        "guard": "INSUFFICIENT_RELATION",
+        "reason": "检索证据中未出现 anchor/target"
+      },
+      {
+        "id": "rt_p13",
+        "query": "本轮共接报多少起灾情？",
+        "guard": "INSUFFICIENT_RELATION",
+        "reason": "检索证据中未出现 anchor/target"
+      },
+      {
+        "id": "rt_p14",
+        "query": "8 月共发布多少次预警？",
+        "guard": "INSUFFICIENT_RELATION",
+        "reason": "检索证据中未出现 anchor/target"
+      },
+      {
+        "id": "rt_p15",
+        "query": "停电影响了多少个村？",
+        "guard": "INSUFFICIENT_RELATION",
+        "reason": "检索证据中未出现 anchor/target"
+      },
+      {
+        "id": "rt_p16",
+        "query": "RT-200 有多少个通道？",
+        "guard": "INSUFFICIENT_RELATION",
+        "reason": "检索证据中未出现 anchor/target"
+      },
+      {
+        "id": "rt_p17",
+        "query": "监测项目有哪些岗位？",
+        "guard": "INSUFFICIENT_RELATION",
+        "reason": "检索证据中未出现 anchor/target"
+      },
+      {
+        "id": "rt_p18",
+        "query": "RT 系列的责任工程师有哪些人？",
+        "guard": "INSUFFICIENT_RELATION",
+        "reason": "检索证据中未出现 anchor/target"
+      },
+      {
+        "id": "rt_p19",
+        "query": "8 月天气过程包括哪些？",
+        "guard": "INSUFFICIENT_RELATION",
+        "reason": "检索证据中未出现 anchor/target"
+      },
+      {
+        "id": "rt_p20",
+        "query": "本项目有哪些管理人员？",
+        "guard": "INSUFFICIENT_RELATION",
+        "reason": "检索证据中未出现 anchor/target"
+      },
+      {
+        "id": "rt_p21",
+        "query": "RT 系列采集仪有哪些功能？",
+        "guard": "INSUFFICIENT_RELATION",
+        "reason": "检索证据中未出现 anchor/target"
+      },
+      {
+        "id": "rt_p22",
+        "query": "监测项目的工作流程包括哪些环节？",
+        "guard": "INSUFFICIENT_RELATION",
+        "reason": "检索证据中未出现 anchor/target"
+      },
+      {
+        "id": "rt_p23",
+        "query": "强降雨过程造成了哪些损失？",
+        "guard": "INSUFFICIENT_RELATION",
+        "reason": "检索证据中未出现 anchor/target"
       },
       {
         "id": "rt_p24",
         "query": "台风过程造成了哪些影响？",
         "guard": "INSUFFICIENT_RELATION",
         "reason": "未找到「台风过程」的因果证据单元"
+      },
+      {
+        "id": "rt_p25",
+        "query": "责任划分是怎么规定的？",
+        "guard": "INSUFFICIENT_RELATION",
+        "reason": "检索证据中未出现 anchor/target"
+      },
+      {
+        "id": "rt_p26",
+        "query": "岗位职责是怎么规定的？",
+        "guard": "INSUFFICIENT_RELATION",
+        "reason": "检索证据中未出现 anchor/target"
+      },
+      {
+        "id": "rt_p27",
+        "query": "8 月天气过程情况怎么样？",
+        "guard": "INSUFFICIENT_RELATION",
+        "reason": "检索证据中未出现 anchor/target"
       },
       {
         "id": "rt_p28",
@@ -98,16 +218,40 @@
         "reason": "分别找到 anchor / target，但没有直接关系证据"
       },
       {
+        "id": "rt_p31",
+        "query": "停航影响范围是什么？",
+        "guard": "INSUFFICIENT_RELATION",
+        "reason": "检索证据中未出现 anchor/target"
+      },
+      {
         "id": "rt_p32",
         "query": "数据跳变的常见原因是什么？",
         "guard": "INSUFFICIENT_RELATION",
         "reason": "分别找到 anchor / target，但没有直接关系证据"
       },
       {
+        "id": "rt_p33",
+        "query": "强降雨影响了哪些地区？",
+        "guard": "INSUFFICIENT_RELATION",
+        "reason": "检索证据中未出现 anchor/target"
+      },
+      {
+        "id": "rt_p34",
+        "query": "台风影响了哪些地区？",
+        "guard": "INSUFFICIENT_RELATION",
+        "reason": "检索证据中未出现 anchor/target"
+      },
+      {
         "id": "rt_p35",
         "query": "高温有哪些影响？",
         "guard": "INSUFFICIENT_RELATION",
         "reason": "未找到「高温有」的因果证据单元"
+      },
+      {
+        "id": "rt_p36",
+        "query": "停电影响了哪些对象？",
+        "guard": "INSUFFICIENT_RELATION",
+        "reason": "检索证据中未出现 anchor/target"
       }
     ],
     "sample_final_state": [

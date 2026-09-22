@@ -11,9 +11,12 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+# Gold 构建必须复用**生产**的关系解析（单一语义源），故把仓库根放进 sys.path
+sys.path.insert(0, str(HERE.parent))
 FIXTURES = HERE / "fixtures"
 OUT = HERE / "datasets" / "core_gold.jsonl"
 
@@ -365,7 +368,7 @@ AT_C: list[tuple] = [
 
 def _build_attr() -> int:
     """Attribution Pack 专用校验：不仅要词在，还要**关系结构**成立。"""
-    from _relation import analyze_query, units_of           # noqa: PLC0415
+    from app.core import relation_guard as RG  # noqa: PLC0415  （单一语义源）
 
     docs = {p.name: p.read_text(encoding="utf-8") for p in FIXTURES_ATTR.glob("*.md")}
     rows, problems = [], []
@@ -377,7 +380,7 @@ def _build_attr() -> int:
         for t in (anchor, target):
             if t not in text:
                 problems.append(f"{cid}: {t!r} 不在 {doc} 中（题目不成立）")
-        units = units_of(text)
+        units = RG.units_of(text)
         same_unit = [u for u in units
                      if anchor in u["text"] and target in u["text"]]
         if state == "yes" and not same_unit:
@@ -387,12 +390,12 @@ def _build_attr() -> int:
             problems.append(f"{cid}: 负例/无证据题却在同一 unit 内共现 "
                             f"（{same_unit[0]['kind']}: {same_unit[0]['text'][:40]!r}）")
         # 解析器自检：确定性解析必须能从 query 里还原出 anchor / target
-        pa = analyze_query(q)
-        if anchor is not None and pa["anchor"] and pa["anchor"] != anchor:
-            problems.append(f"{cid}: 解析 anchor={pa['anchor']!r} != 声明 {anchor!r}")
-        if anchor is not None and not pa["anchor"] and cat != "event":
+        pa = RG.analyze_relation(q)
+        if anchor is not None and pa.anchor and pa.anchor != anchor:
+            problems.append(f"{cid}: 解析 anchor={pa.anchor!r} != 声明 {anchor!r}")
+        if anchor is not None and not pa.anchor and cat != "event":
             problems.append(f"{cid}: 解析不出 anchor（声明 {anchor!r}）")
-        pt = pa.get("value") or pa.get("target")
+        pt = pa.value or pa.target
         if target and pt and pt != target and cat not in ("impact",):
             problems.append(f"{cid}: 解析 target={pt!r} != 声明 {target!r}")
         rows.append({
@@ -400,7 +403,7 @@ def _build_attr() -> int:
             "expected": {
                 "doc": doc, "answer_state": state,
                 "anchor": anchor, "target": target,
-                "relation_type": pa.get("relation_type"),
+                "relation_type": pa.relation_type,
                 "must_contain": [anchor, target], "must_not_contain": [],
             },
             "evidence_groups": [],
@@ -526,7 +529,7 @@ RT_C: list[tuple] = [
 
 def _build_router() -> int:
     """Router Pack 专用校验：**路由期望必须与确定性解析器一致**。"""
-    from _relation import route_attribution  # noqa: PLC0415
+    from app.core import relation_guard as RG  # noqa: PLC0415
 
     docs = {p.name: p.read_text(encoding="utf-8") for p in FIXTURES_ROUTER.glob("*.md")}
     rows, problems = [], []
@@ -536,7 +539,7 @@ def _build_router() -> int:
         if text is None:
             problems.append(f"{cid}: fixture {doc} 不存在")
             continue
-        got = route_attribution(q)
+        got = RG.analyze_relation(q).route
         if got != rte:
             problems.append(f"{cid}: 路由期望 {rte} 但解析器给出 {got} —— {q}")
         if rte == G:
@@ -581,8 +584,8 @@ def _build_router() -> int:
 
 
 def _units_of(text: str) -> list[str]:
-    from _relation import units_of  # noqa: PLC0415
-    return [u["text"] for u in units_of(text)]
+    from app.core import relation_guard as RG  # noqa: PLC0415
+    return [u["text"] for u in RG.units_of(text)]
 
 
 def main() -> int:

@@ -32,8 +32,7 @@ sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(HERE))
 
 import _metrics
-from _relation import (analyze_query, entities_in, owner_vocab,  # noqa: E402
-                       units_of)
+from app.core import relation_guard as RG  # noqa: E402  （生产单一语义源）
 
 import run_eval as R  # noqa: E402
 
@@ -41,108 +40,15 @@ REPORTS = HERE / "reports"
 ATTR_GOLD = HERE / "datasets" / "attribution_dev.jsonl"
 FIXTURES_ATTR = HERE / "fixtures_attribution"
 TOP_K = 5                       # 生产默认
-_CAUSE = re.compile(r"(?:导致|造成|引起)")
-_CAUSE_SUBJ = re.compile(r"([\u4e00-\u9fa5A-Za-z0-9\-－]{2,14}?)(?:导致|造成|引起)")
 
 
-def _content(par, ref) -> str:
-    for p in par.get(ref.doc_id, []):
-        if p["parent_id"] == ref.parent_id:
-            return p["content"] or ""
-    return ""
+def naive_verdict(rq, cands: list[dict]) -> str:
+    """基线：**只看共现**（现在的系统就是这种语义：词都出现 → 当成有关系）。
 
-
-def _party(unit_text: str) -> str | None:
-    m = re.search(r"由([\u4e00-\u9fa5A-Za-z0-9\-]{2,14}?)负责", unit_text)
-    return m.group(1) if m else None
-
-
-# --------------------------------------------------------------------------
-# Guard
-# --------------------------------------------------------------------------
-def guard(an: dict, cands: list[dict], vocab: set[str]) -> dict:
-    """cands: [{'parent_id','section','units':[...]}]（**顺序即生产排名**）。
-
-    返回 {'verdict','reason','unit'}；verdict ∈ YES / NO / INSUFFICIENT_RELATION。
+    与 guard 用同一份 `rq`，保证 baseline / candidate 只差"看不看 unit"。
     """
-    a, t, rt = an.get("anchor"), an.get("target"), an.get("relation_type")
-    if not an.get("is_relation"):
-        return {"verdict": "PASS_THROUGH", "reason": "非关系型查询", "unit": ""}
-
-    all_units = [(c["section"], u) for c in cands for u in c["units"]]
-
-    # --- impact：只有 anchor（target 是被问的"影响集合"）→ anchor 所在单元里有因果动词即成立 ---
-    if rt == "impact" and a and not t:
-        for sec, u in all_units:
-            if a in u["text"] and _CAUSE.search(u["text"]):
-                return {"verdict": "YES", "reason": f"找到「{a}」的因果单元",
-                        "unit": u["text"]}
-        return {"verdict": "INSUFFICIENT_RELATION",
-                "reason": f"未找到「{a}」的因果证据单元", "unit": ""}
-
-    # --- event：只有 target（问"哪个事件造成 Y"）→ 找含 target 的因果单元并指出主体 ---
-    if rt == "event" and t and not a:
-        for sec, u in all_units:
-            if t in u["text"]:
-                m = _CAUSE_SUBJ.search(u["text"])
-                if m:
-                    return {"verdict": "YES", "reason": f"该结果由「{m.group(1)}」造成",
-                            "unit": u["text"]}
-        return {"verdict": "INSUFFICIENT_RELATION",
-                "reason": f"未找到「{t}」的成因单元", "unit": ""}
-
-    # --- 责任归属：看 anchor 所在单元的"由 X 负责" ---
-    if rt == "responsibility" and a:
-        for sec, u in all_units:
-            if a in u["text"]:
-                party = _party(u["text"])
-                if party:
-                    if t and party != t:
-                        return {"verdict": "NO",
-                                "reason": f"责任方为「{party}」，不是「{t}」", "unit": u["text"]}
-                    return {"verdict": "YES", "reason": f"责任方「{party}」",
-                            "unit": u["text"]}
-        # 找不到"由 X 负责"句 → **不早退**，继续走 entity/冲突判定
-        # （表格式责任分工就是这样：责任人写在表列里，没有"由…负责"句式）
-
-    # --- STRONG：同一 evidence unit 内同时出现 anchor 与 target ---
-    if a and t:
-        for sec, u in all_units:
-            if a in u["text"] and t in u["text"]:
-                return {"verdict": "YES", "reason": f"同一 {u['kind']} 内共现",
-                        "unit": u["text"]}
-
-    # --- 归因冲突：target 出现在**别的**主体/实体名下 ---
-    if t:
-        for sec, u in all_units:
-            if t not in u["text"]:
-                continue
-            # (a) 事件归因冲突：该单元里另有因果主体，且不是 anchor
-            for w in vocab:
-                if w in u["text"] and a and w != a and w not in a and a not in w:
-                    return {"verdict": "NO",
-                            "reason": f"该结果归属于「{w}」，不是「{a}」", "unit": u["text"]}
-            # (b) 实体混淆：该单元里有同类实体（如 AQ-100 vs AQ-110），不是 anchor
-            if a:
-                ents = entities_in(u["text"])
-                if ents and ents != {a} and a not in ents:
-                    other = sorted(ents - {a})[0]
-                    return {"verdict": "NO",
-                            "reason": f"该属性属于「{other}」，不是「{a}」", "unit": u["text"]}
-
-    # --- 弃答：anchor / target 各自能找到，但没有任何关系单元 ---
-    hit_a = any(a and a in u["text"] for _, u in all_units)
-    hit_t = any(t and t in u["text"] for _, u in all_units)
-    if hit_a or hit_t:
-        return {"verdict": "INSUFFICIENT_RELATION",
-                "reason": "分别找到 anchor / target，但没有直接关系证据", "unit": ""}
-    return {"verdict": "INSUFFICIENT_RELATION", "reason": "检索证据中未出现 anchor/target", "unit": ""}
-
-
-def naive_verdict(an: dict, cands: list[dict]) -> str:
-    """基线：**只看共现**（现在的系统就是这种语义：词都出现 → 当成有关系）。"""
-    a, t = an.get("anchor"), an.get("target")
-    blob = " ".join(u["text"] for c in cands for u in c["units"])
+    a, t = rq.anchor, rq.target
+    blob = " ".join((p.get("content") or "") for p in cands)
     if a and t:
         return "YES" if (a in blob and t in blob) else "INSUFFICIENT_RELATION"
     if a:
@@ -152,7 +58,6 @@ def naive_verdict(an: dict, cands: list[dict]) -> str:
     return "PASS_THROUGH"
 
 
-# --------------------------------------------------------------------------
 def load_cases(path: Path) -> list[dict]:
     out = []
     with path.open(encoding="utf-8") as fh:
@@ -190,25 +95,21 @@ def build(split: str):
     db, emb = R.build_library(fixtures)
     docs = R.doc_map(db)
     par = R.parent_index(db)
-    # 全语料 owner 词表（从文档自身推导，不硬编码业务词）
-    vocab: set[str] = set()
-    for ps in par.values():
-        for p in ps:
-            vocab |= owner_vocab(p["content"] or "")
-    return db, emb, docs, par, vocab
+    return db, emb, docs, par
 
 
 def candidates_for(db, emb, par, q: str, k: int = TOP_K) -> list[dict]:
     res = R.S.hybrid_search(db, emb, q, top_k_parents=k)
     out = []
     for r in res.references:
-        content = ""
+        content, section = "", ""
         for p in par.get(r.doc_id, []):
             if p["parent_id"] == r.parent_id:
                 content = p["content"] or ""
+                section = p.get("section_path") or ""
                 break
-        out.append({"parent_id": r.parent_id, "section": r.path or "",
-                    "units": units_of(content)})
+        out.append({"parent_id": r.parent_id, "doc_id": r.doc_id,
+                    "content": content, "section_path": section})
     return out
 
 
@@ -245,21 +146,31 @@ def score(rows: list[dict], key: str) -> dict:
     }
 
 
-def run_attribution(db, emb, par, vocab) -> dict:
+def run_attribution(db, emb, par) -> dict:
     cases = load_cases(ATTR_GOLD)
-    rows, per_case, t0 = [], [], time.perf_counter()
+    rows, rows_in_scope, per_case, t0 = [], [], [], time.perf_counter()
     for c in cases:
-        an = analyze_query(c["query"])
+        rq = RG.analyze_relation(c["query"])
         cands = candidates_for(db, emb, par, c["query"])
-        g = guard(an, cands, vocab)
-        rows.append({"state": c["expected"]["answer_state"],
-                     "guard": g["verdict"], "naive": naive_verdict(an, cands)})
+        gr = RG.evaluate_relation(rq, cands)
+        rec = {"state": c["expected"]["answer_state"],
+               "guard": gr.verdict, "naive": naive_verdict(rq, cands)}
+        rows.append(rec)
+        if rq.route == RG.ROUTE_GUARD:
+            rows_in_scope.append(rec)
         per_case.append({"id": c["id"], "category": c["category"], "query": c["query"],
-                         "state": c["expected"]["answer_state"], "guard": g["verdict"],
-                         "naive": naive_verdict(an, cands), "reason": g["reason"],
-                         "unit": g["unit"][:80]})
+                         "state": c["expected"]["answer_state"], "guard": gr.verdict,
+                         "naive": naive_verdict(rq, cands), "reason": gr.reason,
+                         "unit": gr.unit[:80]})
     dt = (time.perf_counter() - t0) / max(1, len(cases))
-    return {"baseline": score(rows, "naive"), "candidate": score(rows, "guard"),
+    # 主口径：只统计 **Router 实际交给 Guard** 的题（causal/event/responsibility）。
+    # property / confusion / impact 现在按设计走 PASS_THROUGH（普通检索），
+    # 把它们也算进 Guard 指标会把「正确不进 Guard」误判成 guard 失败。
+    in_scope = [r for r in rows_in_scope]
+    return {"baseline": score(in_scope, "naive"), "candidate": score(in_scope, "guard"),
+            "all_cases_baseline": score(rows, "naive"),
+            "all_cases_candidate": score(rows, "guard"),
+            "in_scope_n": len(in_scope), "out_of_scope_n": len(rows) - len(in_scope),
             "per_case": per_case, "guard_ms_per_query": round(dt * 1000, 2),
             "cases": len(cases),
             "by_category": dict(Counter(c["category"] for c in cases))}
@@ -272,22 +183,17 @@ def dev_regression() -> dict:
     db, emb = R.build_library(R.FIXTURES)
     docs, par = R.doc_map(db), R.parent_index(db)
     rows, rel_q, blocked, blocked_ids = [], 0, 0, []
-    vocab: set[str] = set()
-    for ps in par.values():
-        for p in ps:
-            vocab |= owner_vocab(p["content"] or "")
     t0 = time.perf_counter()
     for c in cases:
         refs = list(R.S.hybrid_search(db, emb, c["query"], top_k_parents=TOP_K).references)
         rows.append({"id": c["id"], "category": c["category"], "refs": refs})
-        an = analyze_query(c["query"])
-        if not an["is_relation"]:
+        rq = RG.analyze_relation(c["query"])
+        if not rq.is_relation:
             continue
         rel_q += 1
         # ★ 关键风险面：guard 会不会把**普通可回答事实题**也拦下来？
-        cands = [{"parent_id": r.parent_id, "section": r.path or "",
-                  "units": units_of(_content(par, r))} for r in refs]
-        v = guard(an, cands, vocab)["verdict"]
+        cands = candidates_for(db, emb, par, c["query"])
+        v = RG.evaluate_relation(rq, cands).verdict
         if v != "YES" and c["expected"]["answer_state"] == "answered":
             blocked += 1
             blocked_ids.append({"id": c["id"], "category": c["category"],
@@ -315,20 +221,16 @@ def holdout_validation() -> dict:
     cases = R.load_gold(R.HOLDOUT_GOLD)
     db, emb = build("holdout")[0:2]
     docs, par = R.doc_map(db), R.parent_index(db)
-    vocab: set[str] = set()
-    for ps in par.values():
-        for p in ps:
-            vocab |= owner_vocab(p["content"] or "")
     out = {}
     for c in cases:
-        an = analyze_query(c["query"])
-        if not an["is_relation"] and c["category"] != "attribution":
+        rq = RG.analyze_relation(c["query"])
+        if not rq.is_relation and c["category"] != "attribution":
             continue
         cands = candidates_for(db, emb, par, c["query"])
-        g = guard(an, cands, vocab)
+        gr = RG.evaluate_relation(rq, cands)
         out[c["id"]] = {"query": c["query"], "state": c["expected"]["answer_state"],
-                        "guard": g["verdict"], "naive": naive_verdict(an, cands),
-                        "reason": g["reason"],
+                        "guard": gr.verdict, "naive": naive_verdict(rq, cands),
+                        "reason": gr.reason,
                         "forbidden": c["expected"].get("must_not_contain") or []}
     return out
 
@@ -352,7 +254,11 @@ def render_md(rep: dict) -> str:
         def f(v):
             return "—" if v is None else f"{v*100:.1f}%"
         L.append(f"| {lab} | {f(bl.get(k))} | **{f(ca.get(k))}** |")
-    L += ["", f"（正例 {ca['n_yes']} / 负例 {ca['n_no']} / 无答案 {ca['n_insufficient']}）", "",
+    L += ["", f"（正例 {ca['n_yes']} / 负例 {ca['n_no']} / 无答案 {ca['n_insufficient']}）",
+          "",
+          f"> 主口径只统计 **Router 交给 Guard 的 {a['in_scope_n']} 题**"
+          f"（causal/event/responsibility）；另有 {a['out_of_scope_n']} 题按设计走 "
+          f"PASS_THROUGH（property/confusion/impact），不进入 Guard 指标。", ""
           "## 逐题判定（guard）", "", "| id | category | 期望 | guard | 说明 |",
           "| --- | --- | --- | --- | --- |"]
     for c in a["per_case"]:
@@ -391,8 +297,8 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
     t_start = time.time()
 
-    db, emb, docs, par, vocab = build("attribution")
-    attr = run_attribution(db, emb, par, vocab)
+    db, emb, docs, par = build("attribution")
+    attr = run_attribution(db, emb, par)
     R._DB.checkpoint_and_close() if R._DB else None
 
     dev = dev_regression()

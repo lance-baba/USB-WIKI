@@ -341,6 +341,55 @@ DEV 72 里 `谁负责数据处理？` 被路由进 Guard（1/72 = 1.4%，在门�
 的边界形态**：外形确实像「谁负责 X」，但实际只是查一个角色持有人。当前选择**保留在 Guard 内**
 （宁可多守一次），因为它属于同一类归因风险。**这是本轮最主要的边界误判类型。**
 
+## 生产集成（Selective Attribution Guard）
+
+**生产模块：`app/core/relation_guard.py`** —— eval **不再保留任何一份实现**
+（`eval/_relation.py` 已删除；`build_gold.py` / `attribution_guard_spike.py` /
+`router_spike.py` 全部改为 `from app.core import relation_guard`）。
+这样 Router 与 Parser 是**同一份正则**（`_PATTERNS` 一张表同时产出 route 与
+relation_type/anchor/target），不可能再漂移。
+
+### 接入位置：`llm.Gateway.stream_chat()`
+
+```
+query → hybrid_search() → references/parents
+      → analyze_relation()            # 一次解析，同时得到 route 与关系结构
+      → PASS_THROUGH  → guard is None → 原逻辑完全不变（字节级）
+      → ATTRIBUTION_GUARD → evaluate_relation()
+            allow_relation_claim = True  → 正常回答（并把通过的证据标为 preferred）
+            allow_relation_claim = False → **受控回答，不调用 LLM**，citation 照旧下发
+```
+
+`references` 帧**先于**判定下发 —— 所以被拦截时用户仍能看到 anchor / 冲突证据并自行核验。
+未改动：`hybrid_search` 排序、TopK、引用编号、source anchor、citation 数据。
+
+### 三种状态
+
+| 状态 | 含义 | 行为 |
+| --- | --- | --- |
+| `YES` | 找到直接关系证据 | 原回答流程继续；`preferred_parent_id` 标出通过的证据 |
+| `NO` | target 归属别的事件/主体/责任方 | 禁止声称 YES；受控文案点名真实 owner（**owner 来自直接证据，不让模型猜**） |
+| `INSUFFICIENT_RELATION` | 两者分别存在，但无直接关系证据 | 禁止把「分别存在」拼成关系 |
+
+### 回归（本次集成后）
+
+| 集 | 结果 |
+| --- | --- |
+| Router DEV 72 | Precision **100%** · Recall **100%** · False Route **0%** · DEV72 unnecessary **1.4%** · 覆盖 **100%** |
+| Attribution DEV 33（in-scope 24） | Positive/Negative/Abstention **100%** · False Association **0%** |
+| 原 DEV 72 Retrieval | Recall@1/3/5、Coverage、Relation、Wrong-doc、No-answer **全部 +0.0pp** |
+| 新增 targeted tests | **46/46**（A–J + smoke + PASS_THROUGH 字节级保持） |
+
+> ⚠ Attribution DEV 的**主口径只统计 Router 交给 Guard 的 24 题**（causal/event/responsibility）；
+> 另 9 题（property/confusion/impact）按设计走 PASS_THROUGH，不该再算进 Guard 指标 ——
+> 把它们也算进去会把「正确地不进 Guard」误判成 guard 失败（集成初期因此误报过一次退化）。
+
+### 性能
+
+- PASS_THROUGH 增势 **≈ 0.005 ms/query**（只做一次正则解析）
+- Guard（`evaluate_relation`，5 parents）**≈ 0.045 ms/query**；端到端含检索 **2.4 ms/query**
+- 目标 <5ms ✅；无新依赖、无模型、无网络
+
 ## 下一实验（仅登记设计，本轮不实现）
 
 ```text

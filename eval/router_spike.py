@@ -30,7 +30,7 @@ REPO = HERE.parent
 sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(HERE))
 
-from _relation import route_attribution, units_of  # noqa: E402
+from app.core import relation_guard as RG  # noqa: E402  （生产单一语义源）
 
 import attribution_guard_spike as AG  # noqa: E402  （无 reranker 依赖）
 import run_eval as R  # noqa: E402
@@ -55,7 +55,7 @@ def router_metrics() -> dict:
     conf: list[dict] = []
     t0 = time.perf_counter()
     for c in cases:
-        got = route_attribution(c["query"])
+        got = RG.analyze_relation(c["query"]).route
         exp = c["expected_route"]
         if exp == GUARD and got == GUARD:
             tp += 1
@@ -87,7 +87,7 @@ def dev72_unnecessary() -> dict:
     routed, unnec = [], []
     t0 = time.perf_counter()
     for c in cases:
-        r = route_attribution(c["query"])
+        r = RG.analyze_relation(c["query"]).route
         if r != GUARD:
             continue
         routed.append(c["id"])
@@ -106,10 +106,10 @@ def attr_dev_coverage() -> dict:
     high = [c for c in cases
             if c["expected"]["relation_type"] in ("causal", "event", "responsibility")]
     other = [c for c in cases if c not in high]
-    covered = [c for c in high if route_attribution(c["query"]) == GUARD]
+    covered = [c for c in high if RG.analyze_relation(c["query"]).route == GUARD]
     leaked = [{"id": c["id"], "query": c["query"],
                "relation_type": c["expected"]["relation_type"]}
-              for c in other if route_attribution(c["query"]) == GUARD]
+              for c in other if RG.analyze_relation(c["query"]).route == GUARD]
     return {
         "cases": len(cases), "highrisk": len(high), "covered": len(covered),
         "coverage": len(covered) / len(high) if high else None,
@@ -122,29 +122,32 @@ def attr_dev_coverage() -> dict:
 def combination() -> dict:
     """Router + Guard 组合：在 Router Pack 语料上跑，衡量最终产品语义。"""
     cases = load(ROUTER_GOLD)
-    R.reset_db() if hasattr(R, "reset_db") else None
     db, emb = R.build_library(FIXTURES_ROUTER)
-    docs, par = R.doc_map(db), R.parent_index(db)
-    vocab: set[str] = set()
-    for ps in par.values():
-        for p in ps:
-            vocab |= AG.owner_vocab(p["content"] or "")
+    par = R.parent_index(db)
 
     guard_rows, pass_blocked = [], []
     for c in cases:
-        an = AG.analyze_query(c["query"])
+        rq = RG.analyze_relation(c["query"])
         cands = AG.candidates_for(db, emb, par, c["query"])
-        g = AG.guard(an, cands, vocab)
-        if route_attribution(c["query"]) == GUARD:
+        if rq.route == RG.ROUTE_GUARD:
+            gr = RG.evaluate_relation(rq, cands)
             if c["expected"]["answer_state"] in ("yes", "no", "insufficient"):
                 guard_rows.append({"state": c["expected"]["answer_state"],
-                                   "guard": g["verdict"], "id": c["id"],
-                                   "query": c["query"], "reason": g["reason"]})
+                                   "guard": gr.verdict, "id": c["id"],
+                                   "query": c["query"], "reason": gr.reason})
         else:
-            # 反事实：如果**没有 router**、guard 被无差别套用，这题会不会被拦？
-            if g["verdict"] != "YES" and g["verdict"] != "PASS_THROUGH":
+            # 反事实：**假设没有 Router**，guard 被无差别套用，这题会不会被拦？
+            # 用强制 route=GUARD 的 RelationQuery 触发同一份 guard 逻辑，
+            # 保证反事实与真实判定用的是**同一套语义**（不是另一套实现）。
+            forced = RG.RelationQuery(query=c["query"], route=RG.ROUTE_GUARD,
+                                      relation_type=rq.relation_type,
+                                      anchor=rq.anchor, target=rq.target,
+                                      attr=rq.attr, value=rq.value,
+                                      is_relation=rq.is_relation)
+            gr = RG.evaluate_relation(forced, cands)
+            if gr.verdict != "YES":
                 pass_blocked.append({"id": c["id"], "query": c["query"],
-                                     "guard": g["verdict"], "reason": g["reason"]})
+                                     "guard": gr.verdict, "reason": gr.reason})
     sc = AG.score(guard_rows, "guard")
     n_pass_gold = sum(1 for c in cases if c["expected_route"] != GUARD)
     return {

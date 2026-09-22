@@ -3719,6 +3719,9 @@ def main() -> int:
         # Fast P0：型号/规格查询必须优先「目标实体 ↔ 型号」直接关系（D 类）
         from tests.test_model_retrieval import run as _run_model
         _run_model(ctx, check, section, skip)
+        # 生产集成：选择性归因守卫（Router + Guard；确定性、无模型、无网络）
+        from tests.test_relation_guard import run as _run_rguard
+        _run_rguard(ctx, check, section, skip)
         # 安全保险丝：破坏性测试只能碰隔离 Library（事故后新增，永远先跑）
         from tests.test_harness_safety import run as _run_safety
         _run_safety(ctx, check, section, skip)

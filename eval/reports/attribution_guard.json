@@ -1,7 +1,31 @@
 {
-  "generated_at": "2026-09-22 22:01:17",
+  "generated_at": "2026-09-23 07:28:41",
   "attribution": {
     "baseline": {
+      "n": 24,
+      "n_yes": 12,
+      "n_no": 9,
+      "n_insufficient": 3,
+      "attribution_precision": 0.5454545454545454,
+      "attribution_recall": 1.0,
+      "positive_relation_accuracy": 1.0,
+      "negative_relation_accuracy": 0.0,
+      "abstention_accuracy": 0.0,
+      "false_association_rate": 0.8333333333333334
+    },
+    "candidate": {
+      "n": 24,
+      "n_yes": 12,
+      "n_no": 9,
+      "n_insufficient": 3,
+      "attribution_precision": 1.0,
+      "attribution_recall": 1.0,
+      "positive_relation_accuracy": 1.0,
+      "negative_relation_accuracy": 1.0,
+      "abstention_accuracy": 1.0,
+      "false_association_rate": 0.0
+    },
+    "all_cases_baseline": {
       "n": 33,
       "n_yes": 18,
       "n_no": 12,
@@ -13,18 +37,20 @@
       "abstention_accuracy": 0.0,
       "false_association_rate": 0.8666666666666667
     },
-    "candidate": {
+    "all_cases_candidate": {
       "n": 33,
       "n_yes": 18,
       "n_no": 12,
       "n_insufficient": 3,
-      "attribution_precision": 1.0,
+      "attribution_precision": 0.8571428571428571,
       "attribution_recall": 1.0,
       "positive_relation_accuracy": 1.0,
-      "negative_relation_accuracy": 1.0,
+      "negative_relation_accuracy": 0.75,
       "abstention_accuracy": 1.0,
-      "false_association_rate": 0.0
+      "false_association_rate": 0.2
     },
+    "in_scope_n": 24,
+    "out_of_scope_n": 9,
     "per_case": [
       {
         "id": "ad_c01",
@@ -143,7 +169,7 @@
         "state": "no",
         "guard": "NO",
         "naive": "YES",
-        "reason": "该结果归属于「引桥桥面铺装破损由冻融循环」，不是「车辆超载」",
+        "reason": "该结果归属于「冻融循环」，不是「车辆超载」",
         "unit": "引桥桥面铺装破损由冻融循环引起。"
       },
       {
@@ -183,8 +209,8 @@
         "state": "yes",
         "guard": "YES",
         "naive": "YES",
-        "reason": "找到「强降雨」的因果单元",
-        "unit": "强降雨导致河流水位上涨 1.2 米。"
+        "reason": "PASS_THROUGH（不进入归因守卫）",
+        "unit": ""
       },
       {
         "id": "ad_i02",
@@ -193,8 +219,8 @@
         "state": "yes",
         "guard": "YES",
         "naive": "YES",
-        "reason": "找到「暴雨」的因果单元",
-        "unit": "⑴、暴雨造成城区 6 处道路积水。"
+        "reason": "PASS_THROUGH（不进入归因守卫）",
+        "unit": ""
       },
       {
         "id": "ad_i03",
@@ -203,8 +229,8 @@
         "state": "yes",
         "guard": "YES",
         "naive": "YES",
-        "reason": "找到「雷电」的因果单元",
-        "unit": "⑴、雷电造成 3 个小区短时停电。"
+        "reason": "PASS_THROUGH（不进入归因守卫）",
+        "unit": ""
       },
       {
         "id": "ad_p01",
@@ -213,8 +239,8 @@
         "state": "yes",
         "guard": "YES",
         "naive": "YES",
-        "reason": "同一 table_row 内共现",
-        "unit": "| 型号 | 量程 | 分辨力 | 责任人 | | AQ-100 | 50m | 1mm | 张工 |"
+        "reason": "PASS_THROUGH（不进入归因守卫）",
+        "unit": ""
       },
       {
         "id": "ad_p02",
@@ -223,8 +249,8 @@
         "state": "yes",
         "guard": "YES",
         "naive": "YES",
-        "reason": "同一 table_row 内共现",
-        "unit": "| 型号 | 量程 | 分辨力 | 责任人 | | AQ-110 | 100m | 2mm | 李工 |"
+        "reason": "PASS_THROUGH（不进入归因守卫）",
+        "unit": ""
       },
       {
         "id": "ad_p03",
@@ -233,18 +259,18 @@
         "state": "yes",
         "guard": "YES",
         "naive": "YES",
-        "reason": "同一 table_row 内共现",
-        "unit": "| 型号 | 量程 | 分辨力 | 责任人 | | AQ-100 | 50m | 1mm | 张工 |"
+        "reason": "PASS_THROUGH（不进入归因守卫）",
+        "unit": ""
       },
       {
         "id": "ad_p06",
         "category": "property",
         "query": "AQ-100 的检定周期是 24 个月吗？",
         "state": "no",
-        "guard": "NO",
+        "guard": "YES",
         "naive": "YES",
-        "reason": "该属性属于「AQ-110」，不是「AQ-100」",
-        "unit": "AQ-110 的检定周期为 24 个月。"
+        "reason": "PASS_THROUGH（不进入归因守卫）",
+        "unit": ""
       },
       {
         "id": "ad_r01",
@@ -321,20 +347,20 @@
         "category": "confusion",
         "query": "AQ-110 的量程是 50m 吗？",
         "state": "no",
-        "guard": "NO",
+        "guard": "YES",
         "naive": "YES",
-        "reason": "该属性属于「AQ-100」，不是「AQ-110」",
-        "unit": "| 型号 | 量程 | 分辨力 | 责任人 | | AQ-100 | 50m | 1mm | 张工 |"
+        "reason": "PASS_THROUGH（不进入归因守卫）",
+        "unit": ""
       },
       {
         "id": "ad_x03",
         "category": "confusion",
         "query": "AQ-100 的责任人是李工吗？",
         "state": "no",
-        "guard": "NO",
+        "guard": "YES",
         "naive": "YES",
-        "reason": "该属性属于「AQ-110」，不是「AQ-100」",
-        "unit": "| 型号 | 量程 | 分辨力 | 责任人 | | AQ-110 | 100m | 2mm | 李工 |"
+        "reason": "PASS_THROUGH（不进入归因守卫）",
+        "unit": ""
       },
       {
         "id": "ad_e01",
@@ -357,7 +383,7 @@
         "unit": "大风导致 12 个航班取消。"
       }
     ],
-    "guard_ms_per_query": 2.39,
+    "guard_ms_per_query": 2.44,
     "cases": 33,
     "by_category": {
       "causal": 15,
@@ -383,97 +409,13 @@
     },
     "relation_type_queries": 25,
     "cases": 72,
-    "pipeline_ms_per_query": 2.44,
-    "guard_blocked_normal_queries": 16,
+    "pipeline_ms_per_query": 3.32,
+    "guard_blocked_normal_queries": 2,
     "guard_blocked_ids": [
-      {
-        "id": "jkj_df_purpose",
-        "category": "direct_fact",
-        "query": "监测的目的是什么？",
-        "guard": "INSUFFICIENT_RELATION"
-      },
-      {
-        "id": "jkj_df_baseline_use",
-        "category": "direct_fact",
-        "query": "基准点中其中一个点的用途是什么？",
-        "guard": "INSUFFICIENT_RELATION"
-      },
       {
         "id": "jkj_df_data_person",
         "category": "direct_fact",
         "query": "谁负责数据处理？",
-        "guard": "INSUFFICIENT_RELATION"
-      },
-      {
-        "id": "proc_df_accept",
-        "category": "direct_fact",
-        "query": "设备验收的结论是什么？",
-        "guard": "INSUFFICIENT_RELATION"
-      },
-      {
-        "id": "jkj_q_vert_points",
-        "category": "quantity",
-        "query": "竖向位移监测点的点号范围是什么？",
-        "guard": "INSUFFICIENT_RELATION"
-      },
-      {
-        "id": "jkj_m_origin",
-        "category": "model_spec",
-        "query": "电子水准仪的产地是哪里？",
-        "guard": "INSUFFICIENT_RELATION"
-      },
-      {
-        "id": "jkj_tr_freq_table",
-        "category": "table_relation",
-        "query": "各施工阶段的监测频率分别是多少？",
-        "guard": "INSUFFICIENT_RELATION"
-      },
-      {
-        "id": "jkj_tr_waterlevel_row",
-        "category": "table_relation",
-        "query": "水位仪的规格型号与数量是多少？",
-        "guard": "INSUFFICIENT_RELATION"
-      },
-      {
-        "id": "jkj_tr_level_row",
-        "category": "table_relation",
-        "query": "电子水准仪的型号和数量？",
-        "guard": "INSUFFICIENT_RELATION"
-      },
-      {
-        "id": "jkj_lc_projects",
-        "category": "list_coverage",
-        "query": "本工程的监测项目包括哪些？",
-        "guard": "INSUFFICIENT_RELATION"
-      },
-      {
-        "id": "qwen_lc_features",
-        "category": "list_coverage",
-        "query": "Qwen-Image-2.1 的功能有哪些？",
-        "guard": "INSUFFICIENT_RELATION"
-      },
-      {
-        "id": "qwen_so_edit",
-        "category": "section_overview",
-        "query": "Qwen-Image-2.1 的编辑能力怎么样？",
-        "guard": "INSUFFICIENT_RELATION"
-      },
-      {
-        "id": "jkj_se_level_vs_water",
-        "category": "similar_entity",
-        "query": "水准仪的精度要求是什么？",
-        "guard": "INSUFFICIENT_RELATION"
-      },
-      {
-        "id": "jkj_se_base_purpose",
-        "category": "similar_entity",
-        "query": "基准点的作用是什么？",
-        "guard": "INSUFFICIENT_RELATION"
-      },
-      {
-        "id": "jkj_se_alert_freq",
-        "category": "similar_entity",
-        "query": "预警时对应的监测频率是多少？",
         "guard": "INSUFFICIENT_RELATION"
       },
       {

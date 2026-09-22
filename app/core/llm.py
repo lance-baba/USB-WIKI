@@ -32,6 +32,8 @@ from typing import Iterator
 from . import config, net_util, search as search_mod
 from .db import Database
 from .log_util import get_logger
+from .relation_guard import (ROUTE_GUARD, ROUTE_PASS, analyze_relation,  # noqa: F401
+                             blocked_message, evaluate_relation, evidence_hint)
 
 log = get_logger()
 
@@ -637,6 +639,19 @@ class Gateway:
             log.error("检索失败: %s", exc)
             result = search_mod.SearchResult(query=query, route="like")
 
+        # ---- 选择性归因守卫（只覆盖 causal / event / responsibility）----
+        # PASS_THROUGH 时 rq.route != ROUTE_GUARD → 下面完全不介入，**字节级保持原行为**；
+        # 且这里只做一次正则解析，不额外检索、不调模型、不加网络依赖。
+        rq = analyze_relation(query)
+        guard = None
+        if rq.route == ROUTE_GUARD:
+            try:
+                guard = evaluate_relation(rq, result.parents)
+            except Exception as exc:  # noqa: BLE001
+                # 守卫自身绝不能拖垮问答：任何异常都退回 PASS_THROUGH 语义。
+                log.warning("归因守卫异常，按正常回答处理: %s", exc)
+                guard = None
+
         refs = [
             {
                 "id": r.id, "title": r.title, "path": r.path,
@@ -665,11 +680,28 @@ class Gateway:
             hl_terms = [t for t in hl_terms if t in _blob]
         # 首帧注入引用溯源字典（PRD 5.3）
         yield {"type": "references", "refs": refs}
-        yield {
+        meta = {
             "type": "meta", "provider": provider, "route": result.route,
             "counts": result.counts, "warnings": warns + result.warnings,
             "terms": hl_terms[:12],
         }
+        if guard is not None:
+            # 仅在 debug / diagnostics 暴露内部状态；前端主界面仍是「自然语言 + citation」
+            meta["relation_route"] = rq.route
+            meta["relation_type"] = rq.relation_type
+            meta["relation_anchor"] = rq.anchor
+            meta["relation_target"] = rq.target
+            meta["allow_relation_claim"] = guard.allow_relation_claim
+            meta.update(guard.as_dict())
+        yield meta
+
+        # ---- 被守卫拦截：走**受控回答**，绝不把问题交给 LLM 自由生成 ----
+        # 引用帧已在上面下发，所以用户仍能看到 anchor / 冲突证据并自行核验。
+        if guard is not None and not guard.allow_relation_claim:
+            yield {"type": "delta",
+                   "content": blocked_message(rq, guard) + evidence_hint(rq)}
+            yield {"type": "done"}
+            return
 
         if provider == "error":
             yield {"type": "error", "message": warns[-1] if warns else "模型服务不可用"}

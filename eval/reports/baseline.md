@@ -1,9 +1,9 @@
 # USB-WIKI · RAG Eval Lab V1 — Baseline Report
 
-- 生成时间：2026-09-22 21:23:25
+- 生成时间：2026-09-23 07:29:00
 - 题量：**72**（top_k=5，embedder=local_hash(512)  # 离线可复现；不依赖 ollama）
-- 隔离库：`C:\Users\huqih\AppData\Local\Temp\usb-wiki-eval-97dv16y1`（TEMP，未触碰真实 Library）
-- 耗时：0.37s
+- 隔离库：`C:\Users\huqih\AppData\Local\Temp\usb-wiki-eval-cymzopa_`（TEMP，未触碰真实 Library）
+- 耗时：0.39s
 
 ## 总指标
 
