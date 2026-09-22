@@ -8,13 +8,22 @@ const $$ = (s, r) => Array.from((r || document).querySelectorAll(s));
 
 const S = {
   ready: false,
-  refs: [],          // 当前回答的引用字典
+  refs: [],          // 兼容字段：最近一次回答的引用（新代码走 refsByTurn）
+  // A：引用身份必须是 turn-scoped —— [N] 只在单条 assistant 回答内唯一，不是全局唯一。
+  // 每条 assistant turn 自己保存自己的 refs 快照，点击时按「turn_id + ref_id」取回，
+  // 绝不读取最新一轮的 S.refs（否则回答 A 的 [1] 会串到回答 B 的 [1]）。
+  refsByTurn: new Map(),   // turn_id -> [ {id,path,parent_id,snippet,source_start_line,source_end_line,...} ]
+  turn: 0,                 // 当前正在流式输出的 assistant turn id
+  turnSeq: 0,              // turn id 自增计数器
   rendered: "",      // 已渲染的文本（不含滞留缓冲）
   holding: "",       // 未闭合角标滞留缓冲
   full: "",          // 收到的完整文本
   q: "",             // 最近一次提问（证据跳转的高亮词源）
   busy: false,
 };
+
+// B：导航串行化守卫 —— 连续点击不同 citation 时，旧请求不得覆盖较新的点击结果。
+let NOTE_NAV_SEQ = 0;
 
 /* ---------------------------- 工具 ---------------------------- */
 function toast(msg, ms) {
@@ -27,13 +36,17 @@ function esc(s) {
   return String(s == null ? "" : s).replace(/[&<>"']/g, c =>
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
+// 仅用于属性值转义（值为字符串/数字；不破坏 HTML 结构）
+function attrEsc(v) {
+  return String(v == null ? "" : v).replace(/[&"]/g, c => ({ "&": "&amp;", '"': "&quot;" }[c]));
+}
 function api(path, opts) {
   return fetch(path, Object.assign({ headers: { "Content-Type": "application/json" } }, opts || {}))
     .then(r => r.json());
 }
 
 /* -------------------- 轻量 Markdown 渲染 -------------------- */
-function mdToHtml(src) {
+function mdToHtml(src, refs) {
   const blocks = [];
   let text = String(src || "");
   // 代码块先摘出来，避免内部被行内规则污染
@@ -53,11 +66,24 @@ function mdToHtml(src) {
   text = text.replace(/^&gt;\s?(.*)$/gm, "<blockquote>$1</blockquote>");
   text = text.replace(/^\s*[-*]\s+(.+)$/gm, "<p>• $1</p>");
   text = text.replace(/^\s*(\d+)\.\s+(.+)$/gm, "<p>$1. $2</p>");
-  // 引用角标 [^1] / [1]
+  // 引用角标 [^1] / [1] —— turn-scoped：直接把该轮 refs 身份写进 span 的 data-*，
+  // 点击时不再回查全局 S.refs（A：防止跨轮串号）。
+  const refsArr = (refs || []).filter(Boolean);
+  const byId = {};
+  refsArr.forEach(r => { byId[String(r.id)] = r; });
   text = text.replace(/\[\^?(\d+)\]/g, (m, n) => {
-    const ref = S.refs.find(r => String(r.id) === String(n));
-    const tip = ref ? ((ref.display_source || ref.title) + "\n" + ref.path + "\n\n" + (ref.snippet || "")).slice(0, 320) : "引用 " + n;
-    return '<span class="cite" data-ref="' + n + '" data-tip="' + esc(tip).replace(/\n/g, "&#10;") + '">' + n + "</span>";
+    const ref = byId[String(n)];
+    if (!ref) return '<span class="cite" data-ref="' + n + '" data-tip="引用 ' + n + '">' + n + "</span>";
+    const tip = ((ref.display_source || ref.title) + "\n" + ref.path + "\n\n" + (ref.snippet || "")).slice(0, 320);
+    // 引用身份全部内联：点击时由 span 自身数据集驱动，不依赖任何全局状态
+    const attr = (k, v) => " data-" + k + '="' + attrEsc(v) + '"';
+    return '<span class="cite" data-ref="' + n + '"' +
+      attr("path", ref.path || "") +
+      attr("parent-id", ref.parent_id || "") +
+      attr("snippet", ref.snippet || "") +
+      attr("src-start", ref.source_start_line || 0) +
+      attr("src-end", ref.source_end_line || 0) +
+      ' data-tip="' + esc(tip).replace(/\n/g, "&#10;") + '">' + n + "</span>";
   });
   text = text.replace(/\n{2,}/g, "</p><p>");
   text = text.replace(/\n/g, "<br>");
@@ -215,7 +241,7 @@ function renderStream(bub) {
   if (safe === S.rendered) return;
   S.rendered = safe;
   S.holding = S.full.slice(safe.length);
-  bub.innerHTML = mdToHtml(safe) + '<span class="pending-dot"></span>';
+  bub.innerHTML = mdToHtml(safe, bub._refs) + '<span class="pending-dot"></span>';
   $("#chatScroll").scrollTop = $("#chatScroll").scrollHeight;
 }
 
@@ -230,8 +256,10 @@ async function send() {
   input.value = "";
 
   S.full = ""; S.rendered = ""; S.holding = ""; S.refs = [];
+  S.turn = ++S.turnSeq;                // A：新的一轮，分配独立 turn id
   S.q = q;                              // B：证据跳转时高亮查询关键词
   const bub = pushMsg("assistant", '<span class="hint">检索知识库…</span>');
+  bub._refs = [];                      // 本轮的 refs 快照（随 references 帧到达而填充）
 
   try {
     const resp = await fetch("/api/chat/completions", {
@@ -258,7 +286,8 @@ async function send() {
     }
     // 收尾：强制绘制滞留缓冲
     const [safe] = splitHold(S.full);
-    bub.innerHTML = mdToHtml(S.full) + (S.refs.length ? refsHtml(S.refs) : "");
+    const refs = bub._refs || [];
+    bub.innerHTML = mdToHtml(S.full, refs) + (refs.length ? refsHtml(refs) : "");
   } catch (e) {
     bub.innerHTML = '<div class="alert err" style="margin:0">请求失败：' + esc(e.message) + "</div>";
   } finally {
@@ -269,17 +298,22 @@ async function send() {
 }
 
 function refsHtml(refs) {
-  return '<div class="refs">' + refs.map(r =>
-    '<span class="ref" data-ref="' + r.id + '" title="' +
-      esc(r.path + "\n" + (r.snippet || "点击跳转到该笔记")) + '">[' + r.id + "] " +
+  return '<div class="refs">' + refs.map(r => {
+    // 来源 chip：文档级跳转（只打开整篇，不强制跳某 Parent），身份内联 data-path。
+    const attr = (k, v) => " data-" + k + '="' + attrEsc(v) + '"';
+    return '<span class="ref"' + attr("ref", r.id) + attr("path", r.path || "") +
+      ' title="' + esc(r.path + "\n" + (r.snippet || "点击跳转到该笔记")) + '">[' + r.id + "] " +
       // UX-1：来源显示名优先（导入文件→源文件名；剪藏/笔记→标题）
-      esc(r.display_source || r.title) + "</span>"
-  ).join("") + "</div>";
+      esc(r.display_source || r.title) + "</span>";
+  }).join("") + "</div>";
 }
 
 function handleFrame(f, bub) {
   if (f.type === "references") {
-    S.refs = f.refs || [];
+    const refs = f.refs || [];
+    S.refs = refs;                              // 兼容旧引用
+    S.refsByTurn.set(S.turn, refs);            // A：按 turn 保存快照
+    if (bub) bub._refs = refs;                 // 本轮 bubble 自身携带
   } else if (f.type === "meta") {
     (f.warnings || []).forEach(w => toast("⚠ " + w, 3600));
     const [safe] = splitHold(S.full);
@@ -550,11 +584,12 @@ function renderNoteList() {
 
 /* 打开一条笔记（列表项已渲染时使用）。抽成具名函数，供问答引用跳转复用。
  * jump 非空时（B）：证据跳转 —— 打开后按 parent_id 定位证据块并高亮。 */
-async function openNoteItem(el, jump) {
+async function openNoteItem(el, jump, nav) {
     $$("#noteList .list-item").forEach(x => x.classList.remove("active"));
     el.classList.add("active");
     $("#noteTitleBar").textContent = el.querySelector(".t").textContent;
     const r = await api("/api/notes/content?path=" + encodeURIComponent(el.dataset.path));
+    if (nav != null && nav !== NOTE_NAV_SEQ) return;                 // B：有更新的导航已发生 → 放弃
     if (r.code !== 200) {
       NOTE.payload = null;
       $("#noteSeg").hidden = true;
@@ -574,37 +609,57 @@ async function openNoteItem(el, jump) {
       // 若该笔记默认开「原版」，先切回渲染视图再定位。
       NOTE.view = "rendered";
       setNoteView(NOTE.view);
-      jumpToEvidence(el.dataset.path, jump);
+      await jumpToEvidence(el.dataset.path, jump, nav);
       return;
     }
+    // C：打开一篇笔记即清掉上一次引用的持久高亮（用户主动切换了上下文）
+    _clearEvidenceHighlight();
     NOTE.view = orig ? "original" : "rendered";
     setNoteView(NOTE.view);
 }
 
 /* 按路径打开笔记：供问答内文角标 / 底部来源 chips 跳转使用 */
-async function openNoteByPath(path, jump) {
+async function openNoteByPath(path, jump, nav) {
   if (!path) return;
+  if (nav != null && nav !== NOTE_NAV_SEQ) return;                 // B：守卫
   switchTab("notes");
-  await loadNotes();                    // 列表异步渲染，必须等它出来
+  await loadNotes();                                // 列表异步渲染，必须等它出来
+  if (nav != null && nav !== NOTE_NAV_SEQ) return;                 // B：等待期间可能被新点击覆盖
   const find = () => $$("#noteList .list-item").find(x => x.dataset.path === path);
   let el = find();
   if (!el && $("#noteFilter") && $("#noteFilter").value) {
     $("#noteFilter").value = "";        // 可能被过滤词挡住 → 清空后重试
     await loadNotes();
+    if (nav != null && nav !== NOTE_NAV_SEQ) return;
     el = find();
   }
   if (!el) { toast("找不到该笔记（可能已被删除）", 3200); return; }
   el.scrollIntoView({ block: "center" });
-  openNoteItem(el, jump);
+  await openNoteItem(el, jump, nav);
 }
 
 /* -------- B/A：证据精确定位（**源行锚点为主**，snippet 文本仅作旧索索引兜底） --------
    A1/A4：parent_id → source_start_line/source_end_line → 与 DOM 块的
    data-src-start/data-src-end 求交集 → 定位。同一文字在目录与正文各出现一次时，
    两者源行号不同 → 必然落在正文（旧实现在全文搜第一处相同文字，会跳到目录）。 */
-async function jumpToEvidence(path, jump) {
+/* 清掉 noteView 里残留的引用高亮（C：切换笔记/重新点击时调用） */
+function _clearEvidenceHighlight() {
+  const box = $("#noteView");
+  if (!box) return;
+  box.querySelectorAll("mark").forEach(m => {
+    const p = m.parentNode;
+    while (m.firstChild) p.insertBefore(m.firstChild, m);
+    m.remove();
+    if (p.normalize) p.normalize();
+  });
+  box.querySelectorAll(".ev-hl,.ev-hl-persist").forEach(el =>
+    el.classList.remove("ev-hl", "ev-hl-persist"));
+}
+
+async function jumpToEvidence(path, jump, nav) {
   const box = $("#noteView");
   if (!box || !jump) return;
+  if (nav != null && nav !== NOTE_NAV_SEQ) return;                 // B：有更新的导航已覆盖
 
   // 1) 证据块元数据：parent_id → /api/notes/evidence（section_path + content + 源行范围）
   let ev = null;
@@ -612,6 +667,7 @@ async function jumpToEvidence(path, jump) {
     try {
       const r = await api("/api/notes/evidence?path=" + encodeURIComponent(path) +
         "&parent_id=" + encodeURIComponent(jump.parent_id));
+      if (nav != null && nav !== NOTE_NAV_SEQ) return;             // B：证据请求返回前已被新点击覆盖
       if (r.code === 200) ev = r.data;
     } catch (e) { /* 走兜底 */ }
   }
@@ -674,8 +730,10 @@ async function jumpToEvidence(path, jump) {
     region = blocks.slice(start, end + 1);
   }
 
-  // 5) 高亮：上下文=淡蓝块（3.5s 淡化）；证据句=黄色保留；查询词不做永久 mark
-  region.forEach(b => b.classList.add("ev-hl"));
+  // 5) 高亮：上下文=淡蓝块；证据句=黄色保留；查询词不做永久 mark（A7 视觉语义）。
+  // C2：证据标识**持续可见** —— 首次 1s 较明显 pulse，然后转入较浅的 persistent 状态，
+  //     直到用户点击另一个 citation 或打开另一篇笔记才清除（不再 3.5s 后完全消失）。
+  region.forEach(b => { b.classList.remove("ev-hl-fade"); b.classList.add("ev-hl"); });
   const phrases = _evidencePhrases(jump.snippet);
   if (phrases.length) {
     region.forEach(b => {
@@ -686,7 +744,51 @@ async function jumpToEvidence(path, jump) {
     });
   }
   region[0].scrollIntoView({ block: "center", behavior: "smooth" });
-  setTimeout(() => region.forEach(b => b.classList.add("ev-hl-fade")), 3500);
+  // 1s 后从 pulse 转 persistent（仅调淡背景，保留左色边线 + 黄色证据句）
+  setTimeout(() => region.forEach(b => {
+    if (b.classList.contains("ev-hl")) b.classList.replace("ev-hl", "ev-hl-persist");
+  }), 1000);
+}
+
+/* -------- 证据定位辅助（B/A 引用稳定锚点用） -------- */
+function _normTxt(s) {
+  return String(s == null ? "" : s).replace(/\s+/g, " ").trim().toLowerCase();
+}
+function _evBlocks(box) {
+  // 阅读视图的顶层渲染块（带 data-src-* 源行身份），用于与引用源行范围求交集
+  return Array.prototype.filter.call(box.children, b => b.dataset && b.dataset.srcStart);
+}
+function _evidencePhrases(snippet) {
+  // 从 ref.snippet 取真正出现在正文中的证据句：剥离高亮哨兵 \u0001/\u0002，按摘录顺序取前 3 片。
+  // 只负责「高亮哪一句」，不参与「跳到哪里」（跳转只用 source range，见 jumpToEvidence 主路径）。
+  return String(snippet || "")
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, "")
+    .split(/[…\n]|\.\.\./)
+    .map(s => s.replace(/[  - 　]/g, " ").replace(/\s+/g, " ").trim())
+    .filter(s => s.length >= 8)
+    .slice(0, 3);
+}
+function _markNode(node, terms, tag, cls) {
+  // 在文本节点上包 <tag class=cls>，命中最长最靠前的一组 terms；不碰任何标签/属性。
+  const text = node.nodeValue;
+  if (!text || !text.trim()) return;
+  let best = null;
+  for (const t of terms) {
+    if (!t) continue;
+    const i = text.toLowerCase().indexOf(String(t).toLowerCase());
+    if (i >= 0 && (!best || i < best.i)) best = { i, t: String(t) };
+  }
+  if (!best) return;
+  const frag = document.createDocumentFragment();
+  if (best.i > 0) frag.appendChild(document.createTextNode(text.slice(0, best.i)));
+  const mk = document.createElement(tag);
+  mk.className = cls || "";
+  mk.textContent = text.slice(best.i, best.i + best.t.length);
+  frag.appendChild(mk);
+  const tail = document.createTextNode(text.slice(best.i + best.t.length));
+  frag.appendChild(tail);
+  node.parentNode.replaceChild(frag, node);
+  _markNode(tail, terms, tag, cls);          // tail 严格更短 → 必然终止
 }
 
 /* -------- 笔记视图：渲染 / 原版 / 源码 -------- */
@@ -1317,21 +1419,26 @@ function switchTab(name) {
   if (name === "settings") { loadConfig(); pollStatus(false); }
 }
 
-/* 问答引用跳转（B）：
+/* 问答引用跳转（A/B）：
  * 正文角标 [N]（.cite）= **证据**：打开笔记 → 按 parent_id 定位证据块 → 滚动 + 高亮；
  * 底部来源 chips（.ref）= **文档**：只打开整篇资料，不强制跳某个 Parent。
- * 语义区分：数字 = 证据，来源名 = 文档。 */
-document.addEventListener("click", function (ev) {
+ * 语义区分：数字 = 证据，来源名 = 文档。
+ * A：引用身份全部内联在 span 的 data-* 上（turn-scoped，绝不回查全局 S.refs）。
+ * B：整条链 await 串行化 + NOTE_NAV_SEQ 守卫，连续点击时旧请求不得覆盖较新结果。 */
+document.addEventListener("click", async function (ev) {
   const chip = ev.target && ev.target.closest ? ev.target.closest(".cite,.ref") : null;
   if (!chip) return;
-  const id = chip.dataset.ref;
-  const ref = (S.refs || []).find(function (r) { return String(r.id) === String(id); });
-  if (!ref) { toast("该引用没有对应的笔记路径", 2600); return; }
+  const path = chip.dataset.path;
+  if (!path) { toast("该引用没有对应的笔记路径", 2600); return; }
   const isCite = chip.classList.contains("cite");
-  openNoteByPath(ref.path, isCite ? {
-    parent_id: ref.parent_id || "",
-    snippet: ref.snippet || ""
-  } : null);
+  const jump = isCite ? {
+    parent_id: chip.dataset.parentId || "",
+    snippet: chip.dataset.snippet || "",
+    source_start_line: Number(chip.dataset.srcStart) || 0,
+    source_end_line: Number(chip.dataset.srcEnd) || 0,
+  } : null;
+  const nav = ++NOTE_NAV_SEQ;             // B：本次导航序号
+  await openNoteByPath(path, jump, nav);
 });
 
 /* ---------------------------- 绑定 ---------------------------- */

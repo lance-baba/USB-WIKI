@@ -984,6 +984,20 @@ def _tiered_recall(db: Database, scope: list[str], target: list[str],
     return ordered, tier_of, (route or "like")
 
 
+#: 查询功能词（模型/型号类问句里不算「目标实体」的废词）。D5：实体必须是设备名词本身，
+#: 不能把「的 / 是什么型号 / 规格」这类问句骨架当实体，否则会误匹配一大片无关块。
+_MODEL_QSTOP = {
+    "的", "了", "吗", "呢", "是什么", "是什么型号", "型号", "规格", "什么", "哪些", "有",
+    "在", "是", "如何", "怎么样", "介绍", "总结", "功能", "特点", "用途", "情况", "内容",
+    "信息", "能力", "特性", "支持", "包含", "包括", "要求", "规定", "安排", "主要", "核心",
+    "相关", "具体",
+}
+#: 型号型 token：品牌/字母前缀 + 数字（DINI03 / GM-101 / TL-03D / XY-1 / SW-30 / CX-70）。
+#: 关键：**至少 2 个字母** —— 排除「N2」「1mm」「±1mm」这类精度/单位表达（D2：
+#: 数字 + mm/米/精度/级别/有效期 不能单独证明型号）。
+_MODEL_TOKEN = re.compile(r"[A-Za-z]{2,5}[- ]?\d{1,4}[A-Za-z]?")
+
+
 def _answer_type_bonus(text: str, section_path: str, target: list[str],
                        qtype: str) -> float:
     """答案类型感知的**轻量**排序信号（P0-7）。
@@ -1017,8 +1031,20 @@ def _answer_type_bonus(text: str, section_path: str, target: list[str],
             return 1.2
         return 0.0
     if qtype == "model":
-        if re.search(r"([A-Z]{1,5}[- ]?\d{1,4}[A-Za-z]?|\d+(\.\d+)?\s*(mm|米))", t):
-            return 1.5
+        # D2/D3/D5：型号信号必须 = **目标实体 + 型号型 token 同块出现**（markdown 表格行/同一句）。
+        # 删除旧的错误规则（「数字 + mm/米」会让 ±1mm 误得型号加分）。
+        entity_terms = [x for x in (target or []) if len(x) >= 2 and x not in _MODEL_QSTOP]
+        has_model = bool(_MODEL_TOKEN.search(t))
+        has_entity = any(term and term in t for term in entity_terms)
+        if has_entity and has_model:
+            return 2.5                          # 强信号：实体 ↔ 型号 直接关系（设备表行）
+        if has_model and re.search(r"(设备|规格|型号|仪器|材料)", section_path or ""):
+            return 1.2                          # 次信号：型号型 token 落在「设备/规格型号」章节
+        if has_entity:
+            return 0.4                          # 提到了目标设备，但本块不含型号值（弱）
+        # D4：纯精度/等级/有效期/施工方法块，且不含型号/实体 → 明显降权（除非用户问的就是精度）
+        if re.search(r"(精度|等级|检定|有效期|有效期至|合格|校准|误差|读数)", t):
+            return -0.8
         return 0.0
     if qtype == "location":
         if re.search(r"(位于|位置|点号|编号|标号)", t):

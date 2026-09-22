@@ -3716,6 +3716,9 @@ def main() -> int:
         # Fast P0：引用 stable anchor（源行范围）+ 章节覆盖 + 日志格式化契约
         from tests.test_citation_anchor import run as _run_anchor
         _run_anchor(ctx, check, section, skip)
+        # Fast P0：型号/规格查询必须优先「目标实体 ↔ 型号」直接关系（D 类）
+        from tests.test_model_retrieval import run as _run_model
+        _run_model(ctx, check, section, skip)
         # 安全保险丝：破坏性测试只能碰隔离 Library（事故后新增，永远先跑）
         from tests.test_harness_safety import run as _run_safety
         _run_safety(ctx, check, section, skip)
