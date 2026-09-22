@@ -147,6 +147,8 @@
     border:1px solid rgba(79,70,229,.16);color:var(--accent);cursor:pointer;max-width:260px;
     overflow:hidden;text-overflow:ellipsis;white-space:nowrap
   }
+  /* 「来源」是文档级列表：同一文档被引用多处时的 ×N 计数（弱化，不抢来源名） */
+  .ref .ref-n{opacity:.6;font-size:10.5px;margin-left:3px;font-variant-numeric:tabular-nums}
   .composer{display:flex;gap:10px;align-items:flex-end;padding-top:12px;border-top:1px solid var(--line)}
   .composer textarea{min-height:46px;max-height:150px;resize:none}
 

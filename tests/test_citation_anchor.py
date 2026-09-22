@@ -105,7 +105,15 @@ title: "重复标题 fixture"
     check("B4 概览型问句识别为 coverage（不被 datetime 抢走）",
           ana.question_type == "coverage", ana.question_type)
     res2 = search_mod.hybrid_search(db, emb, q, top_k_parents=5)
-    check("B3 引用角标仍限 top_k（不放大）", len(res2.references) <= 5, str(len(res2.references)))
+    # ⚠ 不变量（2026-09-22 修）：coverage 的 context 会扩展到 >top_k 个父块，
+    # 引用必须**逐个建立**（编号 ≡ 引用 id），否则模型照编号写的 [N] 前端解析不到。
+    # 旧断言「引用角标 ≤ top_k」把这条 bug 固化成了期望，已删除并改为：
+    check("B3 编号空间 ≡ 引用空间（每条 context 父块都可被引用解析）",
+          len(res2.references) == len(res2.parents) and
+          [r.id for r in res2.references] == list(range(1, len(res2.references) + 1)),
+          str((len(res2.references), len(res2.parents))))
+    check("B3 每条引用都可点击（path 非空）",
+          all(r.path for r in res2.references))
     prompt = llm.Gateway.build_prompt(q, res2, None)
     check("B5 context 含频率表", "1次/1d" in prompt and "1次/3d" in prompt)
     check("B5 context 含后续全部条件项",

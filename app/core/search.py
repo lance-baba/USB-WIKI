@@ -1444,7 +1444,6 @@ def hybrid_search(
         final = round(float(acc["max"]) + lex + ans + multi, 6)
         ranked.append((pid, acc, pr, final))
     ranked.sort(key=lambda x: x[3], reverse=True)
-    ref_cap = max(top_k_parents, 1)          # 正文引用角标数量不变
 
     # B2/B3：概览/覆盖型问句（「X 是怎么样的」「X 的功能有哪些」）要的是**整节**内容。
     # 用**排序第一的父块**自带 metadata（doc_id / section_path / ord）做章节扩展：
@@ -1510,17 +1509,12 @@ def hybrid_search(
             doc_cache[did] = " ".join(x for x in (t, disp, rel) if x)
         title, rel_path, display_source = _doc_row(db, did)
         title = title or did
-        if idx > ref_cap:
-            # 覆盖型扩展块：只进 context，不占引用角标（数字=证据，保持简洁）
-            parents.append({
-                "parent_id": pid, "doc_id": did, "title": title,
-                "display_source": display_source or title, "path": rel_path,
-                "content": pr["content"], "section_path": pr["section_path"],
-                "source_start_line": int(pr.get("source_start_line") or 0),
-                "source_end_line": int(pr.get("source_end_line") or 0),
-                "score": round(acc["max"], 6), "similarity": acc["sim"],
-            })
-            continue
+        # ⚠ 不变量：**片段编号 [i] 必须与引用 id i 一一对应**。
+        # build_prompt 按 result.parents 顺序编号 [1]..[N]；若某些父块只进 context
+        # 而不建引用（旧实现用 ref_cap=top_k 截断），模型照编号写的 [6]+ 在前端就
+        # 解析不到（只有 1..top_k 存在）→ 正文角标成片「点不过去」。
+        # 覆盖型问句的 context 本就会扩展到 >top_k 个父块，故这里**逐个建引用**：
+        # 编号空间 ≡ 引用空间。底部「来源」列表由前端按文档去重，不会因此变长。
         references.append(Reference(
             id=idx, title=title, path=rel_path, snippet=_snippet(pr["content"], query),
             parent_id=pid, doc_id=did, score=round(acc["max"], 6), similarity=acc["sim"],
@@ -1536,9 +1530,10 @@ def hybrid_search(
             "path": rel_path,
             "content": pr["content"],
             "section_path": pr["section_path"],
+            "source_start_line": int(pr.get("source_start_line") or 0),
+            "source_end_line": int(pr.get("source_end_line") or 0),
             "score": round(acc["max"], 6),
             "similarity": acc["sim"],
-            "_lex": score,
         })
 
     result.references = references

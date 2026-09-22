@@ -304,11 +304,29 @@ def run(ctx, check, section, skip) -> None:  # noqa: ARG001
               len(cov_secs) >= 4, str(sorted(cov_secs)))
         check("coverage：用户点名的功能章节全部进 Top5",
               checks_needed <= cov_secs, str(sorted(checks_needed - cov_secs)))
-        # B2/B3 起：coverage 的 **context（parents）** 允许有界扩展（整节覆盖），
-        # 但**引用角标**仍严格限 top_k —— 数字=证据，保持简洁。
-        check("coverage：引用角标仍 ≤ top_k（未放大）",
-              len(cov.references) <= 5, str(len(cov.references)))
-        check("coverage：context 按章节扩展（parents ≥ references）",
-              len(cov.parents) >= len(cov.references), str((len(cov.parents), len(cov.references))))
+        # ⚠ 不变量（2026-09-22 修）：**提示词片段编号 ≡ 引用 id 空间**。
+        # build_prompt 按 result.parents 顺序编号 [1]..[N]；每个编号都必须能解析到
+        # 一条带 path 的引用，否则正文角标成片「点不过去」（用户真机反馈）。
+        # 旧实现把引用数硬截到 top_k=5，而 coverage 的 context 可有 ~14 个父块 →
+        # 模型照编号写的 [6]+ 在前端全部解析失败。旧断言「引用角标 ≤ top_k」当年
+        # 把这条 bug 固化成了「期望」，此处改为断言真正的不变量。
+        check("coverage：编号空间 ≡ 引用空间（references 与 parents 一一对应）",
+              len(cov.references) == len(cov.parents),
+              str((len(cov.references), len(cov.parents))))
+        check("coverage：引用 id 连续 1..N（与提示词片段编号一一对应）",
+              [r.id for r in cov.references] == list(range(1, len(cov.references) + 1)),
+              str([r.id for r in cov.references][:10]))
+        check("coverage：每条引用都可点击（path 非空）",
+              all(r.path for r in cov.references),
+              str([r.id for r in cov.references if not r.path]))
+
+        # 直接验证提示词：出现过的最大片段编号必须 ≤ 引用数（即都能解析）。
+        import re as _re
+        from app.core import llm as _llm
+        _prompt = _llm.Gateway.build_prompt("监测频率是怎么样的", cov, None)
+        _nums = [int(m) for m in _re.findall(r"\[(\d+)\] 来源：", _prompt)]
+        check("coverage：提示词里出现过的最大片段编号都能解析到引用",
+              bool(_nums) and max(_nums) <= len(cov.references),
+              f"max={max(_nums) if _nums else None} refs={len(cov.references)}")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

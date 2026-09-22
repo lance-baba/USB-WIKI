@@ -298,13 +298,25 @@ async function send() {
 }
 
 function refsHtml(refs) {
-  return '<div class="refs">' + refs.map(r => {
+  // 底部「来源」是**文档级**列表：同一篇文档只出现一次。
+  // 旧实现按父块逐条渲染 → 一次覆盖型回答会把同一份报告列 5~14 遍（用户看到
+  // 一排一模一样的标签）。正文里的 [N] 角标才是逐条证据，来源列表只回答
+  // 「答案来自哪几篇资料」。同一文档被引用多处时用 ×N 标注。
+  const seen = new Map();
+  refs.forEach(r => {
+    const key = r.path || (r.display_source || r.title);
+    if (!seen.has(key)) seen.set(key, { r, n: 0 });
+    seen.get(key).n += 1;
+  });
+  const uniq = [...seen.values()];
+  const attr = (k, v) => " data-" + k + '="' + attrEsc(v) + '"';
+  return '<div class="refs">' + uniq.map(({ r, n }) => {
     // 来源 chip：文档级跳转（只打开整篇，不强制跳某 Parent），身份内联 data-path。
-    const attr = (k, v) => " data-" + k + '="' + attrEsc(v) + '"';
-    return '<span class="ref"' + attr("ref", r.id) + attr("path", r.path || "") +
-      ' title="' + esc(r.path + "\n" + (r.snippet || "点击跳转到该笔记")) + '">[' + r.id + "] " +
+    const cnt = n > 1 ? ' <span class="ref-n">×' + n + "</span>" : "";
+    return '<span class="ref"' + attr("path", r.path || "") +
+      ' title="' + esc((r.path || "") + "\n" + (r.snippet || "点击跳转到该笔记")) + '">' +
       // UX-1：来源显示名优先（导入文件→源文件名；剪藏/笔记→标题）
-      esc(r.display_source || r.title) + "</span>";
+      esc(r.display_source || r.title) + cnt + "</span>";
   }).join("") + "</div>";
 }
 
