@@ -73,3 +73,6 @@ wiki-usb.pid
 # RAG Eval Lab：私人题库/私人语料不入库（公开仓库只保留 core_gold）
 eval/datasets/private/*
 !eval/datasets/private/.gitkeep
+
+# Reranker Spike：模型只用于开发 A/B，绝不入库/进包
+eval/models/

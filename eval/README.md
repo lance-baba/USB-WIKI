@@ -116,6 +116,42 @@ python3 eval/run_eval.py compare --candidate reranker
   真正有意义的是**同一套 gold 下 baseline 与 candidate 的相对差异**，以及**各类别的失败结构**。
 * 词表匹配（`must_contain`）是**代理指标**，不等于人判断的相关性。
 
+## Reranker Spike V1 结论（2026-09-22，`reranker_spike.py`）
+
+两个候选（**ONNX int8 导出**，纯 CPU，Windows）：
+
+| | bge-reranker-base | bge-reranker-v2-m3 |
+| --- | --- | --- |
+| 上游 / license | BAAI/bge-reranker-base · MIT | BAAI/bge-reranker-v2-m3 · Apache-2.0 |
+| 本地路径 | `eval/models/bge-reranker-base` | `eval/models/bge-reranker-v2-m3` |
+| 磁盘(int8) / fp32 参考 | 287.5MB / 1061MB | 560.6MB / 2166MB |
+| 加载 / 首问 / p50 / p95 | 2.1s / 434ms / **28ms** / 320ms | 4.9s / 1634ms / **81ms** / 1022ms |
+| RAM 增量（加载 → 预热） | +532MB → **+713MB** | +866MB → **+1270MB** |
+| Recall@1 Δ（主 pool N20） | **+0.0pp** | **+1.5pp** |
+| 标签 | `WEAK` | `WEAK`（N10 时 +3.0pp → `MARGINAL`） |
+
+**结论：目前不值得进产品。** 依据：
+1. **净收益约等于零**：base 修好 5 题 / 改坏 5 题（净 0）；v2-M3 修好 7 / 改坏 6（净 +1）。
+   R@1 的 +1.5pp 是"换来换去"的结果，不是稳定增益。
+2. **引入真实回退**：`attribution_violation_rate` **0% → 20%**（`wea_at_typhoon_frost`
+   被重排成命中陷阱词）；base 的 `table_relation` R@1 66.7% → **50%**。
+3. **代价很大**：磁盘 +288MB/+561MB（当前精简包仅 122MB）、常驻 RAM +0.7~1.3GB，
+   而 USB-WIKI 定位是**便携、不要求独显**。
+
+**它确实修好了什么**（局部有效，aggregate 被抵消）：基线 3 个 RERANK 失败题
+（监测目的 / 观测人员有哪些 / 人员配置）全部被拉回 top-5；`水准仪是什么型号？`
+被 v2-M3 从第 3 名**提到第 1 名**（DINI03 证据）。这印证了"正确证据已在候选里、只是没排第一"
+的判断 —— 但 cross-encoder 同时把它认为"更像"的其它段落也提了上来。
+
+⚠ **指标口径提醒**：`trap_hit` 的判据是"top-1 证据父块里出现了 must_not_contain 词"。
+对**表格型证据**会过严 —— 例如 `jkj_m_level_model` 的正确证据父块是整张设备表，同一块里
+本来就含有干扰行 `水位仪 SW-30`，于是被判为"命中陷阱"。这类需按表格行级别判定，
+本轮未细分，故把它与真正的归因回退（`wea_at_typhoon_frost`）区分看待。
+
+**若将来要重试 reranker**，优先验证：① 只在 `model_spec` / `person` / `table_relation`
+这类"实体↔值"问题上启用（这两类确实 +20~40pp）；② 按需加载 + 高配才开，避免常驻内存；
+③ 先解决 rerank 后 top-1 反而变差的 5~6 题再谈上线。
+
 ## 下一实验（仅登记设计，本轮不实现）
 
 ```text
