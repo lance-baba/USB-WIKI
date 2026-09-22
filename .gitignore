@@ -69,3 +69,7 @@ id_ed25519
 
 # 无控制台启动时写入的运行时 PID（供停止脚本使用），不入库
 wiki-usb.pid
+
+# RAG Eval Lab：私人题库/私人语料不入库（公开仓库只保留 core_gold）
+eval/datasets/private/*
+!eval/datasets/private/.gitkeep
