@@ -124,13 +124,22 @@ title: "重复标题 fixture"
     # F：引用跳转后的**关键字高亮** —— 高亮词来自「问题实词」，由后端 meta 帧下发。
     # 为什么不让前端从 snippet 提取：snippet 带 Markdown 语法（### / | / ---），
     # 文本精确匹配必然失败（用户真机反馈「跳过去后没有高亮」）。
-    f_terms = [t for t in search_mod.content_terms(q) if len(t) >= 2]
-    check("F 问题实词可作为高亮词（meta 帧 terms 来源）",
+    f_terms = search_mod.highlight_terms(q)
+    check("F 高亮词可真在正文匹配（meta 帧 terms 来源）",
           "监测频率" in f_terms, str(f_terms))
-    # 脏词过滤：单字/疑问词不进高亮词表（否则满屏乱标）
-    dirty = [t for t in search_mod.content_terms("水准仪是什么型号的") if len(t) < 2]
-    check("F 高亮词表按长度过滤（单字疑问词不入表）",
-          all(len(t) >= 2 for t in f_terms), str(dirty))
+    # 实测坑：content_terms(「水平位移监测点怎么布置」) → ['水平位移监测点怎', '布置']，
+    # 尾字「怎」是「怎么」被 _CJK_SPLIT_CHARS 从中间切断的残留，拿去高亮永远匹配不上。
+    hard = search_mod.highlight_terms("水平位移监测点怎么布置")
+    check("F 高亮词剥掉尾部疑问字残留（…监测点怎 → …监测点）",
+          "水平位移监测点" in hard and all("怎" not in t for t in hard), str(hard))
+    check("F 高亮词不含疑问字（怎/么/哪/几… 不作高亮词）",
+          all(not any(c in search_mod._QCHARS for c in t) for t in hard), str(hard))
+    check("F 高亮词按长度降序（长词优先，避免被短词切碎）",
+          f_terms == sorted(f_terms, key=len, reverse=True), str(f_terms))
+    # 只下发**确实出现在证据里**的词（保证前端一定高亮得到；都不出现则留空走兜底）
+    _blob = "\n".join((p.get("content") or "") for p in res2.parents)
+    _kept = [t for t in f_terms if t in _blob]
+    check("F 高亮词过滤后仍非空（证据里真的有这些词）", bool(_kept), f"{_kept} / {f_terms}")
 
     section("C：日志格式化（Mapping 参数不得被强转）")
     import io

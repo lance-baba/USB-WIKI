@@ -653,9 +653,16 @@ class Gateway:
         # 关键词高亮（UX）：把「问题实词」随 meta 帧下发，前端在**证据区域内**高亮这些词，
         # 引用跳转后一眼看到命中点。为什么不让前端自己从 snippet 提取：ref.snippet 是带
         # Markdown 语法（### / | / ---）的摘录，按文本精确匹配必然失败（用户真机反馈）。
-        hl_terms = [t for t in (search_mod.content_terms(query) or []) if len(t) >= 2]
-        if not hl_terms:
-            hl_terms = [t for t in (getattr(result, "lex_terms", None) or []) if len(t) >= 2]
+        # 关键词高亮（UX）：把「问题实词」随 meta 帧下发，前端在**证据区域内**高亮这些词，
+        # 引用跳转后一眼看到命中点。两条硬约束：
+        #   ① 不让前端自己从 snippet 提取 —— snippet 带 Markdown 语法（### / | / ---），
+        #      文本精确匹配必然失败（用户真机反馈「跳过去没有高亮」）；
+        #   ② 只下发**确实出现在本次证据里**的词 —— 保证前端一定高亮得到。若一条都不出现
+        #      （证据措辞与提问不同），留空让前端退回「证据句片段」高亮（尽力而为）。
+        hl_terms = search_mod.highlight_terms(query)
+        if hl_terms:
+            _blob = "\n".join((p.get("content") or "") for p in result.parents)
+            hl_terms = [t for t in hl_terms if t in _blob]
         # 首帧注入引用溯源字典（PRD 5.3）
         yield {"type": "references", "refs": refs}
         yield {

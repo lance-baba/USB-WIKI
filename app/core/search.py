@@ -215,6 +215,43 @@ def content_terms(query: str) -> list[str]:
     return sets[0] if sets else []
 
 
+def highlight_terms(query: str) -> list[str]:
+    """「引用跳转后高亮关键字」专用词表。
+
+    与检索实词（``content_terms``）要求不同：检索词只要「能召回」即可，高亮词必须
+    **干净且真能在正文里被看到**，否则等于没高亮。
+
+    实测坑：``content_terms("水平位移监测点怎么布置")`` → ``['水平位移监测点怎', '布置']``
+    —— ``_CJK_SPLIT_CHARS`` 含「么」，「怎么」被从中间切断，留下尾字「怎」黏在词尾，
+    拿它去正文里精确匹配**永远匹配不上**（用户真机反馈「跳过去没有高亮」的同类根因）。
+    这里对每个词**再剥一次边上的疑问字**（怎/么/哪/几/何/啥…），剥完不足 2 字的丢掉；
+    若全被剥光则退回未剥的词表（宁可多标，不可不标）。
+    """
+    cands = [str(t) for t in (content_terms(query) or [])] or \
+            [str(t) for t in query_terms(query)]
+    out: list[str] = []
+    for t in cands:
+        s = t.strip()
+        for _ in range(3):                      # 最多剥三层，避免把真词越剥越碎
+            before = s
+            while s and s[0] in _QCHARS:
+                s = s[1:]
+            while s and s[-1] in _QCHARS:
+                s = s[:-1]
+            if s == before:
+                break
+        if len(s) >= 2:
+            out.append(s)
+    if not out:
+        out = [t for t in cands if len(t) >= 2]
+    uniq: list[str] = []
+    for t in out:                               # 去重保序 → 再按长度降序（长词优先）
+        if t not in uniq:
+            uniq.append(t)
+    uniq.sort(key=len, reverse=True)
+    return uniq[:12]
+
+
 # --------------------------------------------------------------------------
 # 轻量确定性 Query Analysis（P0-3）—— 不引入任何分词/大模型依赖
 # --------------------------------------------------------------------------
