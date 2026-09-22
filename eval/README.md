@@ -15,16 +15,81 @@
 ```text
 eval/
 ├─ README.md
-├─ run_eval.py            # Harness：baseline / compare
-├─ build_gold.py          # 维护者工具：生成 gold 并做完整性校验
+├─ run_eval.py            # Harness：baseline（默认 DEV）/ baseline --holdout / compare
+├─ depth_control.py       # V1.1：A0/A1/A2 候选池深度对照（隔离"加深 pool"与"rerank"）
+├─ reranker_spike.py      # V1：reranker 离线 A/B（fetch / verify / run）
+├─ build_gold.py          # 维护者工具：生成 DEV+HOLDOUT gold 并做完整性校验
 ├─ datasets/
-│  ├─ core_gold.jsonl     # 72 条 gold（14 类）
+│  ├─ core_gold.jsonl     # **DEV SET**：72 条（14 类，每条带 "split": "dev"）
+│  ├─ holdout/
+│  │  └─ holdout_gold.jsonl  # **HOLDOUT**：35 条（10 类，"split": "holdout"）
 │  └─ private/            # 私人题库（gitignore；本地专用）
-├─ fixtures/              # **gold 的唯一来源**：6 篇 Markdown 语料（4 主题 + 2 干扰）
+├─ fixtures/              # **DEV gold 的唯一来源**：6 篇语料（4 主题 + 2 干扰）
+├─ fixtures_holdout/      # HOLDOUT 语料：4 篇（桥梁 / 隧道 / 仪器手册 / 天气日志）
+├─ models/                # reranker 权重（gitignored；持久保存，可长期复用）
 └─ reports/
-   ├─ baseline.json
-   └─ baseline.md
+   ├─ baseline.{json,md}            # DEV
+   ├─ baseline_holdout.{json,md}    # HOLDOUT（显式 --holdout 才生成）
+   ├─ reranker_benchmark.{json,md}
+   └─ depth_control.{json,md}
 ```
+
+## DEV / HOLDOUT 分离（V1.1）
+
+| split | 文件 | 语料 | 用途 |
+| --- | --- | --- | --- |
+| **DEV** | `datasets/core_gold.jsonl`（72 题） | `fixtures/` | 日常开发、bug 分析、方案选择 |
+| **HOLDOUT** | `datasets/holdout/holdout_gold.jsonl`（35 题） | `fixtures_holdout/` | **仅阶段性 release decision** |
+
+⚠ **现有 72 题已正式标记为 DEV SET**（每条带 `"split": "dev"`）。它们参与过 bug 分析、reranker
+选择与架构决策，**今后不得称其为 unbiased test**，也不得据此宣称泛化能力。
+
+### Holdout 防泄漏规则（必须遵守）
+
+1. 开发阶段**只输出 DEV 指标**；Holdout **默认锁定**。
+2. 只有显式开关才跑：`... run_eval.py baseline --holdout`
+3. `compare` **不会**自动跑 Holdout（它只读已产出的报告文件）。
+4. **不要根据 Holdout 的逐题失败去调算法** —— 那就是过拟合。Holdout 只用于阶段性 release decision。
+5. Holdout 语料与 DEV 语料**完全分离**：不同领域、不同表达、不同结构，**不是 DEV 问题的改写**。
+6. 每次动完算法，**先看 DEV**；只有到"要决定是否发布"时才跑一次 Holdout。
+
+### Holdout 首次运行（35 题，locked → 显式开启）
+
+Recall@1 **90.3%** · Recall@3/@5 **100%** · MRR 0.941 · Coverage 100% · Relation 100% ·
+Wrong-doc 0% · No-answer FP 0% · **Attribution 误归因 25%（1/4）**
+
+> 值得注意：**Attribution 在完全独立的语料上依然出问题**
+> （`ho_at_sand_fog`：把"沙尘"错配到"高速公路临时封闭"，那是大雾的影响）。
+> 这是 holdout 独立确认的真实弱点，不是 DEV 的偶然。
+
+## Candidate Depth Control（V1.1）
+
+同一套生产 `hybrid_search()`，**算法一行未改**。A2/A1 只加深候选池、**保持原始排序**，再截 Top5。
+
+| 指标 | A0 生产 Top5 | A2 pool10 | A1 pool20 | rerank base | rerank v2-M3 |
+| --- | --- | --- | --- | --- | --- |
+| Recall@1 | 69.7% | 69.7% | 69.7% | 69.7% | **71.2%** |
+| Recall@3 | 92.4% | 92.4% | 92.4% | 95.5% | **97.0%** |
+| Recall@5 | 93.9% | 93.9% | 93.9% | 98.5% | 98.5% |
+| MRR | 0.804 | 0.804 | 0.804 | 0.824 | 0.839 |
+| Coverage group | 79.3% | 79.3% | 79.3% | 96.4% | 96.4% |
+| Coverage full | 57.1% | 57.1% | 57.1% | 85.7% | 85.7% |
+| Relation | 100% | 100% | 100% | 100% | 100% |
+| Wrong-doc | 3.0% | 3.0% | 3.0% | 1.5% | 1.5% |
+| Attribution err | 0.0% | 0.0% | 0.0% | 20.0% | 20.0% |
+| **Candidate Recall@pool** | **93.9%** | **95.5%** | **98.5%** | — | — |
+
+**结论要分两层说，不能只说一句「pool 没用」：**
+
+1. **pool 加深不改变头部**：A0 / A2 / A1 的 top-5 **逐题完全相同（含顺序）**，所有头部指标一字未动。
+   → 上一轮 reranker 报告里的 Recall@3/5 与 Coverage 提升，**100% 来自重排**，而不是候选池加深。
+2. **但 pool 加深确实抬高了「天花板」**：Candidate Recall@pool 93.9% → 95.5% → **98.5%**。
+   多出来的那部分证据**全部排在 5 名之后**，没有重排就永远浮不上来。
+   → 这既解释了 reranker 为什么有效（它能把 5 名后的证据提上来），也说明
+   **pool 的红利只有重排才能兑现**；单纯加深 pool 不改变任何用户可见指标。
+
+**本轮未构建 Evidence Selector**（MMR / section diversity / 新打分 / prompt 改动），
+按要求只把实验口径搞干净。
 
 ## 运行
 

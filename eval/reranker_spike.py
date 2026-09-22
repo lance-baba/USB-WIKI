@@ -291,6 +291,11 @@ def _content_of(parents, ref):
     return ""
 
 
+def _same_line(content: str, a: str, b: str) -> bool:
+    """关系必须**同一行**成立（表格行 / 同一句），不能只是"同文共现"。"""
+    return any((a in ln and b in ln) for ln in (content or "").splitlines())
+
+
 def metrics_for(cases, ranking, parents, docs):
     """ranking: {case_id: [refs...]}（已重排，取前 5 用）。"""
     rows = []
@@ -316,6 +321,11 @@ def metrics_for(cases, ranking, parents, docs):
         if mustnot:
             top1 = _content_of(parents, refs[0]) if refs else ""
             row["trap"] = any(t in top1 for t in mustnot)
+        rel = exp.get("relation")
+        if rel:
+            e, v = rel
+            row["relation_ok"] = any(
+                _same_line(_content_of(parents, r), e, v) for r in refs[:5])
         rows.append(row)
     return rows
 
@@ -337,6 +347,7 @@ def aggregate(rows):
         "mrr": statistics.fmean([r["rr"] for r in ans]) if ans else None,
         "coverage_group_recall": statistics.fmean([r["cov_group"] for r in covr]) if covr else None,
         "coverage_full_rate": rate(covr, "cov_full"),
+        "relation_accuracy": rate([r for r in rows if "relation_ok" in r], "relation_ok"),
         "wrong_document_rate": rate(ans, "wrong_doc"),
         "no_answer_fp_rate": rate(neg, "trap"),
         "attribution_violation_rate": rate(att, "trap"),
@@ -576,12 +587,13 @@ def render_md(rep: dict) -> str:
          "| 指标 | Baseline | " + " | ".join(names) + " |",
          "| --- | --- | " + " | ".join(["---"] * len(names)) + " |"]
     keys = ["recall@1", "recall@3", "recall@5", "mrr", "coverage_group_recall",
-            "coverage_full_rate", "cat_model_spec_r@1", "cat_person_r@1",
+            "coverage_full_rate", "relation_accuracy", "cat_model_spec_r@1", "cat_person_r@1",
             "cat_similar_entity_r@1", "cat_table_relation_r@1", "cat_direct_fact_r@1",
             "wrong_document_rate", "no_answer_fp_rate", "attribution_violation_rate"]
     labels = {"recall@1": "Recall@1", "recall@3": "Recall@3", "recall@5": "Recall@5",
               "mrr": "MRR", "coverage_group_recall": "Coverage group",
-              "coverage_full_rate": "Coverage full", "cat_model_spec_r@1": "model_spec R@1",
+              "coverage_full_rate": "Coverage full", "relation_accuracy": "Relation",
+              "cat_model_spec_r@1": "model_spec R@1",
               "cat_person_r@1": "person R@1", "cat_similar_entity_r@1": "similar_entity R@1",
               "cat_table_relation_r@1": "table_relation R@1", "cat_direct_fact_r@1": "direct_fact R@1",
               "wrong_document_rate": "Wrong-doc", "no_answer_fp_rate": "No-answer FP",

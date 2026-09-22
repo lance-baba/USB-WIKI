@@ -1,9 +1,9 @@
 # USB-WIKI · RAG Eval Lab V1 — Baseline Report
 
-- 生成时间：2026-09-22 20:29:49
+- 生成时间：2026-09-22 21:23:25
 - 题量：**72**（top_k=5，embedder=local_hash(512)  # 离线可复现；不依赖 ollama）
-- 隔离库：`C:\Users\huqih\AppData\Local\Temp\usb-wiki-eval-8gevup7k`（TEMP，未触碰真实 Library）
-- 耗时：24.74s
+- 隔离库：`C:\Users\huqih\AppData\Local\Temp\usb-wiki-eval-97dv16y1`（TEMP，未触碰真实 Library）
+- 耗时：0.37s
 
 ## 总指标
 
@@ -57,85 +57,6 @@
 | jkj_so_person | section_overview | `RERANK` | 人员配置情况怎么样？ |
 | qwen_lc_features | list_coverage | `COVERAGE` | Qwen-Image-2.1 的功能有哪些？ |
 | jkj_so_freq | section_overview | `COVERAGE` | 监测频率是怎么样的？ |
-
-## LLM answer smoke
-
-```json
-{
-  "cases": [
-    {
-      "id": "jkj_df_purpose",
-      "category": "direct_fact",
-      "provider": "ollama",
-      "must_contain_hit": 0,
-      "must_contain_total": 2,
-      "forbidden_leak": [],
-      "has_citation": false,
-      "refs": 5,
-      "answer_head": "现有资料没有明确说明监测的具体目的，但提供了不同项目的监测频率和人员配置等信息。"
-    },
-    {
-      "id": "jkj_df_observer_skill",
-      "category": "direct_fact",
-      "provider": "ollama",
-      "must_contain_hit": 2,
-      "must_contain_total": 2,
-      "forbidden_leak": [],
-      "has_citation": true,
-      "refs": 1,
-      "answer_head": "现场观测员应熟悉水准仪与全站仪的操作 [1]。"
-    },
-    {
-      "id": "jkj_df_baseline_use",
-      "category": "direct_fact",
-      "provider": "ollama",
-      "must_contain_hit": 2,
-      "must_contain_total": 2,
-      "forbidden_leak": [],
-      "has_citation": true,
-      "refs": 13,
-      "answer_head": "基准点中的一个点可用于放置全站仪，另一个作为后视点 [1]。"
-    },
-    {
-      "id": "jkj_df_mark",
-      "category": "direct_fact",
-      "provider": "ollama",
-      "must_contain_hit": 3,
-      "must_contain_total": 3,
-      "forbidden_leak": [],
-      "has_citation": true,
-      "refs": 1,
-      "answer_head": "水平位移监测点是用测量钉打入设置的，并且用红漆做了明显的标志 [1]。"
-    },
-    {
-      "id": "jkj_df_structure",
-      "category": "direct_fact",
-      "provider": "ollama",
-      "must_contain_hit": 2,
-      "must_contain_total": 2,
-      "forbidden_leak": [],
-      "has_citation": true,
-      "refs": 2,
-      "answer_head": "*   BLD0912 高新区商业综合体贴坑监测方案中的工程：围护结构采用地下连续墙加三道混凝土支撑 [1]。 *   JKJ2307 镇海区基坑围护施工监测方案中的工程：围护结构采用钻孔灌注桩加内支撑 [2]。"
-    },
-    {
-      "id": "jkj_df_data_person",
-      "category": "direct_fact",
-      "provider": "ollama",
-      "must_contain_hit": 2,
-      "must_contain_total": 2,
-      "forbidden_leak": [],
-      "has_citation": true,
-      "refs": 1,
-      "answer_head": "数据处理员是陈静 [1]。"
-    },
-    {
-      "id": "qwen_df_position",
-      "category": "direct_fact",
-      "provider": "ollama",
-      "must_contain_hit": 2,
-      "must_contain_total":
-```
 
 ---
 

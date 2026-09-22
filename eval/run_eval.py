@@ -42,8 +42,10 @@ from app.core.embedder import HashEmbedder  # noqa: E402
 DIM = 512
 TOP_K = 5
 _DB = None          # 当前打开的库，退出时先关闭再删临时目录（Windows 上不关就删不掉）
-GOLD = HERE / "datasets" / "core_gold.jsonl"
+GOLD = HERE / "datasets" / "core_gold.jsonl"          # DEV SET（72 题）
+HOLDOUT_GOLD = HERE / "datasets" / "holdout" / "holdout_gold.jsonl"
 FIXTURES = HERE / "fixtures"
+FIXTURES_HOLDOUT = HERE / "fixtures_holdout"
 REPORTS = HERE / "reports"
 PRIVATE = HERE / "datasets" / "private"
 
@@ -54,23 +56,24 @@ COVERAGE_CATS = {"list_coverage", "section_overview", "cross_section"}
 # --------------------------------------------------------------------------
 # 建库（完全在隔离库内）
 # --------------------------------------------------------------------------
-def build_library():
+def build_library(fixtures_dir: Path | None = None):
     global _DB
+    fixtures_dir = fixtures_dir or FIXTURES
     paths.ensure_dirs()
     db = db_mod.get_db(paths.CACHE_DB, embedding_dim=DIM)
     _DB = db
     db.init_schema()
     emb = HashEmbedder(DIM)
-    for src in sorted(FIXTURES.glob("*.md")):
+    for src in sorted(fixtures_dir.glob("*.md")):
         dst = paths.NOTES_DIR / src.name
         shutil.copyfile(src, dst)
         indexer.index_file(db, dst, emb)
     return db, emb
 
 
-def load_gold() -> list[dict]:
+def load_gold(path: Path | None = None) -> list[dict]:
     rows = []
-    with GOLD.open(encoding="utf-8") as fh:
+    with (path or GOLD).open(encoding="utf-8") as fh:
         for line in fh:
             line = line.strip()
             if line:
@@ -239,12 +242,21 @@ def classify(case, row, db, emb, docs, parents) -> str:
 
 # --------------------------------------------------------------------------
 def run_baseline(args) -> int:
-    if not GOLD.exists():
-        print("缺少数据集，先运行：python eval/build_gold.py")
+    split = "holdout" if getattr(args, "holdout", False) else "dev"
+    gold = HOLDOUT_GOLD if split == "holdout" else GOLD
+    fixtures = FIXTURES_HOLDOUT if split == "holdout" else FIXTURES
+    report_name = "baseline_holdout" if split == "holdout" else "baseline"
+    if split == "holdout":
+        print("=" * 70)
+        print("HOLDOUT RUN —— 仅用于阶段性 release decision。")
+        print("不要根据 Holdout 的逐题失败去调算法（那就是过拟合）。")
+        print("=" * 70)
+    if not gold.exists():
+        print(f"缺少数据集 {gold}，先运行：python eval/build_gold.py")
         return 2
-    cases = load_gold()
+    cases = load_gold(gold)
     t0 = time.time()
-    db, emb = build_library()
+    db, emb = build_library(fixtures)
     docs = doc_map(db)
     parents = parent_index(db)
 
@@ -336,7 +348,7 @@ def run_baseline(args) -> int:
         "meta": {
             "app_version": APP_VERSION,
             "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "cases": len(cases), "top_k": TOP_K,
+            "split": split, "cases": len(cases), "top_k": TOP_K,
             "embedder": f"local_hash({DIM})  # 离线可复现；不依赖 ollama",
             "elapsed_s": round(time.time() - t0, 2),
             "library": str(paths.DATA_DIR),
@@ -349,9 +361,9 @@ def run_baseline(args) -> int:
         "llm_smoke": llm_smoke,
     }
     REPORTS.mkdir(parents=True, exist_ok=True)
-    (REPORTS / "baseline.json").write_text(
+    (REPORTS / f"{report_name}.json").write_text(
         json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-    (REPORTS / "baseline.md").write_text(render_md(report), encoding="utf-8")
+    (REPORTS / f"{report_name}.md").write_text(render_md(report), encoding="utf-8")
     print_summary(report)
     return 0
 
@@ -461,7 +473,8 @@ def print_summary(rep: dict) -> None:
               "wrong_document_rate", "no_answer_fp_rate", "attribution_violation_rate",
               "citation_structural_rate", "citation_intersection_rate"):
         print(f"  {k:24s} {pct(m[k])}")
-    print(f"\n失败 {len(rep['failures'])} 例；报告 → eval/reports/baseline.md")
+    name = "baseline_holdout" if rep["meta"].get("split") == "holdout" else "baseline"
+    print(f"\n失败 {len(rep['failures'])} 例；报告 → eval/reports/{name}.md")
 
 
 # --------------------------------------------------------------------------
@@ -490,9 +503,11 @@ def cmd_compare(args) -> int:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="eval/run_eval.py")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    b = sub.add_parser("baseline", help="跑全量 gold 并生成 baseline 报告")
+    b = sub.add_parser("baseline", help="跑全量 gold 并生成 baseline 报告（默认 DEV）")
     b.add_argument("--llm-smoke", type=int, default=0, metavar="N",
                    help="额外抽 N 道题跑真实 provider 的 answer smoke（默认 0=不跑）")
+    b.add_argument("--holdout", action="store_true",
+                   help="跑 HOLDOUT 集（默认锁定；仅用于阶段性 release decision）")
     c = sub.add_parser("compare", help="对比 baseline 与候选报告")
     c.add_argument("--baseline", default="baseline")
     c.add_argument("--candidate", default="reranker")

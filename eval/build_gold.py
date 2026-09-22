@@ -205,10 +205,117 @@ C: list[tuple] = [
 ]
 
 
+# --------------------------------------------------------------------------
+# HOLDOUT（V1.1 新增）：**独立语料 + 独立表达**，不得简单改写 DEV 问题。
+# 用于阶段性 release decision；开发期默认锁定（见 README 防泄漏规则）。
+# --------------------------------------------------------------------------
+FIXTURES_HOLDOUT = HERE / "fixtures_holdout"
+OUT_HOLDOUT = HERE / "datasets" / "holdout" / "holdout_gold.jsonl"
+
+BR = "bridge_health.md"          # 桥梁健康监测
+TU = "tunnel_monitor.md"         # 隧道监测（干扰件，全站仪型号不同）
+LF = "crack_gauge_manual.md"     # 仪器技术手册（含型号命名规则）
+NW = "november_weather_log.md"   # 11 月天气日志（三个过程并存）
+
+HO_C: list[tuple] = [
+    # ---- direct_fact
+    ("ho_df_span_type", "direct_fact", "本桥是什么桥型？", BR,
+     ["连续箱梁桥", "预应力"], [], None, None, "answered"),
+    ("ho_df_light_test", "direct_fact", "本桥是否已开展荷载试验？", BR,
+     ["尚未开展荷载试验"], [], None, None, "answered"),
+    ("ho_df_calib", "direct_fact", "裂缝观测仪的校准有效期是多久？", LF,
+     ["12 个月", "返厂校准"], [], None, None, "answered"),
+    ("ho_df_storage", "direct_fact", "LF-21 是否带数据存储功能？", LF,
+     ["带存储", "LF-21"], [], None, None, "answered"),
+    ("ho_df_who_report", "direct_fact", "桥梁监测报告的编制由谁负责？", BR,
+     ["赵敏", "报告编制"], [], None, None, "answered"),
+    # ---- quantity
+    ("ho_q_deflect_points", "quantity", "主梁挠度测点共有几个？", BR,
+     ["12 个", "LD-01 至 LD-12"], [], ["挠度测点", "12"], None, "answered"),
+    ("ho_q_pier_points", "quantity", "墩顶位移测点有多少个？", BR,
+     ["6 个", "DD-01 至 DD-06"], [], None, None, "answered"),
+    ("ho_q_temp_range", "quantity", "结构温度测点的编号范围是什么？", BR,
+     ["WD-01 至 WD-08"], [], None, None, "answered"),
+    ("ho_q_tunnel_settle", "quantity", "隧道拱顶下沉测点有几个？", TU,
+     ["15 个", "SD-01 至 SD-15"], [], None, None, "answered"),
+    # ---- person
+    ("ho_p_team_size", "person", "桥梁监测小组由几个人组成？", BR,
+     ["3 人", "赵敏"], [], None, None, "answered"),
+    ("ho_p_detectors", "person", "桥梁的现场检测员是谁？", BR,
+     ["周晨", "钱磊"], [], None, None, "answered"),
+    ("ho_p_tunnel_leader", "person", "隧道监测的负责人是谁？", TU,
+     ["孙航"], [], ["负责人", "孙航"], None, "answered"),
+    # ---- model_spec
+    ("ho_m_bridge_station", "model_spec", "桥梁监测使用的是哪种全站仪？", BR,
+     ["徕卡TS16"], ["徕卡TS09"], ["全站仪", "徕卡TS16"], None, "answered"),
+    ("ho_m_crack_model", "model_spec", "桥梁监测的裂缝观测仪是什么型号？", BR,
+     ["LF-20"], [], None, None, "answered"),
+    ("ho_m_tunnel_station", "model_spec", "隧道监测使用的全站仪是什么型号？", TU,
+     ["徕卡TS09"], ["TS16"], ["全站仪", "徕卡TS09"], None, "answered"),
+    ("ho_m_level_bridge", "model_spec", "桥梁监测使用的静力水准仪是什么型号？", BR,
+     ["JZ-5"], [], None, None, "answered"),
+    # ---- table_relation
+    ("ho_tr_bridge_table", "table_relation", "桥梁监测仪器表中静力水准仪的数量是多少？", BR,
+     ["JZ-5", "4台"], [], ["JZ-5", "4台"], None, "answered"),
+    ("ho_tr_tunnel_table", "table_relation", "隧道监测仪器表中收敛计的型号与数量？", TU,
+     ["SLJ-3", "5台"], [], ["收敛计", "5台"], None, "answered"),
+    ("ho_tr_lf_resolution", "table_relation", "LF-20 的分辨率是多少？", LF,
+     ["0.01mm"], [], ["分辨率", "0.01mm"], None, "answered"),
+    ("ho_tr_lf30_weight", "table_relation", "LF-30 的整机重量是多少？", LF,
+     ["480g"], [], ["LF-30", "480g"], None, "answered"),
+    # ---- list_coverage
+    ("ho_lc_bridge_items", "list_coverage", "本桥的监测项目包括哪些？", BR,
+     ["主梁挠度", "墩顶位移", "支座位移", "结构温度", "车辆荷载", "裂缝宽度"], [], None,
+     [["主梁挠度"], ["墩顶位移"], ["支座位移"], ["结构温度"], ["车辆荷载"], ["裂缝宽度"]], "answered"),
+    ("ho_lc_tunnel_items", "list_coverage", "隧道监测项目有哪些？", TU,
+     ["拱顶下沉", "周边收敛", "地表沉降", "锚杆轴力"], [], None,
+     [["拱顶下沉"], ["周边收敛"], ["地表沉降"], ["锚杆轴力"]], "answered"),
+    ("ho_lc_lf_params", "list_coverage", "裂缝观测仪的主要技术参数有哪些？", LF,
+     ["量程", "分辨率", "工作温度", "供电", "整机重量"], [], None,
+     [["量程"], ["分辨率"], ["工作温度"], ["供电"], ["整机重量"]], "answered"),
+    # ---- similar_entity
+    ("ho_se_lf_resolution_diff", "similar_entity", "LF-20 与 LF-30 的分辨率有什么区别？", LF,
+     ["0.01mm", "0.005mm"], [], None, None, "answered"),
+    ("ho_se_jz5_what", "similar_entity", "JZ-5 是什么类型的仪器？", BR,
+     ["静力水准仪"], ["裂缝观测仪"], None, None, "answered"),
+    ("ho_se_sand_area", "similar_entity", "扬沙天气发生在哪些地区？", NW,
+     ["甘肃西部", "宁夏北部"], ["江苏南部"], None, None, "answered"),
+    # ---- attribution
+    ("ho_at_cold_area", "attribution", "寒潮影响了哪些地区？", NW,
+     ["内蒙古中部", "河北北部"], ["江苏南部"], None, None, "answered"),
+    ("ho_at_sand_area", "attribution", "沙尘过程影响了哪些地区？", NW,
+     ["甘肃西部", "宁夏北部"], ["内蒙古"], None, None, "answered"),
+    ("ho_at_fog_effect", "attribution", "大雾造成了什么影响？", NW,
+     ["高速公路临时封闭", "追尾事故 3 起"], ["PM10"], None, None, "answered"),
+    ("ho_at_sand_fog", "attribution", "沙尘天气是否导致高速公路临时封闭？", NW,
+     [], ["高速公路"], None, None, "insufficient"),
+    # ---- negative_no_answer
+    ("ho_neg_airport", "negative_no_answer", "大雾过程影响了哪些机场？", NW,
+     [], ["机场"], None, None, "insufficient"),
+    ("ho_neg_economic", "negative_no_answer", "寒潮过程造成了多少经济损失？", NW,
+     [], ["经济损失", "亿元"], None, None, "insufficient"),
+    ("ho_neg_waterproof", "negative_no_answer", "LF 系列裂缝观测仪的防水等级是多少？", LF,
+     [], ["防水", "IP"], None, None, "insufficient"),
+    # ---- section_overview
+    ("ho_so_freq", "section_overview", "桥梁监测频次是怎么规定的？", BR,
+     ["1 次/月", "1 次/周", "15℃"], [], None, None, "answered"),
+    ("ho_so_alert", "section_overview", "桥梁监测的预警指标有哪些？", BR,
+     ["1/600", "5mm", "0.2mm"], [], None, None, "answered"),
+]
+
+
 def main() -> int:
-    docs = {p.name: p.read_text(encoding="utf-8") for p in FIXTURES.glob("*.md")}
+    rc = _build(C, FIXTURES, OUT, "dev")
+    if rc != 0:
+        return rc
+    print()
+    return _build(HO_C, FIXTURES_HOLDOUT, OUT_HOLDOUT, "holdout")
+
+
+def _build(case_list, fixtures_dir: Path, out: Path, split: str) -> int:
+    docs = {p.name: p.read_text(encoding="utf-8") for p in fixtures_dir.glob("*.md")}
     rows, problems = [], []
-    for (cid, cat, q, doc, must, mustnot, rel, groups, state) in C:
+    for (cid, cat, q, doc, must, mustnot, rel, groups, state) in case_list:
         text = docs.get(doc)
         if text is None:
             problems.append(f"{cid}: fixture {doc} 不存在")
@@ -239,7 +346,7 @@ def main() -> int:
                 if t not in text:
                     problems.append(f"{cid}: evidence_group 词 {t!r} 不在 {doc} 中")
         rows.append({
-            "id": cid, "category": cat, "query": q,
+            "id": cid, "category": cat, "query": q, "split": split,
             "expected": {
                 "doc": doc, "must_contain": must, "must_not_contain": mustnot,
                 "answer_state": state, "relation": rel,
@@ -248,18 +355,18 @@ def main() -> int:
         })
 
     if problems:
-        print("GOLD INTEGRITY FAILED:")
+        print(f"GOLD INTEGRITY FAILED [{split}]:")
         for p in problems:
             print("  -", p)
         return 1
 
-    OUT.parent.mkdir(parents=True, exist_ok=True)
-    with OUT.open("w", encoding="utf-8") as fh:
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with out.open("w", encoding="utf-8") as fh:
         for r in rows:
             fh.write(json.dumps(r, ensure_ascii=False) + "\n")
     from collections import Counter
     cnt = Counter(r["category"] for r in rows)
-    print(f"OK 写出 {len(rows)} 条 → {OUT}")
+    print(f"OK [{split}] 写出 {len(rows)} 条 → {out}")
     for k, v in sorted(cnt.items()):
         print(f"   {k:20s} {v}")
     return 0

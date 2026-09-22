@@ -1,0 +1,109 @@
+{
+  "meta": {
+    "app_version": "1.3.0",
+    "generated_at": "2026-09-22 21:23:08",
+    "split": "holdout",
+    "cases": 35,
+    "top_k": 5,
+    "embedder": "local_hash(512)  # 离线可复现；不依赖 ollama",
+    "elapsed_s": 0.26,
+    "library": "C:\\Users\\huqih\\AppData\\Local\\Temp\\usb-wiki-eval-uryfis93"
+  },
+  "counts_by_category": {
+    "attribution": 4,
+    "direct_fact": 5,
+    "list_coverage": 3,
+    "model_spec": 4,
+    "negative_no_answer": 3,
+    "person": 3,
+    "quantity": 4,
+    "section_overview": 2,
+    "similar_entity": 3,
+    "table_relation": 4
+  },
+  "metrics": {
+    "recall@1": 0.9032258064516129,
+    "recall@3": 1.0,
+    "recall@5": 1.0,
+    "mrr": 0.9408602150537635,
+    "coverage_group_recall": 1.0,
+    "coverage_full_rate": 1.0,
+    "relation_accuracy": 1.0,
+    "wrong_document_rate": 0.0,
+    "no_answer_fp_rate": 0.0,
+    "attribution_violation_rate": 0.25,
+    "citation_structural_rate": 1.0,
+    "citation_intersection_rate": 1.0
+  },
+  "per_category": {
+    "attribution": {
+      "n": 4,
+      "recall@5": 1.0,
+      "pass": 3
+    },
+    "direct_fact": {
+      "n": 5,
+      "recall@5": 1.0,
+      "pass": 5
+    },
+    "list_coverage": {
+      "n": 3,
+      "recall@5": 1.0,
+      "pass": 3
+    },
+    "model_spec": {
+      "n": 4,
+      "recall@5": 1.0,
+      "pass": 4
+    },
+    "negative_no_answer": {
+      "n": 3,
+      "recall@5": null,
+      "pass": 3
+    },
+    "person": {
+      "n": 3,
+      "recall@5": 1.0,
+      "pass": 3
+    },
+    "quantity": {
+      "n": 4,
+      "recall@5": 1.0,
+      "pass": 4
+    },
+    "section_overview": {
+      "n": 2,
+      "recall@5": 1.0,
+      "pass": 2
+    },
+    "similar_entity": {
+      "n": 3,
+      "recall@5": 1.0,
+      "pass": 3
+    },
+    "table_relation": {
+      "n": 4,
+      "recall@5": 1.0,
+      "pass": 4
+    }
+  },
+  "failures": [
+    {
+      "id": "ho_at_sand_fog",
+      "category": "attribution",
+      "query": "沙尘天气是否导致高速公路临时封闭？",
+      "class": "RECALL",
+      "answer_state": "insufficient",
+      "hit@5": false,
+      "n_refs": 1,
+      "coverage": null,
+      "trap": true
+    }
+  ],
+  "highlights": {
+    "level_model_query": null,
+    "qwen_features": null,
+    "typhoon_attribution": null
+  },
+  "llm_smoke": null
+}
