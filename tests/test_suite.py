@@ -3719,6 +3719,9 @@ def main() -> int:
         # Fast P0：型号/规格查询必须优先「目标实体 ↔ 型号」直接关系（D 类）
         from tests.test_model_retrieval import run as _run_model
         _run_model(ctx, check, section, skip)
+        # DOCX 表格检索 Blocker 回归（D1 分散表头 / D2 表格行级切片 / E 表头传播 / F 源行 / H 端到端）
+        from tests.test_docx_table_retrieval import run as _run_docx_t
+        _run_docx_t(ctx, check, section, skip)
         # 生产集成：选择性归因守卫（Router + Guard；确定性、无模型、无网络）
         from tests.test_relation_guard import run as _run_rguard
         _run_rguard(ctx, check, section, skip)

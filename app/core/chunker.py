@@ -35,6 +35,21 @@ _PSEUDO_HEADING_RE = re.compile(
 _SENT_SPLIT_RE = re.compile(r"(?<=[。！？!?；;])\s*|(?<=\.)\s+|\n{2,}")
 _CODE_FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
 
+# Markdown 表格检测：连续 `|...|` 行且其中含一条 `|---|` 分隔行。
+_TABLE_ROW_RE = re.compile(r"^\s*\|.*\|\s*$")
+_TABLE_SEP_RE = re.compile(r"^\s*\|[\s:|-]+\|\s*$")
+
+# 分布式 CJK 空白（Word「分散对齐 / 字符间距」把「规格型号」拆成「规 格 型 号」）。
+# 只在「汉字与汉字之间」的空白上收拢；不破坏 CJK 与 ASCII / 标点之间的空格
+# （如「美国 1台」「N2 级别」「SW-30」），正文普通空格语义不受影响。
+_CJK = r"[\u3400-\u9fff]"
+_DIST_CJK_SPACE_RE = re.compile(rf"(?<={_CJK})\s+(?={_CJK})")
+
+
+def normalize_distributed_cjk(text: str) -> str:
+    """收拢汉字之间的分散排版空格；对其它空白（含 ASCII 邻接）一律不动。"""
+    return _DIST_CJK_SPACE_RE.sub("", text or "")
+
 
 @dataclass
 class ChildChunk:
@@ -67,9 +82,14 @@ class ParentBlock:
 
 
 def retrieval_text_of(section_path: str, content: str) -> str:
-    """检索文本的唯一构造点（P0-4）：章节路径在前、原文在后。"""
+    """检索文本的唯一构造点（P0-4）：章节路径在前、**规范化后**的原文在后。
+
+    ⚠ 只改检索文本，不碰 ``content``（durable Markdown 真相源）。规范化收敛 Word
+    表格里「规 格 型 号」式的逐字分散空格，使存量库仅重建 cache.db 即可被「型号」命中，
+    无需用户重新导入原 DOCX。
+    """
     sp = (section_path or "").strip()
-    body = content or ""
+    body = normalize_distributed_cjk(content or "")
     return f"{sp}\n\n{body}" if sp else body
 
 
@@ -223,8 +243,14 @@ def _split_parents(body: str, base_line: int = 1) -> list[tuple[str, str, int, i
         buf = f"{buf}\n\n{block}" if buf else block
         buf_lines = buf_lines + list(range(blk_start, blk_end + 1))
 
-        # 单块极长（如整段代码/长表格）时硬切：行号随字符切点一起分家
+        # 单块极长（如整段代码）时硬切：行号随字符切点一起分家。
+        # ⚠ 表格块**不允许**字符硬切 —— 否则表头与数据行分离、行被拦腰切断
+        # （真实 Bug：长仪器表被切断后「型号」与「水准仪」行不再共现，检索漏召回）。
+        # 表格作为整体父块保留，行级完整性由 `_split_children` 用表头传播保证。
         while len(buf) > PARENT_HARD_LIMIT:
+            # 含表格分隔行即视为表格块：整体保留，禁止字符硬切（行完整性优先）。
+            if any(_TABLE_SEP_RE.match(ln) for ln in buf.split("\n")):
+                break
             head, rest = buf[:PARENT_SIZE], buf[PARENT_SIZE:]
             cut = head.count("\n") + 1                 # head 覆盖的行数
             out.append((head.strip(), path(), buf_lines[0], buf_lines[min(cut, len(buf_lines)) - 1]))
@@ -244,9 +270,52 @@ def _sentences(text: str) -> list[str]:
     return out or [text]
 
 
-def _split_children(parent_text: str, parent_id: str, doc_id: str, start_idx: int,
-                    section_path: str = "") -> list[ChildChunk]:
-    """在父分块内做 200/30 滑窗切片，优先在句子边界断开。"""
+def _split_tables_in_parent(text: str) -> list[tuple[str, object]]:
+    """把父块文本切成「prose」与「table」交替段落。
+
+    table 段返回 ``("table", (header, sep, [rows]))``；prose 段返回 ``("prose", str)``。
+    表格识别：连续 ``|...|`` 行且其中含一条 ``|---|`` 分隔行。
+    """
+    lines = text.split("\n")
+    n = len(lines)
+    segs: list[tuple[str, object]] = []
+    i = 0
+    while i < n:
+        if _TABLE_ROW_RE.match(lines[i]) and i + 1 < n and _TABLE_SEP_RE.match(lines[i + 1]):
+            tbl = [lines[i], lines[i + 1]]
+            j = i + 2
+            while j < n and _TABLE_ROW_RE.match(lines[j]):
+                tbl.append(lines[j])
+                j += 1
+            segs.append(("table", (tbl[0], tbl[1], tbl[2:])))
+            i = j
+        else:
+            start = i
+            i += 1
+            while i < n and not (
+                _TABLE_ROW_RE.match(lines[i]) and i + 1 < n and _TABLE_SEP_RE.match(lines[i + 1])
+            ):
+                i += 1
+            prose = "\n".join(lines[start:i]).strip()
+            if prose:
+                segs.append(("prose", prose))
+    return segs
+
+
+def _mk_child(content: str, parent_id: str, doc_id: str, idx: int,
+              section_path: str) -> ChildChunk:
+    return ChildChunk(
+        chunk_id=f"{doc_id}:c{idx}",
+        doc_id=doc_id,
+        parent_id=parent_id,
+        content=content.strip(),
+        section_path=section_path,
+    )
+
+
+def _split_prose(parent_text: str, parent_id: str, doc_id: str, start_idx: int,
+                 section_path: str) -> list[ChildChunk]:
+    """普通文本：200/30 滑窗切片，优先在句子边界断开。"""
     out: list[ChildChunk] = []
     idx = start_idx
     buf = ""
@@ -255,15 +324,7 @@ def _split_children(parent_text: str, parent_id: str, doc_id: str, start_idx: in
         nonlocal buf, idx
         content = buf.strip()
         if content:
-            out.append(
-                ChildChunk(
-                    chunk_id=f"{doc_id}:c{idx}",
-                    doc_id=doc_id,
-                    parent_id=parent_id,
-                    content=content,
-                    section_path=section_path,
-                )
-            )
+            out.append(_mk_child(content, parent_id, doc_id, idx, section_path))
             idx += 1
         buf = ""
 
@@ -271,8 +332,8 @@ def _split_children(parent_text: str, parent_id: str, doc_id: str, start_idx: in
         if len(sent) > CHILD_SIZE * 2:
             # 超长句（无标点长串）：按窗口硬切
             step = max(1, CHILD_SIZE - CHILD_OVERLAP)
-            for i in range(0, len(sent), step):
-                piece = sent[i:i + CHILD_SIZE]
+            for k in range(0, len(sent), step):
+                piece = sent[k:k + CHILD_SIZE]
                 if not piece.strip():
                     continue
                 if len(buf) + len(piece) > CHILD_SIZE and buf:
@@ -289,6 +350,41 @@ def _split_children(parent_text: str, parent_id: str, doc_id: str, start_idx: in
         buf = f"{buf}\n{sent}".strip() if buf else sent
 
     flush()
+    return out
+
+
+def _split_children(parent_text: str, parent_id: str, doc_id: str, start_idx: int,
+                    section_path: str = "") -> list[ChildChunk]:
+    """在父分块内做子切片。
+
+    * 普通文本走 `_split_prose`（200/30 滑窗）。
+    * **Markdown 表格行级切片 + 表头传播**（D / E）：表格按行边界分段，**绝不在单个
+      row 中间切开**；每个派生表格段都前置表头行（header + 分隔行），使「型号」与
+      数据行在同一 chunk 共现（服务于 FTS 检索文本与 LLM 父块上下文）。重复表头是
+      **derived cache context**，不写回 durable Markdown，引用 source 行仍指向真实数据行。
+    """
+    out: list[ChildChunk] = []
+    idx = start_idx
+    for kind, payload in _split_tables_in_parent(parent_text):
+        if kind == "prose":
+            for c in _split_prose(payload, parent_id, doc_id, idx, section_path):
+                out.append(c)
+                idx += 1
+            continue
+        header, sep, rows = payload
+        head = f"{header}\n{sep}"
+        batch: list[str] = []
+        for row in rows:
+            cand = f"{head}\n{row}" if not batch else f"{head}\n" + "\n".join(batch) + "\n" + row
+            if len(cand) > CHILD_SIZE and batch:
+                out.append(_mk_child(f"{head}\n" + "\n".join(batch), parent_id, doc_id, idx, section_path))
+                idx += 1
+                batch = [row]
+            else:
+                batch.append(row)
+        if batch:
+            out.append(_mk_child(f"{head}\n" + "\n".join(batch), parent_id, doc_id, idx, section_path))
+            idx += 1
     return out
 
 

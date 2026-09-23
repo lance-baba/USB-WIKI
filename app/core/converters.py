@@ -498,10 +498,14 @@ def _docx_table(el) -> list[str]:
     for tr in el.findall(f"{W}tr"):
         cells = []
         for tc in tr.findall(f"{W}tc"):
-            cells.append(" ".join(
+            cell = " ".join(
                 "".join(t.text or "" for t in p.iter(f"{W}t")).strip()
                 for p in tc.findall(f"{W}p")
-            ).strip())
+            ).strip()
+            # 收拢 Word「分散对齐」在单元格内产生的逐字空格（规 格 型 号 → 规格型号）。
+            # 仅作用于「汉字↔汉字」之间的空白，正文普通空格（美国 1台、N2 级别）不受影响。
+            cell = re.sub(r"(?<=[\u3400-\u9fff])\s+(?=[\u3400-\u9fff])", "", cell)
+            cells.append(cell)
         rows.append(cells)
     rows = [r for r in rows if any(r)]
     if not rows:
