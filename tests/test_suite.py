@@ -1467,16 +1467,85 @@ def test_library_contract() -> None:
     check("⑫ WIKIUSB_LIBRARY 环境变量可重定向资料库",
           lib_mod.detect_library_root(Path("X:/base")) != Path("X:/base") / "data"
           or True, "")
+    # 先保存 activate_test_library() 在测试启动时设好的隔离测试 Library —— 后续所有
+    # 破坏性测试（reset_workspace / test_rag_regression / ...）的 Safety Fuse 都依赖它。
+    _saved_wikiusb_library = os.environ.get("WIKIUSB_LIBRARY")
     try:
-        __import__("os").environ["WIKIUSB_LIBRARY"] = str(tmp / "EnvLib")
+        os.environ["WIKIUSB_LIBRARY"] = str(tmp / "EnvLib")
         got = lib_mod.detect_library_root(Path("X:/base"))
         # Windows 上 resolve() 可能返回短路径名形式（RUNNER~1），不能与原始字符串严格相等
-        expected = Path(__import__("os").environ["WIKIUSB_LIBRARY"]).resolve()
+        expected = Path(os.environ["WIKIUSB_LIBRARY"]).resolve()
         check("   环境变量生效", got == expected, f"{got} vs {expected}")
     finally:
-        __import__("os").environ.pop("WIKIUSB_LIBRARY", None)
+        # ★ 修复：恢复隔离测试 Library，绝不能无条件 pop。
+        #   旧实现 `os.environ.pop("WIKIUSB_LIBRARY", None)` 把启动期设好的隔离库删了 →
+        #   Gate 1 中后续 assert_test_library_safe() 在 GitHub workspace 上被 Fuse 拒绝。
+        if _saved_wikiusb_library is None:
+            os.environ.pop("WIKIUSB_LIBRARY", None)
+        else:
+            os.environ["WIKIUSB_LIBRARY"] = _saved_wikiusb_library
+
+    # 环境变量重定向测试结束后，Test Harness 必须仍处于 ACTIVE 状态：
+    #   WIKIUSB_LIBRARY 必须重新指向隔离测试 Library，且 Safety Fuse 不抛异常。
+    test_env.assert_test_library_safe()
+    check("⑫b 环境变量测试结束后恢复隔离 Library（Harness 仍 ACTIVE）",
+          os.environ.get("WIKIUSB_LIBRARY") == _saved_wikiusb_library
+          and os.environ.get("WIKIUSB_TEST_MODE") == "1",
+          f"WIKIUSB_LIBRARY={os.environ.get('WIKIUSB_LIBRARY')} "
+          f"saved={_saved_wikiusb_library}")
 
     shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_env_redirect_restores_isolated_library() -> None:
+    """回归（USB-WIKI Release Gate 1 失败根因，2026-09-23）：
+
+    test_library_contract() ⑫ 会临时把 ``WIKIUSB_LIBRARY`` 重定向到一个临时目录，验证
+    「环境变量可重定向资料库」。**测试结束后必须把隔离测试 Library 还回去**——因为
+    ``activate_test_library()`` 在启动时设好的 ``WIKIUSB_LIBRARY`` 是后续所有破坏性测试
+    （``reset_workspace`` / ``test_rag_regression`` / …）的 Safety Fuse 依赖。
+
+    旧实现在 ``finally`` 里无条件 ``os.environ.pop("WIKIUSB_LIBRARY", None)``，把隔离库删了
+    → 后续 ``assert_test_library_safe()`` 在 GitHub workspace 上被 Fuse 拒绝（Gate 1 失败）。
+    """
+    section("回归：环境变量重定向测试后恢复隔离 Library")
+    # 本测试只做断言 + 一次安全的对照实验，不污染全局 Harness 状态。
+
+    _before = os.environ.get("WIKIUSB_LIBRARY")
+    check("⑬ 前置：WIKIUSB_LIBRARY 指向隔离测试库（Harness ACTIVE）",
+          _before is not None and test_env.is_test_library(_before),
+          f"WIKIUSB_LIBRARY={_before}")
+
+    # —— 复现「重定向→恢复」契约（与 test_library_contract ⑫ 现在采用的逻辑一致）——
+    _saved = os.environ.get("WIKIUSB_LIBRARY")
+    import tempfile as _tf
+    _probe = Path(_tf.mkdtemp(prefix="wikiusb_redirect_")) / "ProbeLib"
+    try:
+        os.environ["WIKIUSB_LIBRARY"] = str(_probe)  # 临时重定向
+    finally:
+        # ★ 正确行为：恢复，而非无条件 pop
+        if _saved is None:
+            os.environ.pop("WIKIUSB_LIBRARY", None)
+        else:
+            os.environ["WIKIUSB_LIBRARY"] = _saved
+
+    check("⑬a 重定向后恢复：WIKIUSB_LIBRARY 还原为隔离库",
+          os.environ.get("WIKIUSB_LIBRARY") == _before,
+          f"now={os.environ.get('WIKIUSB_LIBRARY')} expected={_before}")
+    check("⑬b 恢复后 assert_test_library_safe 通过（Harness 仍 ACTIVE）",
+          test_env.is_test_library(None),
+          "Safety Fuse 在恢复后拒绝")
+
+    # —— 对照：旧「无条件 pop」会让 Harness 断；证明本回归能抓住回归方向 ——
+    os.environ.pop("WIKIUSB_LIBRARY", None)
+    try:
+        _broke = not test_env.is_test_library(None)
+    finally:
+        os.environ["WIKIUSB_LIBRARY"] = _before  # 立刻还原，杜绝污染后续用例
+    check("⑬c 对照：无条件 pop 确实令 Harness 断（回归测试有意义）",
+          _broke, "pop 后 Harness 仍 ACTIVE（与预期相反）")
+    # 还原后再确认一遍，保证后续用例不受本测试干扰
+    test_env.assert_test_library_safe()
 
 def test_single_version_source(ctx) -> None:
     """单一应用版本源：消灭 launcher / server / 前端各写一份的问题。
@@ -3698,6 +3767,7 @@ def main() -> int:
         test_manifest_recovery()
         test_dependency_consistency()
         test_library_contract()
+        test_env_redirect_restores_isolated_library()
         test_single_version_source(ctx)
         from tests.test_rag_regression import run as _run_rag
         _run_rag(ctx, check, section, skip)
