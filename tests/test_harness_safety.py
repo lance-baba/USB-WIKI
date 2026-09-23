@@ -4,7 +4,9 @@
 删除了 `notes/*.md`、`snapshots/*`、`cache.db`（均在 .gitignore 内，git 无法恢复）。
 
 本文件只验证一件事：**破坏性测试永远碰不到真实 Library**。
-Case A/B 断言「真实路径被拒 + 文件仍在」，Case C 断言「隔离条件齐备才放行」，
+Case A 断言「真实路径被拒 + 拒绝前后状态完全一致」（不要求真实库预先有笔记，
+空库/非空库都必须成立），A2 显式覆盖「空真实 Library」这一 CI 场景；
+Case B 断言 Documents 默认库同样被拒；Case C 断言「隔离条件齐备才放行」；
 Case D/E 断言「缺 sentinel / 缺 TEST_MODE 一律拒绝」。
 """
 from __future__ import annotations
@@ -27,21 +29,44 @@ def run(ctx, check, section, skip) -> None:      # noqa: ARG001
             else:
                 os.environ[k] = v
 
+    def _notes_snapshot(root: Path) -> dict:
+        """只读快照：notes 目录下每个文件 → (相对路径, size, mtime_ns)。
+
+        ⚠ 真实 Library **只允许被观察**：不写入、不创建、不删除、不放 probe。
+        返回 ``{}`` 表示「notes 目录不存在或为空」——空与非空**都合法**。
+        """
+        base = root / "notes"
+        if not base.exists():
+            return {}
+        return {
+            p.relative_to(base).as_posix(): (p.stat().st_size, p.stat().st_mtime_ns)
+            for p in sorted(base.rglob("*"))
+            if p.is_file()
+        }
+
     # ---------------------------------------------------------------- Case A
     # Library = repo/data（真实开发库）→ 必须拒绝，且**真实文件不被触碰**
-    # 注意：本用例不往真实库写任何东西，只用已存在的真实笔记做「仍存在」断言。
-    real_notes = sorted((test_env.REPO_DATA / "notes").glob("*.md"))
-    probe = real_notes[0] if real_notes else None
+    #
+    # ⚠ 语义修正（Gate 2 / Run 35869412834，2026-09-23）：
+    #   旧断言是「真实库至少存在 1 篇 .md」——本机开发库有笔记所以 PASS，
+    #   GitHub fresh checkout 的 data/notes 为空 → notes=0 → FAIL。
+    #   那是**测试假设缺陷**，不是产品缺陷。
+    #   正确语义：**Safety Fuse 拒绝真实 Library 后，真实路径的状态与拒绝前
+    #   完全一致**——对「空」和「非空」真实 Library 都必须成立。
+    real_lib = test_env.REPO_DATA
+    before_a = _notes_snapshot(real_lib)           # 只读快照（绝不写 probe）
     os.environ["WIKIUSB_TEST_MODE"] = "1"                 # 即便显式开了 TEST_MODE
-    os.environ["WIKIUSB_LIBRARY"] = str(test_env.REPO_DATA)
+    os.environ["WIKIUSB_LIBRARY"] = str(real_lib)
     refused = False
     try:
         test_env.assert_test_library_safe()
     except RuntimeError as exc:
         refused = test_env.REFUSE_MSG in str(exc)
     check("Case A repo/data 被硬拒绝（即使 TEST_MODE=1）", refused)
-    check("Case A 拒绝后真实库笔记仍存在（未被触碰）",
-          probe is not None and probe.exists(), f"notes={len(real_notes)}")
+    after_a = _notes_snapshot(real_lib)
+    check("Case A 拒绝后真实库状态与拒绝前完全一致（未被触碰）",
+          before_a == after_a,
+          f"before={len(before_a)} after={len(after_a)}")
 
     # ---------------------------------------------------------------- Case B
     # Library = 用户默认 Documents/USB-WIKI-Data → 同样拒绝
@@ -110,5 +135,28 @@ def run(ctx, check, section, skip) -> None:      # noqa: ARG001
     check("附加：suite 入口已把 Library 指向 TEMP（隔离生效）",
           test_env._is_under(Path(os.environ["WIKIUSB_LIBRARY"]),
                              test_env.SYSTEM_TEMP))
+
+    # ------------------------------------------------- Case A2 空库语义回归
+    # 明确覆盖 CI 场景：真实 Library **一篇笔记都没有**（GitHub fresh checkout 的
+    # data/notes 为空）。此时 guard 拒绝仍必须判 PASS —— 判据是「拒绝前后状态一致
+    # （空 == 空）」，而**不是**「真实库必须预先存在笔记」。
+    # ⚠ 这里**不 SKIP**、**不往 repo/data 写任何东西**、**不造假笔记**：
+    #   用一个临时的空真实库结构来复现「空」这一状态。
+    empty_real = Path(_tf.mkdtemp(prefix="usb-wiki-empty-real-")).resolve()
+    (empty_real / "notes").mkdir(parents=True, exist_ok=True)   # 空的 notes 目录
+    before_empty = _notes_snapshot(empty_real)
+    os.environ["WIKIUSB_TEST_MODE"] = "1"
+    os.environ["WIKIUSB_LIBRARY"] = str(empty_real)
+    refused_empty = False
+    try:
+        test_env.assert_test_library_safe()
+    except RuntimeError as exc:
+        refused_empty = test_env.REFUSE_MSG in str(exc)
+    after_empty = _notes_snapshot(empty_real)
+    check("Case A2 空真实 Library（无任何笔记）下 guard 仍拒绝", refused_empty)
+    check("Case A2 空库：拒绝前后状态一致（空 == 空）→ PASS，不因空库误判",
+          before_empty == {} and after_empty == {},
+          f"before={len(before_empty)} after={len(after_empty)}")
+    _sh.rmtree(empty_real, ignore_errors=True)
 
     _restore_env()
