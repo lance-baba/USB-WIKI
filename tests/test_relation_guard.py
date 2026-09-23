@@ -43,6 +43,24 @@ PARENTS = [
      "content": "## 分工\n\n- 泄洪调度由水库调度中心负责。\n- 数据处理由陈静负责。"},
 ]
 
+# 责任归属 8 句式合成 fixture（L1 扩展回归）。覆盖：
+#   由 X 负责 / X，负责… / X负责… / 负责人：X / 负责人为 X /
+#   责任人为 X / 责任单位：X / 责任单位为 X，外加 防汛指挥部 vs 排水管理处 错指。
+PARENTS_RESP = [
+    {"parent_id": "rr1", "doc_id": "d2", "section_path": "分工",
+     "content": "## 分工\n\n- 数据平差与报表编制由李岚负责。\n- 外业测量由王强负责。"},
+    {"parent_id": "rr2", "doc_id": "d2", "section_path": "责任清单",
+     "content": "## 责任清单\n\n- 陈涛，负责设备采购与验收。\n- 赵敏负责合同管理。"},
+    {"parent_id": "rr3", "doc_id": "d2", "section_path": "职责说明",
+     "content": "## 职责说明\n\n本项目负责人：周建国。\n现场安全负责人为市应急管理局。"},
+    {"parent_id": "rr4", "doc_id": "d2", "section_path": "调度",
+     "content": "## 调度\n\n水库调度由防汛指挥部负责，排水管理处配合。\n排涝泵站运行由排水管理处负责。"},
+    {"parent_id": "rr5", "doc_id": "d2", "section_path": "责任认定",
+     "content": "## 责任认定\n\n本次事故的责任人为李建国。\n现场处置责任单位为市应急管理局。"},
+    {"parent_id": "rr6", "doc_id": "d2", "section_path": "防汛",
+     "content": "## 防汛\n\n本次防汛责任单位：防汛指挥部。\n技术支撑责任人为吴磊。"},
+]
+
 
 def _eval(q: str, parents=None):
     rq = RG.analyze_relation(q)
@@ -93,6 +111,74 @@ def _unit_cases(check) -> None:
     check("E responsibility negative → NO",
           gr.verdict == RG.VERDICT_NO and not gr.allow_relation_claim
           and gr.owner == "水库调度中心")
+
+    # ---- E2. 责任归属 8 句式（L1 统一扩展）----
+    def _ev(q):
+        return _eval(q, PARENTS_RESP)
+
+    # 1 由 X 负责
+    rq, gr = _ev("数据平差与报表编制由谁负责？")
+    check("E2 ①由X负责 → YES owner=李岚",
+          rq.route == RG.ROUTE_GUARD and rq.relation_type == "responsibility"
+          and gr.verdict == RG.VERDICT_YES and gr.owner == "李岚")
+    # 3 X负责…
+    rq, gr = _ev("谁负责外业测量？")
+    check("E2 ③X负责… → YES owner=王强",
+          gr.verdict == RG.VERDICT_YES and gr.owner == "王强")
+    # 2 X，负责…
+    rq, gr = _ev("设备采购与验收由谁负责？")
+    check("E2 ②X，负责… → YES owner=陈涛",
+          gr.verdict == RG.VERDICT_YES and gr.owner == "陈涛")
+    # 3（另一例）赵敏负责合同管理
+    rq, gr = _ev("合同管理由谁负责？")
+    check("E2 ③X负责…（赵敏）→ YES owner=赵敏",
+          gr.verdict == RG.VERDICT_YES and gr.owner == "赵敏")
+    # 4 负责人：X
+    rq, gr = _ev("本项目由谁负责？")
+    check("E2 ④负责人：X → YES owner=周建国",
+          gr.verdict == RG.VERDICT_YES and gr.owner == "周建国")
+    # 5 负责人为 X（撰写 负责单位为）
+    rq, gr = _ev("现场安全由谁负责？")
+    check("E2 ⑤负责人为X → YES owner=市应急管理局",
+          gr.verdict == RG.VERDICT_YES and gr.owner == "市应急管理局")
+    # 7 责任单位：X
+    rq, gr = _ev("本次防汛由哪个单位负责？")
+    check("E2 ⑦责任单位：X → YES owner=防汛指挥部",
+          gr.verdict == RG.VERDICT_YES and gr.owner == "防汛指挥部")
+    # 6 责任人为 X
+    rq, gr = _ev("本次事故由谁负责？")
+    check("E2 ⑥责任人为X → YES owner=李建国",
+          gr.verdict == RG.VERDICT_YES and gr.owner == "李建国")
+    # 8 责任单位为 X
+    rq, gr = _ev("现场处置由哪个单位负责？")
+    check("E2 ⑧责任单位为X → YES owner=市应急管理局",
+          gr.verdict == RG.VERDICT_YES and gr.owner == "市应急管理局")
+
+    # ---- wrong-owner：防汛指挥部 vs 排水管理处（两种句式都拦）----
+    rq, gr = _ev("水库调度是否由排水管理处负责？")
+    check("E2 wrong-owner（由X负责） → NO owner=防汛指挥部",
+          gr.verdict == RG.VERDICT_NO and not gr.allow_relation_claim
+          and gr.owner == "防汛指挥部")
+    rq, gr = _ev("本次防汛是否由排水管理处负责？")
+    check("E2 wrong-owner（责任单位：X） → NO owner=防汛指挥部",
+          gr.verdict == RG.VERDICT_NO and not gr.allow_relation_claim
+          and gr.owner == "防汛指挥部")
+    rq, gr = _ev("本次事故是否由王强负责？")
+    check("E2 wrong-owner（责任人为X 错指） → NO owner=李建国",
+          gr.verdict == RG.VERDICT_NO and gr.owner == "李建国")
+
+    # ---- L2：责任类 blocked_message 用归属措辞，不用「归因于」----
+    rq, gr = _ev("水库调度是否由排水管理处负责？")
+    msg = RG.blocked_message(rq, gr)
+    check("E2 责任类 blocked_message 用『由…负责，而不是…』",
+          "由" in msg and "负责" in msg and "而不是" in msg
+          and "防汛指挥部" in msg and "排水管理处" in msg
+          and "归因于" not in msg)
+    # 因果类 blocked_message 仍用「归因于」（回归保护）
+    rq2, gr2 = _eval("强降雨是否导致高速公路临时封闭？")
+    msg2 = RG.blocked_message(rq2, gr2)
+    check("E2 因果类 blocked_message 仍用『归因于』（不回归）",
+          "归因于" in msg2 and "大雾" in msg2 and "强降雨" in msg2)
 
     # ---- F/G/H/I. 必须 PASS_THROUGH ----
     for q, label in (

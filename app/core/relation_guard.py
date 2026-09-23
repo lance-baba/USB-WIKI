@@ -85,10 +85,28 @@ _PATTERNS: tuple[tuple[str, str, re.Pattern], ...] = (
      re.compile(r"^(?P<a>.+?)(?:造成了|造成|带来|产生了|产生)?(?:哪些|什么)?影响[？?]?$")),
 )
 
-_PARTY = re.compile(r"由([\u4e00-\u9fa5A-Za-z0-9\-－]{2,14}?)负责")
 _CAUSE_SUBJ = re.compile(rf"([\u4e00-\u9fa5A-Za-z0-9\-－]{{2,14}}?)(?:{_CAUSE})")
 _ENTITY = re.compile(r"[A-Z]{1,6}[-－]\d{1,4}")
 _SENT = re.compile(r"[。！？；;]")
+
+
+#: 责任归属证据抽取：统一覆盖 8 种句式（顺序即优先级，group(1) 抓取责任主体 X）。
+#: 1 由 X 负责  2 X，负责…  3 X负责…  4 负责人：X  5 负责人为 X
+#: 6 责任人为 X  7 责任单位：X  8 责任单位为 X
+#: 兜底「X负责」（第 8 顺位）必须放在最后 —— 它最宽，会吞掉「X，负责」里的 X。
+_RESP_OWNER_PATTERNS: tuple[re.Pattern, ...] = (
+    re.compile(r"责任单位[：:]\s*([\u4e00-\u9fa5A-Za-z0-9\-－]{2,14})"),     # 7 责任单位：X
+    re.compile(r"责任人为\s*([\u4e00-\u9fa5A-Za-z0-9\-－]{2,14})"),          # 6 责任人为 X
+    re.compile(r"责任单位为\s*([\u4e00-\u9fa5A-Za-z0-9\-－]{2,14})"),        # 8 责任单位为 X
+    re.compile(r"负责人[：:]\s*([\u4e00-\u9fa5A-Za-z0-9\-－]{2,14})"),       # 4 负责人：X
+    re.compile(r"负责人为\s*([\u4e00-\u9fa5A-Za-z0-9\-－]{2,14})"),          # 5 负责人为 X
+    re.compile(r"由([\u4e00-\u9fa5A-Za-z0-9\-－]{2,14}?)负责"),              # 1 由 X 负责
+    re.compile(r"([\u4e00-\u9fa5A-Za-z0-9\-－]{2,14})[，,]\s*负责"),          # 2 X，负责…
+    re.compile(r"([\u4e00-\u9fa5A-Za-z0-9\-－]{2,14})负责"),                  # 3 X负责…（兜底）
+)
+
+#: 进入 owner_vocab 的责任句式（**不含**兜底「X负责」，避免因果题误召回）
+_RESP_VOCAB_PATTERNS: tuple[re.Pattern, ...] = _RESP_OWNER_PATTERNS[:7]
 
 
 # --------------------------------------------------------------------------
@@ -203,6 +221,19 @@ def units_of(content: str) -> list[dict]:
     return units
 
 
+def extract_responsibility_owner(text: str) -> str | None:
+    """从单条 evidence unit 抽取责任主体 X，统一覆盖 8 种句式。
+
+    优先级见 `_RESP_OWNER_PATTERNS`。只做确定性抽取，绝不猜；
+    拿不准（无责任句式）就返回 None，由上层降级到 INSUFFICIENT。
+    """
+    for rx in _RESP_OWNER_PATTERNS:
+        m = rx.search(text)
+        if m:
+            return m.group(1)
+    return None
+
+
 def owner_vocab(text: str) -> set[str]:
     """从文档**自身**推导「谁可能是事件/责任主体」——不硬编码任何业务词。"""
     v: set[str] = set()
@@ -210,8 +241,11 @@ def owner_vocab(text: str) -> set[str]:
         v.add(m.group(1))
     for m in re.finditer(rf"由([\u4e00-\u9fa5A-Za-z0-9\-－]{{2,14}}?)(?:{_CAUSE})", text):
         v.add(m.group(1))
-    for m in re.finditer(r"由([\u4e00-\u9fa5A-Za-z0-9\-－]{2,14}?)负责", text):
-        v.add(m.group(1))
+    # 责任归属句式（不含兜底「X负责」，避免因果题误召回）
+    for rx in _RESP_VOCAB_PATTERNS:
+        m = rx.search(text)
+        if m:
+            v.add(m.group(1))
     return {t for t in v if len(t) >= 2}
 
 
@@ -265,19 +299,18 @@ def evaluate_relation(rq: RelationQuery, parents: list[dict],
                                        m.group(1), u["text"], pid, True)
         return GuardResult(VERDICT_INSUFFICIENT, f"未找到「{t}」的成因单元")
 
-    # --- 责任归属：看 anchor 所在单元的「由 X 负责」 ---
+    # --- 责任归属：看 anchor 所在单元的责任主体（统一 8 种句式）---
     if rt == "responsibility" and a:
         for pid, _sec, u in items:
             if a in u["text"]:
-                m = _PARTY.search(u["text"])
-                if m:
-                    party = m.group(1)
+                party = extract_responsibility_owner(u["text"])
+                if party:
                     if t and party != t:
                         return GuardResult(VERDICT_NO, f"责任方为「{party}」，不是「{t}」",
                                            party, u["text"], pid, False)
                     return GuardResult(VERDICT_YES, f"责任方「{party}」", party,
                                        u["text"], pid, True)
-        # 找不到「由 X 负责」句式 → **不早退**，继续走 entity / 冲突判定
+        # 找不到责任句式 → **不早退**，继续走 entity / 冲突判定
         # （表格型责任分工就是这样：责任人写在表列里，没有「由…负责」句式）
 
     # --- STRONG：同一 evidence unit 内同时出现 anchor 与 target ---
@@ -326,15 +359,38 @@ def evaluate_relation(rq: RelationQuery, parents: list[dict],
 # 受控回答（blocked 时**不调用 LLM**）
 # --------------------------------------------------------------------------
 def blocked_message(rq: RelationQuery, gr: GuardResult) -> str:
-    """受控自然语言：内容只来自 `anchor / target / guard owner`，**不让模型猜**。"""
+    """受控自然语言：内容只来自 `anchor / target / guard owner`，**不让模型猜**。
+
+    按 `relation_type` 分支措辞：
+      * responsibility → 用「由…负责，而不是…」的归属措辞，不用「归因于」；
+      * causal / event  → 保留原有「归因于 / 归属于」因果措辞。
+    """
     a = rq.anchor or "该主体"
     t = rq.target or "该结果"
+    rt = rq.relation_type
+
     if gr.verdict == VERDICT_NO:
+        if rt == "responsibility":
+            if gr.owner:
+                if t and t != a:
+                    return (f"资料显示「{a}」由「{gr.owner}」负责，"
+                            f"而不是「{t}」。")
+                return f"资料显示「{a}」由「{gr.owner}」负责。"
+            if t:
+                return (f"资料显示「{a}」并非由「{t}」负责，"
+                        f"而是归属于其他主体。")
+            return f"资料显示「{a}」的责任归属并非此处所述。"
+        # causal / event：保留因果措辞
         if gr.owner:
             return (f"当前资料中的相关证据把「{t}」归因于「{gr.owner}」，"
                     f"不能据此认定它与「{a}」存在该关系。")
         return (f"当前资料中的相关证据把「{t}」归属于其他事件或主体，"
                 f"不能据此归因给「{a}」。")
+
+    # INSUFFICIENT
+    if rt == "responsibility" and t:
+        return (f"当前资料中没有找到「{a}」由「{t}」负责的直接证据，"
+                f"因此不能据此确认二者存在该责任关系。")
     return (f"当前资料中没有找到「{a}」与「{t}」之间的直接关系证据，"
             f"因此不能据此确认二者存在该关系。")
 

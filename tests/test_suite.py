@@ -3725,6 +3725,9 @@ def main() -> int:
         # 生产集成：选择性归因守卫（Router + Guard；确定性、无模型、无网络）
         from tests.test_relation_guard import run as _run_rguard
         _run_rguard(ctx, check, section, skip)
+        # Pre-Release Final Patch · 责任归属 L1/L2 Mini 回归包（8 句式 + 错指 + 不足 + PASS 边界）
+        from tests.test_responsibility_regression import run as _run_resp
+        _run_resp(ctx, check, section, skip)
         # 安全保险丝：破坏性测试只能碰隔离 Library（事故后新增，永远先跑）
         from tests.test_harness_safety import run as _run_safety
         _run_safety(ctx, check, section, skip)
