@@ -139,6 +139,18 @@
     background:#fde047;color:#1f2937;box-shadow:0 0 0 1px rgba(202,138,4,.5);
     border-radius:3px;padding:0 2px
   }
+  /* Citation Precision Highlight（语义分离）：
+     claim 证据句（[N] 支持的那一句）= 强黄整句；parent region = 极浅上下文，避免「全是重点」。 */
+  .doc-md .ev-region-soft{
+    background:rgba(96,165,250,.06);border-radius:7px;
+    box-shadow:inset 3px 0 0 rgba(96,165,250,.5);
+    transition:background .9s ease, box-shadow .9s ease;
+  }
+  .doc-md mark.ev-claim{
+    background:#fde047;color:#1f2937;
+    box-shadow:0 0 0 1px rgba(202,138,4,.55),0 0 10px rgba(250,204,21,.55);
+    border-radius:3px;padding:0 2px
+  }
   .cite[data-tip]:hover::after{
     content:attr(data-tip);position:absolute;bottom:135%;left:50%;transform:translateX(-50%);
     width:320px;max-width:70vw;padding:9px 11px;border-radius:10px;background:#0f172a;color:#f1f5f9;

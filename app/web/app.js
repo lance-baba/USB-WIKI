@@ -697,8 +697,8 @@ function _clearEvidenceHighlight() {
     m.remove();
     if (p.normalize) p.normalize();
   });
-  box.querySelectorAll(".ev-hl,.ev-hl-persist").forEach(el =>
-    el.classList.remove("ev-hl", "ev-hl-persist"));
+  box.querySelectorAll(".ev-hl,.ev-hl-persist,.ev-region-soft").forEach(el =>
+    el.classList.remove("ev-hl", "ev-hl-persist", "ev-region-soft"));
 }
 
 async function jumpToEvidence(path, jump, nav, terms) {
@@ -730,8 +730,8 @@ async function jumpToEvidence(path, jump, nav, terms) {
     m.remove();
     if (p.normalize) p.normalize();
   });
-  box.querySelectorAll(".ev-hl,.ev-hl-fade").forEach(el =>
-    el.classList.remove("ev-hl", "ev-hl-fade"));
+  box.querySelectorAll(".ev-hl,.ev-hl-fade,.ev-hl-persist,.ev-region-soft").forEach(el =>
+    el.classList.remove("ev-hl", "ev-hl-fade", "ev-hl-persist", "ev-region-soft"));
 
   const blocks = _evBlocks(box);
   const texts = blocks.map(b => _normTxt(b.textContent));
@@ -775,12 +775,27 @@ async function jumpToEvidence(path, jump, nav, terms) {
     region = blocks.slice(start, end + 1);
   }
 
-  // 5) 高亮：上下文=持久浅色块（左侧色边线）；**关键字=黄色 mark**。
-  //    跳过去必须「一眼看清命中在哪」—— 这是最基本的可用性，不能没有。
-  // 关键字来源优先级：
-  //   ① 后端 meta 帧下发的**问题实词**（干净，无 Markdown 污染）—— 主路径；
-  //   ② 退回从 ref.snippet 提炼的证据句（老帧/离线帧没有 terms 时才用）。
-  // 只在**已定位正确的 region 内**标记，绝不跨全文 fuzzy —— 不会重新引入目录误跳。
+  // 5) 高亮（语义分离）：
+  //    ① claim 证据句 = 整句强黄 mark + 居中滚动     ← 主高亮（「[N] 支持哪一句」）
+  //    ② parent region = 极浅上下文（左 accent）      ← 不再整块明显铺蓝（否则全是重点=没重点）
+  //    降级链：claim 句 → ref.snippet 句 → query terms（弱）→ parent-range context。
+  //    任何失败都不得破坏已完成的定位；最差不劣于旧版（terms + 整块高亮）。
+  const blockTexts = region.map(b => b.textContent || "");
+  let hit = _matchEvidenceSentence(blockTexts, (jump && jump.claim) || "");
+  if (!hit) {
+    const phrases = _evidencePhrases(jump.snippet);
+    if (phrases.length) hit = _matchEvidenceSentence(blockTexts, phrases[0]);
+  }
+
+  if (hit) {
+    region.forEach(b => b.classList.add("ev-region-soft"));
+    const mk = _wrapRange(region[hit.index], hit.start, hit.end, "ev-claim");
+    const target = mk || region[hit.index];
+    if (target.scrollIntoView) target.scrollIntoView({ block: "center", behavior: "smooth" });
+    return;                                   // 成功：不再叠加 terms，避免「全是重点」
+  }
+
+  // 降级：query terms（弱）+ 整块可见高亮 == 旧版行为，保证不退步
   region.forEach(b => { b.classList.remove("ev-hl-fade"); b.classList.add("ev-hl"); });
   let kws = (terms || []).map(t => String(t || "").trim()).filter(t => t.length >= 2);
   if (!kws.length) kws = _evidencePhrases(jump.snippet);
@@ -822,6 +837,129 @@ function _evidencePhrases(snippet) {
     .map(t => t.replace(/\s+/g, " ").trim())
     .filter(t => t.length >= 4)
     .slice(0, 6);
+}
+
+/* -------- Citation Precision Highlight（纯 Citation UX patch） --------
+   语义分离：
+     · query terms    = 「为什么检索到这里」（弱信号，仅在降级时使用）
+     · claim sentence = 「正文 [N] 到底支持哪一句」（强信号，主高亮）
+   claim 来自**被点击角标所在段落、角标之前的正文**（turn-scoped），绝不用整轮 query 代替。
+   匹配只在**已按 source-range 定位好的 region 内**做，绝不跨出 region 全文 fuzzy。
+   不改检索 / prompt / DB / source anchor / citation identity。 */
+
+// 角标所在块（bullet/paragraph）中、角标之前的正文 → claim 原文
+function _claimTextOf(chip) {
+  if (!chip || !chip.parentNode) return "";
+  const block = (chip.closest && chip.closest("p,li,blockquote,h1,h2,h3,h4,h5,h6,div"))
+    || chip.parentNode;
+  let out = "";
+  const w = document.createTreeWalker(block, NodeFilter.SHOW_TEXT, null);
+  while (w.nextNode()) {
+    const n = w.currentNode;
+    if (n === chip || (chip.contains && chip.contains(n))) break;   // 到角标自身即停
+    out += n.nodeValue || "";
+  }
+  return out;
+}
+
+// 归一化：去行首项目符号/序号 → 折叠空白（DOM 可能把一句拆成多节点）→ 小写 → 去首尾标点。
+// 注意：**不能**无条件去行首数字（「9月19日…」的 9 是正文，不是序号）；序号须带终止符。
+function _claimNorm(s) {
+  let t = String(s == null ? "" : s)
+    .replace(/^\s*(?:[•·▪◦‣]|[-*–—]|\d{1,3}\s*[.)、．]|[（(]\s*\d{1,3}\s*[）)])\s*/, "")
+    .replace(/[\s\u3000]+/g, "")
+    .toLowerCase();
+  return t
+    .replace(/^[，。！？；：、,.!?;:…"'“”‘’]+/, "")
+    .replace(/[，。！？；：、,.!?;:…"'“”‘’]+$/, "");
+}
+
+// 按 。！？；换行 切句，返回**块内字符区间** [{start,end}]（供高亮映射回 DOM）
+function _sentSpans(text) {
+  const out = [];
+  const re = /[^。！？；\n\r]+/g;
+  let m;
+  while ((m = re.exec(text))) {
+    const raw = m[0];
+    const s = m.index + (raw.length - raw.replace(/^\s+/, "").length);
+    const e = m.index + raw.replace(/\s+$/, "").length;
+    if (e > s) out.push({ start: s, end: e });
+  }
+  return out;
+}
+
+// claim 的轻量 token：数字 + 英文词 + 中文双字片段（滑窗 bigram）
+function _claimTokens(norm) {
+  const s = String(norm || "");
+  const toks = [];
+  (s.match(/\d+/g) || []).forEach(x => toks.push(x));
+  (s.match(/[a-z]+/g) || []).forEach(x => toks.push(x));
+  const runs = s.match(/[\u3400-\u9fff]+/g) || [];
+  for (const run of runs)
+    for (let k = 0; k + 2 <= run.length; k++) toks.push(run.slice(k, k + 2));
+  return toks.length ? Array.from(new Set(toks)) : [];
+}
+
+// 在 region（各块纯文本）内为 claim 选最贴合的候选句。
+// 返回 { index, start, end, mode:"exact"|"overlap", score } 或 null。
+// blockTexts[i] 必须与 region 第 i 块的 textContent 一致（高亮区间据此映射回 DOM）。
+function _matchEvidenceSentence(blockTexts, claimText) {
+  const claim = _claimNorm(claimText);
+  if (claim.length < 4) return null;                 // 太短不作为证据句（避免误标）
+  const toks = _claimTokens(claim);
+  let best = null;
+  for (let i = 0; i < blockTexts.length; i++) {
+    const text = String(blockTexts[i] || "");
+    for (const sp of _sentSpans(text)) {
+      const norm = _claimNorm(text.slice(sp.start, sp.end));
+      if (!norm) continue;
+      // A. 归一化精确子串（双向包含；更紧的句子得分更高）
+      if (norm.indexOf(claim) >= 0 || claim.indexOf(norm) >= 0) {
+        const score = 1 + Math.min(norm.length, claim.length) / Math.max(norm.length, claim.length);
+        if (!best || score > best.score)
+          best = { index: i, start: sp.start, end: sp.end, mode: "exact", score };
+        continue;
+      }
+      // B. 轻量重叠分（中文双字 / 数字 / 英文 token 命中比例）
+      if (!toks.length) continue;
+      let hit = 0;
+      for (const t of toks) if (norm.indexOf(t) >= 0) hit++;
+      const score = hit / toks.length;
+      if (score > 0 && (!best || score > best.score))
+        best = { index: i, start: sp.start, end: sp.end, mode: "overlap", score };
+    }
+  }
+  if (!best) return null;
+  if (best.mode === "exact") return best;
+  return best.score >= 0.34 ? best : null;           // 共同 token 太少 → 视为没找到（降级）
+}
+
+// 在 block 内把文本区间 [start,end) 包成 <mark class=cls>（可跨 <b>/<mark>/多个文本节点）
+function _wrapRange(block, start, end, cls) {
+  if (!block) return null;
+  const w = document.createTreeWalker(block, NodeFilter.SHOW_TEXT, null);
+  const jobs = [];
+  let acc = 0;
+  while (w.nextNode()) {
+    const n = w.currentNode;
+    const val = n.nodeValue || "";
+    const s = Math.max(start, acc) - acc;
+    const e = Math.min(end, acc + val.length) - acc;
+    if (e > s) jobs.push({ n, s, e, len: val.length });
+    acc += val.length;
+  }
+  let first = null;
+  for (const { n, s, e, len } of jobs) {
+    let target = n;
+    if (e < len) target.splitText(e);
+    if (s > 0) target = target.splitText(s);
+    const m = document.createElement("mark");
+    m.className = cls;
+    m.textContent = target.nodeValue;
+    target.parentNode.replaceChild(m, target);
+    if (!first) first = m;
+  }
+  return first;
 }
 
 
@@ -1493,6 +1631,9 @@ document.addEventListener("click", async function (ev) {
     snippet: chip.dataset.snippet || "",
     source_start_line: Number(chip.dataset.srcStart) || 0,
     source_end_line: Number(chip.dataset.srcEnd) || 0,
+    // claim：角标所在段落、角标**之前**的正文（turn-scoped）—— 用于在 region 内
+    // 精确定位「这个角标支持的原文句」。绝不回查全局 refs / 不用整轮 query 代替。
+    claim: _claimTextOf(chip),
   } : null;
   // 高亮词取**本 bubble 自己那一轮**（turn-scoped），不用全局最新一轮
   const bubble = chip.closest ? chip.closest(".bubble") : null;
