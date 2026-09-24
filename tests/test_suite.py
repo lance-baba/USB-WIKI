@@ -4,7 +4,6 @@
   基础链路  —— 切片 / FTS5 Trigram / 短词 LIKE 降级 / 向量 KNN / RRF 融合
   摄入管道  —— 成功分支 / partial_fallback 降级分支
   双模网关  —— SSE 帧序列
-  星图      —— Wikilink 强连线
   隐蔽细节  —— #1 exFAT 等长编辑漏扫、#2 控制台编码锁死、#3 onnxruntime 指令集防护
   破坏性    —— TC-HARD-01/03/04/05 的可自动化等价场景
 
@@ -47,7 +46,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from app.core import (  # noqa: E402
-    chunker, config, crawler, db as db_mod, embedder, graph as graph_mod,
+    chunker, config, crawler, db as db_mod, embedder,
     indexer, llm, paths, search, sync,
 )
 
@@ -310,20 +309,6 @@ def test_gateway(ctx) -> None:
 
     once = ctx.gateway.chat_once("位置编码是什么？")
     check("非流式封装可用", "answer" in once and "references" in once)
-
-
-def test_graph(ctx) -> None:
-    section("离线星图")
-    g = graph_mod.build_graph(ctx.db, threshold=0.82)
-    check("节点数 = 文档数", len(g["nodes"]) == 3, str(len(g["nodes"])))
-    wl = [l for l in g["links"] if l["type"] == "wikilink"]
-    check("Wikilink 强连线已建立", len(wl) >= 1, str(g["stats"]))
-    check("链接目标解析到真实文档", all(
-        any(n["id"] == l["target"] and n["kind"] == "doc" for n in g["nodes"]) for l in wl
-    ))
-    g9 = graph_mod.build_graph(ctx.db, threshold=0.95)
-    check("阈值升高不会新增弱连线",
-          g9["stats"]["semantic"] <= g["stats"]["semantic"], f"0.82={g['stats']['semantic']} 0.95={g9['stats']['semantic']}")
 
 
 def test_hidden_detail_1_equal_length_edit(ctx) -> None:
@@ -2634,7 +2619,7 @@ def test_duplicate_url_detection(ctx) -> None:
     """同一来源 URL 判重：规范化 → 抓取前检查 → 由用户决定动作。
 
     背景（实测事故）：同一篇 Grok 文章被抓成两篇笔记，直接污染检索引用、
-    关键词、主题分组与统计。
+    关键词与统计。
 
     设计约束：
     * **判重必须发生在抓取之前**（abort 分支不发任何网络请求）
@@ -3247,16 +3232,14 @@ def test_inject_budget(ctx) -> None:
     check("超长段落被截断并标出省略号", "…" in seg)
     check("截取的是**与查询相关**的窗口（而非无脑从头截）", "台风" in seg)
 
-def test_ingest_analysis_and_graph(ctx) -> None:
-    """入库语义分析 + 星图确定性边。
+def test_ingest_analysis(ctx) -> None:
+    """入库语义分析（确定性层）。
 
     背景：此前入库只做「转 Markdown → 切片 → 索引」，没有任何语义理解，
-    于是星图只能靠手写 [[Wikilink]] 与高阈值向量建边 —— 两者在这个工作流里
-    几乎都不存在，实测 12 个节点只有 2 条边、8 个孤立节点。这里验证补上的
-    「确定性层」：零依赖、离线可用。
+    关键词 / 实体也就没有数据来源。这里验证补上的「确定性层」：零依赖、离线可用。
     """
-    section("入库语义分析 + 星图确定性边")
-    from app.core import analyzer, graph
+    section("入库语义分析")
+    from app.core import analyzer
 
     # ---- 分析器：关键信息必须真的被抽出来 ----
     body = (
@@ -3276,7 +3259,7 @@ def test_ingest_analysis_and_graph(ctx) -> None:
     check("抽到日期实体", bool(a.entities.get("日期")), str(a.entities))
     check("抽到网址实体", bool(a.entities.get("网址")), str(a.entities))
 
-    # ---- doc_meta：索引时写入，供星图使用 ----
+    # ---- doc_meta：索引时写入的元数据（关键词等）----
     for name, body2 in NOTES.items():
         p = paths.NOTES_DIR / name
         p.write_text(body2, encoding="utf-8")
@@ -3286,18 +3269,6 @@ def test_ingest_analysis_and_graph(ctx) -> None:
     kw_row = ctx.db.query_one("SELECT keywords FROM doc_meta LIMIT 1")
     check("doc_meta 里有关键词（旧笔记走回退现算）",
           bool(kw_row and kw_row["keywords"].strip()), str(kw_row["keywords"] if kw_row else ""))
-
-    # ---- 星图：边必须带得出手的理由 ----
-    g = graph.build_graph(ctx.db)
-    check("星图产出节点", len(g["nodes"]) >= 1, str(g["stats"]))
-    check("默认不启用向量边（依赖嵌入源，多数环境没有）",
-          g["stats"]["vectors_enabled"] is False and g["stats"]["semantic"] == 0,
-          str(g["stats"]))
-    check("每条边都带 type", all(lk.get("type") for lk in g["links"]),
-          str([lk.get("type") for lk in g["links"]]))
-    non_wiki = [lk for lk in g["links"] if lk["type"] != "wikilink"]
-    check("确定性边带「为什么相连」的说明",
-          all(lk.get("reason") for lk in non_wiki), str([lk.get("reason") for lk in non_wiki]))
 
 def test_search_quality_guards(ctx) -> None:
     """检索质量三道闸：实词化、语料词典、引用必须有词法依据。
@@ -3432,7 +3403,7 @@ def test_offline_assets() -> None:
 
     external = re.findall(r'(?:src|href)\s*=\s*["\'](https?://[^"\']+)', html)
     check("HTML 不含任何外链 CDN 资源", not external, str(external))
-    # 死代码清理（Commit A）：D3 力导图已被「主题分组」取代，前端不再引用 D3，vendor 文件已删除。
+    # 死代码清理：D3 力导图 / 星图节点图已移除，前端不再引用 D3，vendor 文件已删除。
     check("控制台不含任何 d3 引用",
           "d3." not in html and "d3.v7" not in html and "/vendor/d3" not in html,
           "仍引用 d3")
@@ -3444,13 +3415,45 @@ def test_offline_assets() -> None:
     check("前端拆分产物 app.css 存在", (paths.WEB_DIR / "app.css").exists())
     check("前端拆分产物 app.js 存在", (paths.WEB_DIR / "app.js").exists())
     check("未闭合角标缓冲实现已迁至 app.js", "splitHold" in js and "\\[\\^?" in js)
-    # 节点图已被「主题分组」取代：实测本项目语料是「剪藏一批互不相关页面」，
-    # 12 篇分成 9 个连通分量，节点图必然是一堆孤岛（不匹配使用形态）。
-    check("控制台已把星图换为主题分组", "主题分组" in html and "topicBox" in html)
-    # 用户可见性质：主题页里不再有节点图画布（SVG 元素从未在 DOM 中存在）。
+    # 星图 / 主题分组功能已**彻底移除**（前端不再有该页，后端不再有 /api/topics·/api/graph）。
+    check("控制台已无星图/主题页残留（tab / panel / 控件）",
+          all(x not in html for x in ("panel-graph", "topicBox", "topicMin", "主题分组",
+                                      'data-tab="graph"')))
+    check("前端不再调用已移除的图/主题接口",
+          "/api/topics" not in js and "/api/graph" not in js
+          and "loadGraph" not in js and "renderTopics" not in js)
     check("主题页不再有节点图画布", '<svg id="graphSvg">' not in html)
-    check("主题页有「共现若干篇才成主题」的阈值控件", 'id="topicMin"' in html)
     check("控制台包含安全退出按钮（调用 /api/system/shutdown）", "/api/system/shutdown" in js)
+
+
+def test_settings_schema_and_defaults() -> None:
+    """设置页：每个配置项都要有中文 schema（否则会以英文原始键兜底显示）；
+    并暴露内置默认值供「恢复默认设置」按钮填回。
+    """
+    section("设置页 · schema 覆盖与恢复默认")
+    import re
+
+    from app.core import config as config_mod
+
+    js = (paths.WEB_DIR / "app.js").read_text(encoding="utf-8")
+    m = re.search(r"const CFG_SCHEMA = \[(.*?)\n\];", js, re.S)
+    schema = m.group(1) if m else ""
+
+    covered = set()
+    cur = None
+    for sec, key in re.findall(r'sec:\s*"(\w+)"|key:\s*"(\w+)"', schema):
+        if sec:
+            cur = sec
+        elif key and cur:
+            covered.add(cur + "." + key)
+
+    defs = config_mod.defaults()
+    all_keys = {s + "." + k for s, items in defs.items() for k in items}
+    missing = sorted(all_keys - covered)
+    check("设置页 schema 覆盖所有配置项（否则会有英文原始键兜底显示）", not missing, str(missing))
+    check("恢复默认：defaults() 返回内置默认值",
+          defs.get("AI", {}).get("provider") == "auto", str(defs.get("AI", {}).get("provider")))
+    check("恢复默认：defaults() 不含已删除的 GRAPH 段", "GRAPH" not in defs)
 
 
 def test_no_absolute_paths() -> None:
@@ -3472,7 +3475,8 @@ def test_no_absolute_paths() -> None:
 
     tmpl = config_mod.DEFAULT_TEMPLATE
     check("内置配置模板含全部必需段",
-          all(sec in tmpl for sec in ("[AI]", "[CRAWLER]", "[GRAPH]")), tmpl[:120])
+          all(sec in tmpl for sec in ("[AI]", "[CRAWLER]")), tmpl[:120])
+    check("星图配置段已移除", "[GRAPH]" not in tmpl)
     check("内置配置模板含嵌入源与维度",
           "embedding_source" in tmpl and "embedding_dim" in tmpl)
     check("config.ini 已 gitignore（含明文密钥，由首次运行生成）",
@@ -3778,6 +3782,7 @@ def main() -> int:
         test_alert_classification()
         test_console_encoding_guard()
         test_offline_assets()
+        test_settings_schema_and_defaults()
         test_no_absolute_paths()
         test_portable_containment()
         test_chrome_fallback_ssrf()
@@ -3907,11 +3912,10 @@ def main() -> int:
         test_schema_compatibility(ctx)
         test_atomic_io()
         test_inject_budget(ctx)
-        test_ingest_analysis_and_graph(ctx)
+        test_ingest_analysis(ctx)
         test_search_quality_guards(ctx)
         test_index_and_search(ctx)
         test_gateway(ctx)
-        test_graph(ctx)
         test_crawler(ctx)
         test_archive_localization()
         test_original_base_injection()

@@ -1239,59 +1239,6 @@ function inline(s) {
     .replace(/~~([^~\n]+)~~/g, "<s>$1</s>");
 }
 
-async function loadGraph() {
-  const minDocs = Math.max(1, Math.min(20, parseInt($("#topicMin").value || "2", 10) || 2));
-  $("#topicStats").innerHTML = '<span class="spin"></span> 正在归类…';
-  try {
-    const r = await api("/api/topics?min_docs=" + minDocs);
-    renderTopics(r.data || {});
-  } catch (e) {
-    $("#topicStats").textContent = "归类失败：" + e.message;
-    $("#topicBox").innerHTML = "";
-  }
-}
-
-/* 主题分组渲染。刻意不画节点图 —— 实测本项目语料是「剪藏一批互不相关页面」，
-   节点图必然是一堆孤岛（12 篇分成 9 个分量）；自动归题 + 按题浏览才贴合场景。 */
-function renderTopics(d) {
-  const topics = d.topics || [];
-  const st = d.stats || {};
-  const ungrouped = d.ungrouped || [];
-  $("#topicStats").textContent =
-    "笔记 " + (st.docs || 0) + " 篇 · 主题 " + (st.topics || 0) + " 个 · 已归题 " +
-    (st.grouped_docs || 0) + " 篇 · 尚未归题 " + (st.ungrouped_docs || 0) + " 篇";
-
-  let html = "";
-  if (!topics.length) {
-    html += '<div class="hint" style="padding:14px 4px">' +
-      "还没有出现'多篇笔记共有的关键词'——<b>主题分组要等你围绕同一主题积累若干篇笔记才会长出来</b>。" +
-      "<br><br>可在上方把阈值调成 <b>1</b>，先看每篇笔记各自的关键词（当作自动标签索引）。</div>";
-  }
-  topics.forEach(function (t) {
-    html += '<div style="margin-bottom:12px">' +
-      '<div style="font-weight:600;font-size:13px;margin-bottom:5px">' +
-      esc(t.term) + ' <span class="pill">' + t.count + ' 篇</span></div>' +
-      '<div style="display:flex;flex-wrap:wrap;gap:6px">' +
-      t.docs.map(function (x) {
-        return '<span class="ref" data-path="' + esc(x.path) + '" title="' + esc(x.path) + '">' +
-               esc(x.title.slice(0, 28)) + '</span>';
-      }).join("") + '</div></div>';
-  });
-  if (ungrouped.length) {
-    html += '<div style="margin-bottom:12px"><div style="font-weight:600;font-size:13px;margin-bottom:5px">' +
-      '尚未归题 <span class="pill">' + ungrouped.length + ' 篇</span></div>' +
-      '<div style="display:flex;flex-wrap:wrap;gap:6px">' +
-      ungrouped.map(function (x) {
-        return '<span class="ref" data-path="' + esc(x.path) + '" title="' + esc(x.path) + '">' +
-               esc(x.title.slice(0, 28)) + '</span>';
-      }).join("") + '</div></div>';
-  }
-  $("#topicBox").innerHTML = html;
-  $$("#topicBox .ref").forEach(function (el) {
-    el.onclick = function () { openNoteByPath(el.dataset.path); };
-  });
-}
-
 /* ---------------------------- 设置 ---------------------------- */
 /* schema 驱动渲染：common=true 的组默认展开，其余折叠进「高级设置」。
    config.ini 保持完整不删项 —— 只是把「看不懂的」收起来，并给每一项配人话说明。 */
@@ -1319,11 +1266,13 @@ const CFG_SCHEMA = [
     ],
   },
   {
-    sec: "GRAPH", title: "知识星图", common: true,
-    desc: "只控制「星图」页的连线密度，怎么调都不会出错。",
+    sec: "AI", title: "AI 提示注入预算", common: false,
+    desc: "控制「一次给模型塞多少背景资料」。调大更全但更慢更费 token，调小可能漏信息。",
     fields: [
-      { key: "semantic_threshold", label: "语义连线阈值", type: "range", min: 0.70, max: 0.95, step: 0.01,
-        tip: "越低连线越多（容易变毛线团），越高越清爽。节点很密就往右拉。" },
+      { key: "inject_per_parent_chars", label: "每段最多注入（字）", type: "number", min: 100,
+        tip: "每一段背景最多截取多少字符。默认 400。" },
+      { key: "inject_total_chars", label: "整轮注入上限（字）", type: "number", min: 200,
+        tip: "一次回答里，所有背景段加起来的字符上限。默认 1800。" },
     ],
   },
   {
@@ -1357,6 +1306,50 @@ const CFG_SCHEMA = [
         tip: "默认 20 秒。" },
       { key: "snapshot_chars", label: "降级快照保留字数", type: "number", min: 100,
         tip: "默认 1000。" },
+      { key: "save_assets", label: "抓取网页子资源（离线可看）", type: "select",
+        tip: "开启后剪藏网页时把 CSS / 图片 / 字体一起存到本地资源池 —— 离线也能还原版式，且浏览时不向外部发任何请求。默认开启。",
+        options: [["1", "开启（推荐）"], ["0", "关闭（只留 HTML）"]] },
+      { key: "assets_budget_kb", label: "单页资源预算（KB）", type: "number", min: 256,
+        tip: "单个网页最多存多少 KB 的资源，超出后剩余资源改用占位符，避免个别页面吃掉整块 U 盘。默认 5120（5 MB）。" },
+      { key: "asset_max_kb", label: "单个资源上限（KB）", type: "number", min: 32,
+        tip: "单个图片 / 字体超过这个大小就跳过（留占位，保留原始尺寸以免撑破布局）。默认 512。" },
+      { key: "allow_private_network", label: "允许抓取内网地址", type: "select",
+        tip: "默认关闭：只允许公网地址（防 SSRF，逐跳校验重定向）。开启表示你明确允许抓局域网 / 本机资源；协议白名单与重定向校验仍不变。",
+        options: [["0", "关闭（推荐）"], ["1", "允许内网"]] },
+    ],
+  },
+  {
+    sec: "ANALYZE", title: "入库分析（AI 增强）", common: false,
+    desc: "入库时是否用本地模型生成一句话摘要。确定性抽取（关键词 / 实体 / 语言）永远执行，不受此影响。",
+    fields: [
+      { key: "ai_summary", label: "生成一句话摘要", type: "select",
+        tip: "模型不在线会自动跳过，不影响入库速度与成功率。默认开启。",
+        options: [["1", "开启（推荐）"], ["0", "关闭"]] },
+    ],
+  },
+  {
+    sec: "SEARCH", title: "检索引用策略", common: false,
+    desc: "控制「引用来源」的严格程度。",
+    fields: [
+      { key: "allow_semantic_only", label: "允许「仅语义相关」进入引用", type: "select",
+        tip: "默认关闭：引用必须有字面依据，宁可回答「没找到」，也不用语义相近但无关的文档冒充出处。开启则召回更多，但引用可能不相关。",
+        options: [["0", "关闭（推荐）"], ["1", "允许"]] },
+    ],
+  },
+  {
+    sec: "IMPORT", title: "文件导入边界（安全上限）", common: false,
+    desc: "防止超大文件 / 压缩炸弹打爆处理流程。默认值保守，正常文档都能打开。",
+    fields: [
+      { key: "max_file_mb", label: "单文件上限（MB）", type: "number", min: 1,
+        tip: "普通文件（PDF / CSV / Markdown 等）单文件大小上限。默认 50。" },
+      { key: "max_archive_entries", label: "压缩包内文件数上限", type: "number", min: 1,
+        tip: "OOXML / EPUB 等压缩容器内的条目数上限。默认 5000。" },
+      { key: "max_archive_entry_mb", label: "压缩包单条目上限（MB）", type: "number", min: 1,
+        tip: "单个解压后条目的大小上限。默认 50。" },
+      { key: "max_archive_total_mb", label: "压缩包总解压上限（MB）", type: "number", min: 1,
+        tip: "整个压缩包解压后的总大小上限。默认 200。" },
+      { key: "max_compression_ratio", label: "最大压缩比", type: "number", min: 1,
+        tip: "解压膨胀倍数上限（防压缩炸弹）。默认 100。" },
     ],
   },
   {
@@ -1376,6 +1369,7 @@ const CFG_SCHEMA = [
 ];
 const SENSITIVE = new Set(["AI.api_key"]);
 let CFG_ORIGINAL = {};   // 记住加载时的值，用于检测「嵌入模型变了要重建索引」
+let CFG_DEFAULTS = {};   // 内置默认值（由 /api/config 附带），供「恢复默认设置」
 
 function cfgVal(cfg, sec, key) {
   const v = cfg && cfg[sec] ? cfg[sec][key] : undefined;
@@ -1438,6 +1432,7 @@ function cfgGroup(g, cfg) {
 async function loadConfig() {
   const r = await api("/api/config");
   const cfg = r.data || {};
+  CFG_DEFAULTS = r.defaults || {};
   CFG_ORIGINAL = JSON.parse(JSON.stringify(cfg));
 
   const seen = new Set();
@@ -1446,10 +1441,11 @@ async function loadConfig() {
     g.fields.forEach(f => seen.add(g.sec + "." + f.key));
     (g.common ? common : advanced).push(cfgGroup(g, cfg));
   });
-  // config.ini 里存在但 schema 未覆盖的键 —— 兜底渲染，保证保存时不丢
+  // config.ini 里存在但 schema 未覆盖的键 —— 兜底渲染，保证保存时不丢。
+  // 排除合成的 *_set 字段（GET /api/config 为「是否已配置密钥」附加，不是真实配置项）。
   const extra = [];
   Object.keys(cfg).forEach(sec => {
-    const hidden = Object.keys(cfg[sec]).filter(k => !seen.has(sec + "." + k));
+    const hidden = Object.keys(cfg[sec]).filter(k => !seen.has(sec + "." + k) && !/_set$/.test(k));
     if (!hidden.length) return;
     extra.push('<div class="cfg-group"><h4>' + esc(sec) + " · 其他</h4>" + hidden.map(k =>
       '<div class="field"><div class="frow"><label>' + esc(k) + "</label></div>" +
@@ -1460,6 +1456,31 @@ async function loadConfig() {
   $("#cfgForm").innerHTML = common.join("");
   $("#cfgAdvanced").innerHTML = advanced.join("") + extra.join("");
   refreshOllamaModels();
+}
+
+/* 「恢复默认设置」：把表单填回出厂默认值（**不落盘**，用户再点「保存配置」才生效）。
+   密钥字段刻意跳过 —— 默认值为空，重置会把真 Key 覆盖掉。 */
+function applyConfigDefaults() {
+  if (!Object.keys(CFG_DEFAULTS).length) { toast("默认值尚未加载，请先刷新"); return; }
+  if (!confirm("把设置填回出厂默认值？\n\n不会立即保存 —— 确认无误后再点「保存配置」才生效。" +
+               "\n（云端 API Key 不会被清空）")) return;
+  $$("#cfgForm [data-sec], #cfgAdvanced [data-sec]").forEach(el => {
+    const sec = el.dataset.sec, key = el.dataset.key;
+    if (SENSITIVE.has(sec + "." + key)) return;            // 不重置密钥
+    const d = CFG_DEFAULTS[sec] ? CFG_DEFAULTS[sec][key] : undefined;
+    if (d === undefined) return;
+    if (el.tagName === "SELECT" && !Array.from(el.options).some(o => o.value === String(d))) {
+      const o = document.createElement("option");
+      o.value = String(d); o.textContent = String(d) || "（默认）";
+      el.appendChild(o);
+    }
+    el.value = d;
+    if (el.type === "range") {
+      const rv = el.closest(".field") && el.closest(".field").querySelector(".rangeval");
+      if (rv) rv.textContent = (+d).toFixed(2);
+    }
+  });
+  toast("已填回默认值，确认后点「保存配置」生效");
 }
 
 /* Ollama 模型下拉（对话模型 + 嵌入模型通用）：在线就列出本机已装模型；
@@ -1600,7 +1621,7 @@ async function rebuild(vec) {
   });
   toast(r.message || "任务已启动");
   setTimeout(async () => {
-    await loadNotes(); await loadGraph(); await pollStatus(false);
+    await loadNotes(); await pollStatus(false);
     log.textContent = "任务已提交后台执行，可继续使用其他功能。";
   }, 2500);
 }
@@ -1609,7 +1630,6 @@ async function rebuild(vec) {
 function switchTab(name) {
   $$(".tab").forEach(t => t.classList.toggle("active", t.dataset.tab === name));
   $$(".panel").forEach(p => p.classList.toggle("active", p.id === "panel-" + name));
-  if (name === "graph") setTimeout(loadGraph, 40);
   if (name === "notes") loadNotes();
   if (name === "settings") { loadConfig(); pollStatus(false); }
 }
@@ -1654,10 +1674,9 @@ $("#btnSaveNote").onclick = doSaveNote;
 $("#noteFilter").oninput = renderNoteList;
 $("#btnCfgSave").onclick = () => saveConfig(false);
 $("#btnCfgReload").onclick = loadConfig;
+$("#btnCfgDefaults").onclick = applyConfigDefaults;
 $("#btnRebuild").onclick = () => rebuild(false);
 $("#btnRebuildVec").onclick = () => rebuild(true);
-$("#btnGraphReload").onclick = loadGraph;
-$("#topicMin").onchange = loadGraph;
 $("#btnRefresh").onclick = async () => { await pollStatus(false); await loadNotes(); toast("状态已刷新"); };
 
 $("#btnShutdown").onclick = async () => {

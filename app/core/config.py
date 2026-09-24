@@ -104,13 +104,6 @@ save_assets = 1
 assets_budget_kb = 5120
 # 单个资源的大小上限 (KB)。超过则跳过并留占位（保留原始尺寸，避免撑破布局）。
 asset_max_kb = 512
-
-[GRAPH]
-# 术语重合边的阈值（关键词集合的 Jaccard 相似度）。这是星图的主力边，
-# 零模型、离线可用。调小 → 边更多但更弱；调大 → 只留高度相关的。
-term_threshold = 0.10
-# 知识星图语义相似度建连默认阈值
-semantic_threshold = 0.82
 """
 
 _lock = threading.RLock()
@@ -157,6 +150,11 @@ def load(path: Path | None = None, force: bool = False) -> configparser.ConfigPa
             for key, value in fallback.items(section):
                 if not parser.has_option(section, key):
                     parser.set(section, key, value)
+
+        # [GRAPH]（星图）功能已移除 → 清掉历史 config.ini 里残留的该段：
+        # 否则设置页会把它当「未知键」以英文原始键兜底显示。下次保存即从文件消失。
+        if parser.has_section("GRAPH"):
+            parser.remove_section("GRAPH")
 
         _parser = parser
         return _parser
@@ -207,6 +205,16 @@ def get_str(section: str, key: str, default: str = "") -> str:
 
 def as_dict() -> dict[str, dict[str, str]]:
     p = load()
+    return {s: dict(p.items(s)) for s in p.sections()}
+
+
+def defaults() -> dict[str, dict[str, str]]:
+    """内置默认配置（解析自 ``DEFAULT_TEMPLATE``）—— 供设置页「恢复默认」使用。
+
+    只含出厂默认值，不含任何用户填写内容（``api_key`` 默认为空串）。
+    """
+    p = _new_parser()
+    p.read_string(DEFAULT_TEMPLATE)
     return {s: dict(p.items(s)) for s in p.sections()}
 
 

@@ -25,10 +25,6 @@
     <button class="tab active" data-tab="chat">问答</button>
     <button class="tab" data-tab="capture">剪藏</button>
     <button class="tab" data-tab="notes">笔记</button>
-    <!-- Pilot 隐藏「主题」：主题页对 Pilot（问答/资料）没有实际价值（主题 0 个 / 尚未归题 11 篇）。
-         仅 UI 隐藏 —— 主题后端、数据、本面板代码全部保留，待 Collections / Topic Intelligence
-         重新定义产品价值后再启用。 -->
-    <button class="tab" data-tab="graph" hidden>主题</button>
     <button class="tab" data-tab="settings">设置</button>
   </nav>
 
@@ -129,26 +125,6 @@
       </div>
     </section>
 
-    <!-- ============ 星图 ============ -->
-    <section class="panel" id="panel-graph">
-        <div class="card grow">
-          <div class="row" style="margin-bottom:10px">
-            <h3 style="margin:0">主题分组</h3>
-            <div class="spacer"></div>
-            <div class="legend">
-              <span>按关键词自动归题 · 点标签或笔记可直接跳转</span>
-              <span style="margin-left:6px">仅显示 ≥
-                <input type="number" id="topicMin" min="1" max="20" value="2" style="width:52px">
-                篇的标签
-              </span>
-              <button class="btn ghost" id="btnGraphReload">重新分组</button>
-            </div>
-          </div>
-          <div id="topicStats" class="hint" style="margin-bottom:8px"></div>
-          <div id="topicBox" style="flex:1;min-height:0;overflow-y:auto;padding-right:4px"></div>
-        </div>
-      </section>
-
     <!-- ============ 设置 ============ -->
     <section class="panel" id="panel-settings">
       <div class="split" style="grid-template-columns:minmax(0,1.12fr) minmax(0,.88fr)">
@@ -166,6 +142,7 @@
           <div class="row" style="margin-top:16px">
             <button class="btn primary" id="btnCfgSave">保存配置</button>
             <button class="btn" id="btnCfgReload">放弃修改</button>
+            <button class="btn" id="btnCfgDefaults" title="把表单填回出厂默认值（不会立即保存）">恢复默认设置</button>
             <span class="hint" style="margin-left:4px">保存后重启程序才完全生效</span>
           </div>
         </div>

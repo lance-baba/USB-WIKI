@@ -308,9 +308,6 @@
   .doc-frame{min-height:120px;width:100%;border:1px solid var(--line);border-radius:9px;background:#fff}
   .doc-meta{font-size:11.5px;color:var(--faint);margin-bottom:7px}
   .doc-dl{padding:14px;border:1px dashed var(--line-strong);border-radius:10px;text-align:center}
-  .legend{display:flex;gap:16px;flex-wrap:wrap;font-size:11.5px;color:var(--muted);align-items:center}
-  .legend span{display:inline-flex;align-items:center;gap:6px}
-  .swatch{width:14px;height:3px;border-radius:2px;display:inline-block}
   input[type=range]{width:190px;accent-color:var(--accent)}
   .kv{display:grid;grid-template-columns:auto 1fr;gap:4px 14px;font-size:12.5px}
   .kv b{font-weight:600;color:var(--muted)}

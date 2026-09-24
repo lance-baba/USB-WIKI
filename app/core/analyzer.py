@@ -3,9 +3,8 @@
 ## 为什么要有它
 
 本项目的入库流程此前只有「转 Markdown → 切片 → 索引」，**没有任何语义理解**。
-后果不止是「看不到摘要」：笔记之间无从比较，于是**星图的边也就没有数据来源**
-（此前只能靠手写 `[[Wikilink]]` 与高阈值向量，两者在这个工作流里几乎都不存在）。
-所以这块既是内容分析，也是星图的地基。
+后果不止是「看不到摘要」：笔记之间无从比较，关键词 / 实体也就没有数据来源。
+所以这块是入库内容分析的地基。
 
 ## 两层设计（与项目既有的降级理念一致）
 
@@ -76,7 +75,6 @@ class Analysis:
     """一次入库分析的结果。"""
 
     keywords: list[str] = field(default_factory=list)      # 供界面展示的 top-k
-    terms: dict[str, float] = field(default_factory=dict)  # 加权术语向量，供星图算重合度
     entities: dict[str, list[str]] = field(default_factory=dict)
     language: str = "unknown"
     chars: int = 0
@@ -254,7 +252,6 @@ def analyze(text: str, title: str = "", top_k: int = 6) -> Analysis:
     terms = extract_terms(text, title)
     return Analysis(
         keywords=list(terms.keys())[:top_k],
-        terms=terms,
         entities=extract_entities(text),
         language=detect_language(text),
         chars=len(text or ""),

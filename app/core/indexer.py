@@ -174,7 +174,7 @@ def index_parsed(
                     parsed.title, parsed.status, prefix_hash or None, time.time(),
                 ),
             )
-            # 入库分析元数据（frontmatter -> doc_meta），供星图与界面使用
+            # 入库分析元数据（frontmatter -> doc_meta），供检索与界面使用
             _m = parsed.meta or {}
             _kws = _m.get("keywords")
             _kw_text = " ".join(str(x) for x in _kws) if isinstance(_kws, (list, tuple)) else str(_kws or "")

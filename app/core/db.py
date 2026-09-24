@@ -83,8 +83,8 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         tokenize = 'trigram'
     );""",
     # 入库分析的元数据：关键词 / 来源域名 / 语言 / 摘要 / 实体
-    # 由 indexer 在索引时从 frontmatter 抄写过来 —— 星图据此建「术语重合」与
-    # 「同源」边，不必逐文件读 frontmatter；关键词顺带可用于检索与界面展示。
+    # 由 indexer 在索引时从 frontmatter 抄写过来，不必逐文件读 frontmatter；
+    # 关键词可用于检索与界面展示。
     """CREATE TABLE IF NOT EXISTS doc_meta (
         doc_id    TEXT PRIMARY KEY,
         keywords  TEXT DEFAULT '',

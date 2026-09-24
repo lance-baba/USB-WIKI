@@ -26,7 +26,8 @@ def handle_get(h: "Handler", path: str) -> bool:
             for _k in list(_items):
                 if redact_mod.is_secret_key(_k):
                     _items[f"{_k}_set"] = bool(config.get_str(_sec, _k, ""))
-    h._send_json({"code": 200, "data": masked})
+    # 附带内置默认值，供设置页「恢复默认设置」按钮填回表单（默认值无密钥，无需脱敏）。
+    h._send_json({"code": 200, "data": masked, "defaults": config.defaults()})
     return True
 
 

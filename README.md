@@ -144,7 +144,7 @@ Wiki-USB/
 │   │   ├── system.py           # /api/status · /api/system/{rebuild-index,rebuild-vectors,shutdown}
 │   │   ├── config.py           # /api/config（GET 脱敏 · POST 保存）
 │   │   ├── diagnostics.py      # /api/diagnostics
-│   │   ├── search.py           # /api/search · /api/topics · /api/graph
+│   │   ├── search.py           # /api/search
 │   │   ├── ask.py              # /api/chat/completions(SSE) · /api/ai/test · /api/ollama/models
 │   │   ├── library.py          # /api/notes* · /api/notes/import · /api/import/formats
 │   │   └── capture.py          # /api/capture/{url,duplicate}
@@ -159,12 +159,12 @@ Wiki-USB/
 │   │   ├── crawler.py          # 网页抓取与降级矩阵
 │   │   ├── llm.py              # 双模 AI 网关 + SSE 流式
 │   │   ├── sync.py             # exFAT 双指纹增量同步
-│   │   ├── graph.py            # 知识星图数据构建
 │   │   ├── net_util.py         # 标准库 HTTP（代理 / certifi / UTF-8）
 │   │   └── context.py          # 应用上下文装配
 │   └── web/
-│       ├── index.html          # 单文件控制台（零框架）
-│       └── vendor/d3.v7.min.js # 完全离线静态库
+│       ├── index.html          # 控制台壳（零框架 / 零 CDN）
+│       ├── app.css             # 样式
+│       └── app.js              # 前端逻辑（问答 / 剪藏 / 笔记 / 设置）
 ├── data/                       # 用户核心资产
 │   ├── notes/                  # 唯一真相源：手写笔记与剪藏 Markdown
 │   ├── snapshots/              # 降级页面的原始 HTML 快照
@@ -186,7 +186,6 @@ Wiki-USB/
 | **短词召回** | 单汉字 / `AI` / `C#` 等短查询自动降级 `LIKE '%kw%'`，召回率 100% |
 | **精确溯源** | 回答携带 `[^n]` 角标，悬停展示父分块来源文件与原文摘要 |
 | **外部编辑器共存** | 15s 轮询 + exFAT 双指纹（含等长编辑哈希比对），Obsidian/Typora 随意读写 |
-| **离线星图** | `[[Wikilink]]` 强连线 + 向量余弦弱连线，阈值滑块 0.70~0.95 化解「毛线团」 |
 | **介质安全** | WAL + `synchronous=NORMAL` 抑制写放大；启动自愈 + 优雅退出保证拔盘后主库自洽 |
 
 ---
@@ -232,7 +231,7 @@ embedding_dim = 512
 ## 6. 测试
 
 ```bash
-python tests/test_suite.py     # 切片/检索/网关/主题分组/破坏性/数据安全/原子写/结构升级/安全边界
+python tests/test_suite.py     # 切片/检索/网关/破坏性/数据安全/原子写/结构升级/安全边界
                                # 末行输出 TOTAL/PASS/SKIP/FAIL；离线时网络用例记 SKIP，总数不变
 python tests/smoke_core.py     # 核心链路冒烟（4 组查询）
 python setup_runtime_windows.py --check           # 运行时体检（解释器 / _pth / 依赖包能否跑起来）
