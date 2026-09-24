@@ -233,6 +233,8 @@ embedding_dim = 512
 ```bash
 python tests/test_suite.py     # 切片/检索/网关/破坏性/数据安全/原子写/结构升级/安全边界
                                # 末行输出 TOTAL/PASS/SKIP/FAIL；离线时网络用例记 SKIP，总数不变
+python tests/test_suite.py --fast   # 快速模式：跳过 A1/A2/A3/A4.2b 的「真实构建发布包 + 安装/重装」段
+                                    # （日常改动用它，几秒~几分钟）；**发布前务必跑一次不带 --fast 的全量**
 python tests/smoke_core.py     # 核心链路冒烟（4 组查询）
 python setup_runtime_windows.py --check           # 运行时体检（解释器 / _pth / 依赖包能否跑起来）
 python setup_runtime_windows.py --verify          # 发布完整性校验（答「这个 U 盘能不能交付」）

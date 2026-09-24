@@ -3764,8 +3764,15 @@ def test_static_assets_serving(ctx) -> None:
 
 
 def main() -> int:
+    # --fast：跳过 A1/A2/A3/A4.2b 的「真实构建发布包 + 安装/重装/回滚」段
+    #（它们占全量时长的绝大部分：本机防毒使删除极慢，重装一次 350–490s）。
+    # 日常改动用 --fast 跑核心链路；**发布前务必跑一次不带 --fast 的全量**。
+    fast = "--fast" in sys.argv[1:]
+
     print("=" * 74)
     print("  Wiki-USB v1.2  自动化验收测试")
+    if fast:
+        print("  模式：--fast（跳过 A1/A2/A3/A4.2b 构建与安装段；发布前请跑全量）")
     print("=" * 74)
 
     real_notes = paths.NOTES_DIR          # 隔离前的真实目录，最后用来验证未被触碰
@@ -3871,27 +3878,39 @@ def main() -> int:
         test_ssrf_guard(ctx)
         test_lifecycle_shutdown()
         # A1：发布构建 + SSD 安装骨架（临时目录，零真实 LOCALAPPDATA/Documents 写入）
-        from tests.test_distribution_a1 import run_a1_tests
-        run_a1_tests()
-        from tests.test_distribution_a1 import PASS as _a1p, FAIL as _a1f, SKIP as _a1s
-        PASS.extend(_a1p)
-        FAIL.extend(_a1f)
-        SKIP.extend(_a1s)
+        if fast:
+            skip("A1 发布构建 + SSD 安装骨架（--fast 跳过：含真实 build+install）",
+                 "发布前请跑全量（不带 --fast）")
+        else:
+            from tests.test_distribution_a1 import run_a1_tests
+            run_a1_tests()
+            from tests.test_distribution_a1 import PASS as _a1p, FAIL as _a1f, SKIP as _a1s
+            PASS.extend(_a1p)
+            FAIL.extend(_a1f)
+            SKIP.extend(_a1s)
         # A2：Installer Hardening / 事务化安装 + 回滚（临时目录，零真实 LOCALAPPDATA/Documents 写入）
-        from tests.test_distribution_a2 import run_a2_tests
-        run_a2_tests()
-        from tests.test_distribution_a2 import PASS as _a2p, FAIL as _a2f, SKIP as _a2s
-        PASS.extend(_a2p)
-        FAIL.extend(_a2f)
-        SKIP.extend(_a2s)
+        if fast:
+            skip("A2 事务化安装 + 回滚（--fast 跳过：含真实 install）", "发布前请跑全量")
+        else:
+            from tests.test_distribution_a2 import run_a2_tests
+            run_a2_tests()
+            from tests.test_distribution_a2 import PASS as _a2p, FAIL as _a2f, SKIP as _a2s
+            PASS.extend(_a2p)
+            FAIL.extend(_a2f)
+            SKIP.extend(_a2s)
         # A3：Release Integrity / BUILD_INFO / SHA256SUMS / 第三方许可（临时目录，全负向构造）
-        from tests.test_distribution_a3 import run_a3_tests
-        run_a3_tests()
-        from tests.test_distribution_a3 import PASS as _a3p, FAIL as _a3f, SKIP as _a3s
-        PASS.extend(_a3p)
-        FAIL.extend(_a3f)
-        SKIP.extend(_a3s)
+        if fast:
+            skip("A3 发布完整性 / BUILD_INFO / SHA256SUMS（--fast 跳过：含真实 build）",
+                 "发布前请跑全量")
+        else:
+            from tests.test_distribution_a3 import run_a3_tests
+            run_a3_tests()
+            from tests.test_distribution_a3 import PASS as _a3p, FAIL as _a3f, SKIP as _a3s
+            PASS.extend(_a3p)
+            FAIL.extend(_a3f)
+            SKIP.extend(_a3s)
         # A4.1：AI 能力分层契约 / Ollama 就绪状态 / 去隐藏默认模型（不联网、不装 Ollama）
+        # —— 纯契约、很快，**任何模式都跑**（不随 --fast 跳过）
         from tests.test_ai_contract_a41 import run_a41_tests
         run_a41_tests()
         from tests.test_ai_contract_a41 import PASS as _a41p, FAIL as _a41f, SKIP as _a41s
@@ -3900,12 +3919,15 @@ def main() -> int:
         SKIP.extend(_a41s)
         # A4.2b：bundled embedding 集成（tokenizer parity / 嵌入 / RAG regression /
         #        降级 / 介质改字节 / 重装恢复 / signature）
-        from tests.test_embedding_a42b import run_a42b_tests
-        run_a42b_tests()
-        from tests.test_embedding_a42b import PASS as _a42p, FAIL as _a42f, SKIP as _a42s
-        PASS.extend(_a42p)
-        FAIL.extend(_a42f)
-        SKIP.extend(_a42s)
+        if fast:
+            skip("A4.2b bundled embedding 集成（--fast 跳过：含重装恢复）", "发布前请跑全量")
+        else:
+            from tests.test_embedding_a42b import run_a42b_tests
+            run_a42b_tests()
+            from tests.test_embedding_a42b import PASS as _a42p, FAIL as _a42f, SKIP as _a42s
+            PASS.extend(_a42p)
+            FAIL.extend(_a42f)
+            SKIP.extend(_a42s)
         test_duplicate_url_detection(ctx)
         test_localhost_security(ctx)
         test_static_assets_serving(ctx)
@@ -3958,6 +3980,9 @@ def main() -> int:
     # 机器可读的稳定格式：TOTAL 恒定（跳过也算登记），便于 CI 与文档引用，
     # 不必在 README / 测试报告 / changelog 里手写数字。
     print(f"  TOTAL={total} PASS={len(PASS)} SKIP={len(SKIP)} FAIL={len(FAIL)}")
+    if fast:
+        print("  ⚠ --fast 模式：已跳过 A1/A2/A3/A4.2b 构建与安装段")
+        print("     —— 发布前请重跑不带 --fast 的全量（TOTAL 会显著高于本次）")
     if FAIL:
         print("\n  失败明细：")
         for f in FAIL:
