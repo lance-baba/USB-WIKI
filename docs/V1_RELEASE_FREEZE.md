@@ -195,23 +195,69 @@ Repair Engine / Ollama 安装 / 模型下载 / GGUF / ONNX 最终策略 / 模型
 
 ---
 
-## 7. CI 触发策略（2026-09-17 生效）
+## 7. Release Gate 与 CI 触发策略（2026-09-25 修订）
 
-**普通 `main` push 仅作为云端备份，不触发 Full CI。**
-Full CI 仅通过 `workflow_dispatch`（手动 Run workflow）或推送 `v*` tag 触发，
-用于**阶段 Gate / Release Candidate / 正式 Release** 验收。
+> ⚠ **本节已按新的产品决策修订**：V1 正式目标平台为 **Windows**，
+> Release Gate 改为 **Windows-only、本地优先**。
+> 旧的「GitHub 5-lane Full CI = 发布前置条件」口径**作废**；
+> GitHub Actions 降级为 **optional independent cloud verification（可选的独立云端验证）**。
 
-| 动作 | 是否跑 Full CI |
-| :--- | :--- |
-| 普通 `push main` | ❌ 只作备份 / commit 历史 / 可回退点 |
-| `workflow_dispatch`（手动） | ✅ 完整 5 路 |
-| `push` `v*` tag | ✅ 完整 5 路 |
-| `pull_request` | ❌ 已移除（本项目无 PR 协作需求） |
+### 7.1 为什么改
 
-**本策略只改「何时触发」，不改「测什么」** —— 5 路矩阵内容
-（Windows Portable Runtime + Windows 3.11/3.13 + Ubuntu 3.11/3.13）不得减少或削弱。
+1. V1 的实际交付对象是 **Windows 用户**；
+2. 本地 **embedded runtime** 才是产品真实运行形态；
+3. Ubuntu / Python version matrix 对当前 V1 发布价值有限；
+4. 避免不必要的 GitHub Actions 云端资源消耗；
+5. GitHub 普通 push 继续只作为**备份 / 回退**。
 
-### 普通开发任务的默认流程
+### 7.2 V1 默认 Release Gate（Windows-only，本地优先）
+
+以下各项**全部通过**，才算 Windows Pilot Release 门槛达成：
+
+```
+Windows Embedded Runtime full test suite
+  → build_release.py --strict
+  → Release media self-verification
+  → Windows launcher / startup smoke
+  → fresh install
+  → real DOCX / PDF import
+  → search / Q&A / citations
+  → quit / reopen
+  → default uninstall preserves Library
+  → reinstall restores Library
+  → custom App path
+  → Pilot package
+```
+
+### 7.3 GitHub Actions 的当前定位（已降级）
+
+**不作为 V1 默认发布前置条件。** 仅在以下情况由**人工**决定使用：
+
+- 需要**独立 clean-machine** 验证；
+- **大版本发布前**主动复核；
+- 本地环境**无法判断平台问题**。
+
+硬规则：
+
+- **不得**因普通 commit / push 自动运行；
+- **不得**因为 GitHub 5-lane 未运行而阻止 Windows Pilot Release
+  —— **前提是 Windows Release Gate（§7.2）全部通过**；
+- workflow 文件**继续保留**：不删除、不为了本轮修改 CI 架构，
+  只是把它从「默认 Release Gate」降级为可选验证。
+
+| 动作 | 是否跑 Full CI | 说明 |
+| :--- | :--- | :--- |
+| 普通 `push main` | ❌ | 只作备份 / commit 历史 / 可回退点 |
+| `workflow_dispatch`（手动） | ⚠️ 可选 | 独立云端验证，**非默认前置条件** |
+| `push` `v*` tag | ⚠️ 可选 | 同上 |
+| `pull_request` | ❌ | 已移除（本项目无 PR 协作需求） |
+
+> 5 路矩阵（Windows Portable + Windows 3.11/3.13 + Ubuntu 3.11/3.13）
+> **继续保留在 workflow 文件里**，作为可选的独立云端验证能力；
+> 但它**不再是** V1 发布门槛。本轮**不修改** `.github/workflows/*`，
+> 也**不触发** `workflow_dispatch`。
+
+### 7.4 普通开发任务的默认流程
 
 ```
 改代码 → 本地 targeted tests → （按改动范围决定是否跑本地全量）→
@@ -221,11 +267,12 @@ git commit → git push origin/main → 结束（不等待 GitHub Actions）
 ⚠ **禁止**把「不等 CI」理解成「不测试」：普通任务**至少**要跑本次改动对应的 targeted tests；
 涉及**核心启动 / 安装 / Data Contract / security** 时，必须跑对应回归测试。
 
-### 汇报口径
+### 7.5 汇报口径
 
 - 普通任务汇报：本地相关测试 PASS/FAIL、本地全量测试（如运行）、Commit SHA、
   是否已 push、`GitHub Full CI：本任务未要求，未运行`。
-- 只有**阶段 Gate** 才汇报 5 路 CI 结果。
+- **阶段 Gate / Release 汇报**：以 **Windows Release Gate（§7.2）各项结果**为准；
+  只有**额外**跑了云端验证时，才再附 5 路 CI 结果。
 
 ### 不在本策略内（不要顺手做）
 
