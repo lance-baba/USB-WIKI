@@ -107,13 +107,17 @@ def note_original(h: "Handler", rel: str) -> None:
     inline = (h.query_flag("download") != "1") and ext in h.INLINE_TYPES
 
     # 剪藏的原网页：判定它是「离线存档」还是「旧存档」。
-    # - 已本地化（HTML 里引用了本地资源池）：**不注入 base** ——
-    #   根相对路径天然指向本服务，浏览时零外部请求，真正离线可用。
-    # - 未本地化（旧存档）：保持原有的联网行为，避免存量页面退化成裸 HTML。
+    # - 已本地化（HTML 里引用了本地资源池）：把资源**内联成 data: URI** 再下发。
+    #   因为快照在 <iframe sandbox=""> 里渲染 → iframe 是不透明源 → 请求
+    #   /api/assets/... 会带 Sec-Fetch-Site: cross-site，被跨站闸门拒（图片/样式全 404）。
+    #   内联后页面自包含、零子请求，既不触发闸门也真正离线（B 方案）。
+    # - 未本地化（旧存档）：保持原有的联网行为，注入 <base> 避免退化成裸 HTML。
     if inline and ext in (".html", ".htm"):
         try:
             text = orig.read_text(encoding="utf-8", errors="replace")
-            if archiver.ASSET_URL_PREFIX not in text:
+            if archiver.ASSET_URL_PREFIX in text:
+                text = archiver.inline_assets(text)
+            else:
                 text = crawler.inject_base_href(text, crawler.source_url_of(rel))
             h._send_buffer(text.encode("utf-8"), ctype, True, orig.name)
             return

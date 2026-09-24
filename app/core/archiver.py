@@ -36,6 +36,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import re
 import threading
@@ -112,6 +113,7 @@ class LocalizeStats:
     failed: int = 0
     timed_out: int = 0
     sheets_dropped: int = 0
+    icons_dropped: int = 0
     scripts: int = 0
     seconds: float = 0.0
     notes: list[str] = field(default_factory=list)
@@ -518,8 +520,10 @@ def localize(html_text: str, page_url: str) -> tuple[str, LocalizeStats]:
 
     html_text = _TAG_RE.sub(_final, html_text)
 
-    # 样式表若最终没抓到 → 整条 link 去掉并计入说明（不留外部 URL）
-    def _drop_dead_sheets(m: re.Match) -> str:
+    # 未本地化的 <link> 一律删掉（不留外部 URL）。
+    # 严格零外发：样式表与**图标**都会被浏览器自动请求 —— 尤其 favicon，
+    # 若保留外链，浏览「离线存档」时仍会向原站发请求（暴露 IP），与立身之本相悖。
+    def _drop_dead_links(m: re.Match) -> str:
         tag, attrs = m.group(1), m.group(2)
         if tag.lower() != "link":
             return m.group(0)
@@ -530,12 +534,17 @@ def localize(html_text: str, page_url: str) -> tuple[str, LocalizeStats]:
                 rel = v
             elif k == "href":
                 href = v
-        if href and _STYLESHEET_REL.search(rel) and not href.startswith(ASSET_URL_PREFIX):
+        if not href or href.startswith((ASSET_URL_PREFIX, "data:")):
+            return m.group(0)                       # 已本地化 / 已内联 → 保留
+        if _STYLESHEET_REL.search(rel):
             stats.sheets_dropped += 1
-            return ""
-        return m.group(0)
+        elif _ICON_REL.search(rel):
+            stats.icons_dropped += 1
+        else:
+            return m.group(0)                       # canonical / alternate 等不自动请求，保留
+        return ""
 
-    html_text = _TAG_RE.sub(_drop_dead_sheets, html_text)
+    html_text = _TAG_RE.sub(_drop_dead_links, html_text)
 
     fetcher.close()
     stats.seconds = time.monotonic() - t0
@@ -555,6 +564,9 @@ def localize(html_text: str, page_url: str) -> tuple[str, LocalizeStats]:
         )
     if stats.sheets_dropped:
         stats.notes.append(f"{stats.sheets_dropped} 个样式表未能存档，该页版式可能不完整")
+    if stats.icons_dropped:
+        stats.notes.append(
+            f"{stats.icons_dropped} 个图标（favicon 等）未能存档，已删除以避免浏览时外发请求")
     if stats.scripts:
         stats.notes.append(f"已省略 {stats.scripts} 个外部脚本（预览沙箱禁用脚本，存档中不再保留）")
     if stats.skipped_blocked:
@@ -566,3 +578,134 @@ def localize(html_text: str, page_url: str) -> tuple[str, LocalizeStats]:
         )
 
     return html_text, stats
+
+
+# --------------------------------------------------------------------------
+# 预览期资源内联（B 方案）—— 让「网页快照」在沙箱 iframe 里也能显示图片
+# --------------------------------------------------------------------------
+# 为什么要内联：快照按设计放在 ``<iframe sandbox="">`` 里渲染。沙箱不给
+# ``allow-same-origin`` → iframe 文档是**不透明源（opaque origin）**；不透明源请求
+# ``/api/assets/...`` 时浏览器标 ``Sec-Fetch-Site: cross-site``，被
+# ``core/security.py`` 的跨站闸门一律拒绝 → 图片与样式**全部 404**（真事故）。
+#
+# 与其放宽安全边界（不放宽），不如把资源**内联进 HTML**：页面自包含 → 浏览时零子请求
+# → 既不触发闸门，也真正离线可看（与本项目「零外部请求」立身之本一致）。
+
+# 资源扩展名 → data: URI 的 MIME
+_DATA_URI_MIME = {
+    ".css": "text/css",
+    ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+    ".gif": "image/gif", ".webp": "image/webp", ".svg": "image/svg+xml",
+    ".bmp": "image/bmp", ".ico": "image/x-icon",
+    ".woff2": "font/woff2", ".woff": "font/woff", ".ttf": "font/ttf",
+    ".otf": "font/otf", ".eot": "application/vnd.ms-fontobject",
+}
+
+# 匹配 HTML / CSS 中的本地资源引用：/api/assets/<16位hash>[.<扩展名>]
+_ASSET_REF_RE = re.compile(r"/api/assets/([0-9a-f]{16})(\.[A-Za-z0-9]{1,8})?")
+
+# CSS 递归内联的深度上限（防 @import 环）
+_MAX_CSS_DEPTH = 6
+
+
+def _resolve_asset_name(hash16: str, ext: str) -> str | None:
+    """把 (hash, ext) 解析成 ``data/assets/`` 下真实存在的文件名。
+
+    优先用带扩展名的精确名；扩展名缺失 / 对不上时，用 hash 前缀找**唯一**候选，
+    找不到返回 None（调用方用占位符兜底）。
+    """
+    if ext:
+        name = hash16 + ext
+        if (paths.ASSETS_DIR / name).is_file():
+            return name
+    try:
+        cands = [p.name for p in paths.ASSETS_DIR.glob(hash16 + ".*") if p.is_file()]
+    except OSError:
+        return None
+    return cands[0] if len(cands) == 1 else None
+
+
+def _asset_data_uri(name: str, cache: dict, inprog: set, depth: int = 0) -> str:
+    """读取资源并转成 ``data:`` URI；CSS 会**递归内联**其内部 url()/@import。
+
+    读不到 / 循环引用 / 超深 → 一律 1×1 占位（保证页面自包含，绝不留下会外发的引用）。
+    """
+    if name in cache:
+        return cache[name]
+    if name in inprog or depth > _MAX_CSS_DEPTH:
+        return _PLACEHOLDER
+    try:
+        raw = (paths.ASSETS_DIR / name).read_bytes()
+    except OSError:
+        cache[name] = _PLACEHOLDER
+        return _PLACEHOLDER
+
+    ext = Path(name).suffix.lower()
+    if ext == ".css":
+        # CSS 内部的 url()/@import **必须先内联**：否则 data: 样式里的
+        # ``/api/assets/...`` 会以**文档**为基准解析 → 又变回 cross-site 请求。
+        inprog.add(name)
+        try:
+            css = raw.decode("utf-8", "replace")
+            css = _ASSET_REF_RE.sub(
+                lambda m: _ref_data_uri(m, cache, inprog, depth + 1), css)
+            raw = css.encode("utf-8")
+        except Exception:  # noqa: BLE001 - 内联失败退回原 CSS
+            pass
+        finally:
+            inprog.discard(name)
+        mime = "text/css"
+    else:
+        mime = _DATA_URI_MIME.get(ext, "application/octet-stream")
+
+    uri = "data:" + mime + ";base64," + base64.b64encode(raw).decode("ascii")
+    cache[name] = uri
+    return uri
+
+
+def _ref_data_uri(m: re.Match, cache: dict, inprog: set, depth: int = 0) -> str:
+    name = _resolve_asset_name(m.group(1), m.group(2) or "")
+    return _asset_data_uri(name, cache, inprog, depth) if name else _PLACEHOLDER
+
+
+def _defuse_external_links(m: re.Match) -> str:
+    """删掉**会自动请求的外部 <link>**（favicon / 未本地化样式 / 资源提示）。
+
+    防御性收尾：老快照（旧 archiver 抓的）可能残留外部 favicon —— 浏览时浏览器
+    仍会去原站取图标，暴露 IP。B 方案要的是「零子请求」，这里一并清掉。
+    canonical / alternate 等不自动请求的 link 保留。
+    """
+    tag, attrs = m.group(1), m.group(2)
+    if tag.lower() != "link":
+        return m.group(0)
+    rel = href = ""
+    for am in _ATTR_RE.finditer(attrs):
+        k, v = am.group(1).lower(), am.group(2).strip("\"'")
+        if k == "rel":
+            rel = v
+        elif k == "href":
+            href = v
+    if not href or not re.match(r"https?://", href, re.I):
+        return m.group(0)
+    if _DROP_REL.search(rel) or _STYLESHEET_REL.search(rel) or _ICON_REL.search(rel):
+        return ""
+    return m.group(0)
+
+
+def inline_assets(html_text: str) -> str:
+    """把剪藏 HTML 里的 ``/api/assets/<name>`` 全部内联为 ``data:`` URI。
+
+    产出**自包含**页面：在 ``<iframe sandbox="">`` 里浏览时零子请求 —— 既不触发
+    跨站闸门（图片/样式不再 404），也真正离线可看。引用缺失 / 读盘失败 → 用 1×1
+    占位，**绝不保留会外发的 URL**。
+    """
+    if not html_text or ASSET_URL_PREFIX not in html_text:
+        return html_text
+    cache: dict[str, str] = {}
+    inprog: set = set()
+    out = _ASSET_REF_RE.sub(lambda m: _ref_data_uri(m, cache, inprog, 0), html_text)
+    # 安全网：异常命名（非 16 位 hash）的残留引用也换成占位，保证**零子请求**
+    if ASSET_URL_PREFIX in out:
+        out = re.sub(re.escape(ASSET_URL_PREFIX) + r"""[^"'\s)>]*""", _PLACEHOLDER, out)
+    # 防御性收尾：清掉会自动请求的外部 link（老快照可能残留外部 favicon）
+    return _TAG_RE.sub(_defuse_external_links, out)

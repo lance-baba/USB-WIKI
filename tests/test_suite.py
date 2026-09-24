@@ -685,6 +685,65 @@ def test_original_base_injection() -> None:
     check("笔记不存在时返回空串而非抛错", url == "", repr(url))
 
 
+def test_snapshot_asset_inlining() -> None:
+    """网页快照图片不显示（真事故）—— 沙箱 iframe 的 cross-site 请求被闸门拒。
+
+    根因：快照在 ``<iframe sandbox="">`` 里渲染 → 不透明源 → 请求 ``/api/assets/...``
+    带 ``Sec-Fetch-Site: cross-site`` → ``security.check_request`` 一律拒 → 图片与样式
+    **全部 404**。修法（B）：服务端把 ``/api/assets/...`` 内联成 ``data:`` URI，
+    页面自包含、零子请求 —— 既过闸门，也真离线。
+    """
+    section("网页快照 · 资源内联（沙箱可用）")
+
+    import base64
+    import re
+
+    from app.core import archiver, paths
+
+    paths.ASSETS_DIR.mkdir(parents=True, exist_ok=True)
+    png = "0123456789abcdef.png"
+    css = "fedcba9876543210.css"
+    (paths.ASSETS_DIR / png).write_bytes(b"\x89PNG\r\n\x1a\nFAKE")
+    (paths.ASSETS_DIR / css).write_text(
+        "body{background:url(/api/assets/%s)}" % png, encoding="utf-8", newline="")
+    try:
+        html = (
+            "<html><head>"
+            '<link rel="stylesheet" href="/api/assets/%s">'
+            "</head><body>"
+            '<img src="/api/assets/%s">'
+            '<img srcset="/api/assets/%s 1x, /api/assets/deadbeefdeadbeef.png 2x">'
+            '<img src="/api/assets/deadbeefdeadbeef.png">'   # 不存在 → 占位
+            "</body></html>" % (css, png, png)
+        )
+        out = archiver.inline_assets(html)
+
+        check("图片内联为 data: URI",
+              'src="data:image/png;base64,' in out, out[-160:])
+        check("样式表内联为 data:text/css",
+              'href="data:text/css;base64,' in out)
+        check("缺失资源用 1×1 占位（不残留可外发 URL）",
+              "data:image/gif;base64" in out)
+        check("输出不再残留任何 /api/assets/ 引用（零子请求）",
+              "/api/assets/" not in out, out[:200])
+
+        # 关键：验证被内联的 CSS **内部** url() 也已换成 data:（只看外层文本会漏判）
+        mm = re.search(r'href="data:text/css;base64,([A-Za-z0-9+/=]+)"', out)
+        css_dec = base64.b64decode(mm.group(1)).decode("utf-8") if mm else ""
+        check("内联 CSS 解码后内部 url() 已指向 data:（否则 data: 样式会回退请求 /api/assets）",
+              "data:image/png;base64," in css_dec and "/api/assets/" not in css_dec,
+              css_dec[:140])
+
+        check("无本地资源引用时是空操作（不破坏旧存档路径）",
+              archiver.inline_assets("<p>hi</p>") == "<p>hi</p>")
+    finally:
+        for f in (paths.ASSETS_DIR / png, paths.ASSETS_DIR / css):
+            try:
+                f.unlink()
+            except OSError:
+                pass
+
+
 def test_orphan_original_cleanup() -> None:
     """原件安全 —— **Pilot 永不自动删除用户原件**（D1~D5）。
 
@@ -3856,6 +3915,7 @@ def main() -> int:
         test_crawler(ctx)
         test_archive_localization()
         test_original_base_injection()
+        test_snapshot_asset_inlining()
         test_orphan_original_cleanup()
         test_html_encoding_detection()
         test_original_preview(ctx)
