@@ -130,6 +130,11 @@
 Repair Engine / Ollama 安装 / 模型下载 / GGUF / ONNX 最终策略 / 模型推荐 / OCR / Reranker /
 新 UI / 云同步 / 激活 / updater / 代码签名 / 私钥 / ZIP / GitHub Release / Tag / RC 测试。
 
+**Collections（资料集）+ Library Management Layer**：分类 `POST_V1`，**架构已冻结**
+（ADR 全文见 [`docs/COLLECTIONS_ARCHITECTURE.md`](COLLECTIONS_ARCHITECTURE.md)，
+含 Global Retrieval / Explicit Scope / durable metadata / Trash-Export 等 invariants）。
+本轮**只落档、不实现**：不改生产代码 / DB schema / 真实 Library / 检索行为。
+
 （`LICENSES` 汇总 / `BUILD_INFO` / `SHA256SUMS` 已在 A3 完成初版；仍**不含**模型类资源，
 待 A4 决定真正捆绑什么后再纳入同一机制。）
 
