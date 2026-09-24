@@ -71,25 +71,102 @@ class _tmp:
         shutil.rmtree(self.d, ignore_errors=True)
 
 
-def _build(tmp: Path) -> Path:
+def _sandbox(tmp: Path) -> tuple[dict, Path]:
+    """A1 subprocess 沙箱：LOCALAPPDATA / 安装记录 / 桌面 **全部**重定向到 TEMP。
+
+    为什么必须有它：生产 ``install()`` 成功后会调用 ``create_desktop_shortcut()``
+    与 ``_write_state()``，分别写**真实桌面**的 ``USB-WIKI.lnk`` 和
+    ``%LOCALAPPDATA%\\USB-WIKI\\install_state.json``。不隔离就违反本文件自我约定的
+    「零真实 LOCALAPPDATA/Documents 写入」——A1 会改掉用户的真实安装记录与桌面。
+    """
+    localapp = tmp / "localapp"
+    state = localapp / "USB-WIKI"
+    desk = tmp / "Desktop"
+    for d in (localapp, state, desk):
+        d.mkdir(parents=True, exist_ok=True)
+    env = {**os.environ,
+           "LOCALAPPDATA": str(localapp),
+           "WIKIUSB_STATE_DIR": str(state),
+           "PYTHONUTF8": "1",
+           "PYTHONIOENCODING": "utf-8"}
+    return env, desk
+
+
+def _run_bounded(cmd, *, phase: str, timeout: int, env: dict,
+                 cwd: str | None = None) -> subprocess.CompletedProcess:
+    """有界 subprocess —— Release 测试**禁止无限等待**。
+
+    - ``stdin=DEVNULL``：声明本调用已给全 CLI 参数、绝不应进入 ``input()``。
+      若生产代码意外进入交互读取，DEVNULL 会让它**立刻 EOF**，而不是永久挂起。
+    - ``timeout``：超时即返回 rc=-1 并打印 command / 阶段 / stdout 尾部 / stderr 尾部，
+      让对应用例**明确 FAIL**，而不是让整套 suite 卡死在无声处。
+    """
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                              env=env, cwd=cwd, stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired as exc:
+        out = exc.stdout or b""
+        err = exc.stderr or b""
+        if isinstance(out, bytes):
+            out = out.decode("utf-8", "replace")
+        if isinstance(err, bytes):
+            err = err.decode("utf-8", "replace")
+        print(f"\n  ⏱ TIMEOUT（{phase}）超过 {timeout}s")
+        print(f"    command     : {' '.join(str(c) for c in cmd)}")
+        print(f"    stdout 尾部 : ...{out[-400:]}")
+        print(f"    stderr 尾部 : ...{err[-400:]}")
+        return subprocess.CompletedProcess(cmd, -1, stdout=out, stderr=err)
+
+
+def _build(tmp: Path, timeout: int = 900) -> Path:
+    env, _ = _sandbox(tmp)
     dist = tmp / "dist"
-    out = subprocess.run(
+    out = _run_bounded(
         [sys.executable, str(REPO / "scripts" / "build_release.py"),
          "--output", str(dist)],
-        capture_output=True, text=True,
-    )
+        phase="build_release", timeout=timeout, env=env)
     if out.returncode != 0:
         print(out.stdout, out.stderr)
     return dist / f"USB-WIKI-v{APP_VERSION}-win-x64"
 
 
-def _install(release: Path, app: Path, lib: Path) -> subprocess.CompletedProcess:
-    return subprocess.run(
+def _install(release: Path, app: Path, lib: Path, tmp: Path,
+             timeout: int = 1200) -> subprocess.CompletedProcess:
+    """安装子进程（沙箱 + 有界）。
+
+    ⚠ timeout 取值依据（实测，非拍脑袋）：本环境重装（had_old=True）会触发
+    ``_rmtree`` 删除旧 App（约 6757 个文件 / 240MB），而 Windows 实时防毒对
+    **删除** 的吞吐远低于写入 —— 隔离实测重装耗时 354–492s（cProfile 显示 92% 耗在
+    ``nt.unlink``/``nt.rmdir``）。安装逻辑本身无缺陷（rc=0 正常返回），只是删除慢。
+    初版按用户估算给 180s → 真实重装直接超时；提到 900s 后，在一次**与本任务无关的并发
+    磁盘重负载**（后台误跑了一份完整 A1 全量，与本次验证抢同一块 HDD）下仍被拖到 >900s。
+    为容纳「真实重装 ~490s + AV/并发 I/O 尖峰余量」，最终定 **1200s（20 分钟）**：
+    既给足余量确保 FAIL=0，又仍**严格有界** —— 真正无限挂起会在 1200s 被 _run_bounded 捕获并
+    显式 FAIL，而非让整套 suite 静默卡死（这正是 Phase D 要修的原始 bug：旧 _install 无 timeout）。
+    注意：1200s 只是「最长等待」，正常重装 ~490s 即返回，不会拖慢通过路径。
+    """
+    env, desk = _sandbox(tmp)
+    return _run_bounded(
         [sys.executable, str(REPO / "scripts" / "install_windows.py"), "install",
          "--release", str(release), "--app-target", str(app),
-         "--library-target", str(lib), "--no-verify"],
-        capture_output=True, text=True,
-    )
+         "--library-target", str(lib), "--no-verify",
+         "--desktop-dir", str(desk)],
+        phase="install", timeout=timeout, env=env)
+
+
+def _real_side_effects() -> dict:
+    """只读快照**真实**（非沙箱）位置：桌面快捷方式 + 安装记录。"""
+    desk = Path(os.environ.get("USERPROFILE", "")) / "Desktop"
+    state = Path(os.environ.get("LOCALAPPDATA", "")) / "USB-WIKI" / "install_state.json"
+    snap = {}
+    for key, p in (("desktop_lnk", desk / "USB-WIKI.lnk"),
+                   ("install_state", state)):
+        try:
+            st = p.stat()
+            snap[key] = (st.st_size, st.st_mtime_ns)
+        except OSError:
+            snap[key] = None
+    return snap
 
 
 def _broken_release(tmp: Path, *, drop_app: bool) -> Path:
@@ -124,7 +201,7 @@ def _t_build() -> None:
 def _t_missing_app() -> None:
     with _tmp() as tmp:
         bad = _broken_release(tmp, drop_app=True)
-        r = _install(bad, tmp / "app", tmp / "lib")
+        r = _install(bad, tmp / "app", tmp / "lib", tmp)
         check("缺 app/ → 安装明确失败（rc!=0）", r.returncode != 0, f"rc={r.returncode}")
         check("缺 app/ 属结构校验（非介质损坏）", r.returncode == 2, f"rc={r.returncode}")
 
@@ -132,7 +209,7 @@ def _t_missing_app() -> None:
 def _t_missing_runtime() -> None:
     with _tmp() as tmp:
         bad = _broken_release(tmp, drop_app=False)
-        r = _install(bad, tmp / "app", tmp / "lib")
+        r = _install(bad, tmp / "app", tmp / "lib", tmp)
         check("缺 python-runtime/python.exe → 安装明确失败（rc!=0）",
               r.returncode != 0, f"rc={r.returncode}")
         check("缺 runtime 属结构校验（非介质损坏）", r.returncode == 2, f"rc={r.returncode}")
@@ -147,10 +224,14 @@ def _t_preserves_existing_library() -> None:
         lib = tmp / "lib"
         (lib / "notes").mkdir(parents=True)
         (lib / "notes" / "seed.md").write_text("seed-content", encoding="utf-8")
-        r = _install(root, tmp / "app", lib)
+        r = _install(root, tmp / "app", lib, tmp)
         preserved = (lib / "notes" / "seed.md").read_text(encoding="utf-8") == "seed-content"
         check("已有 Library → 安装后原文件不被覆盖",
               r.returncode == 0 and preserved, f"rc={r.returncode} preserved={preserved}")
+        # 沙箱捕获验证：安装记录必须落在 TEMP 沙箱，而不是真实 LOCALAPPDATA
+        captured = (tmp / "localapp" / "USB-WIKI" / "install_state.json").is_file()
+        check("安装记录被沙箱捕获（写 TEMP 而非真实 LOCALAPPDATA）",
+              captured, f"state={tmp / 'localapp' / 'USB-WIKI' / 'install_state.json'}")
 
 
 def _t_reinstall_sha256_stable() -> None:
@@ -163,9 +244,9 @@ def _t_reinstall_sha256_stable() -> None:
         (lib / "notes").mkdir(parents=True)
         (lib / "notes" / "a.md").write_text("aaa", encoding="utf-8")
         app = tmp / "app"
-        r1 = _install(root, app, lib)
+        r1 = _install(root, app, lib, tmp)
         h1 = _sha256_tree(lib)
-        r2 = _install(root, app, lib)
+        r2 = _install(root, app, lib, tmp)
         h2 = _sha256_tree(lib)
         check("重装前后 Library SHA256 完全一致",
               r1.returncode == 0 and r2.returncode == 0 and h1 == h2,
@@ -181,7 +262,7 @@ def _t_failure_leaves_library() -> None:
         h0 = _sha256_tree(lib)
         # 用缺 python-runtime 的发布包触发安装失败（介质完整、结构有缺陷）
         bad = _broken_release(tmp / "bad", drop_app=False)
-        r = _install(bad, tmp / "app", lib)
+        r = _install(bad, tmp / "app", lib, tmp)
         h1 = _sha256_tree(lib)
         check("安装失败 → Library SHA256 完全一致",
               r.returncode != 0 and h0 == h1, f"rc={r.returncode}")
@@ -198,7 +279,7 @@ def _t_launch_smoke() -> None:
         root = _build(tmp)
         app = tmp / "app"
         lib = tmp / "lib"
-        r = _install(root, app, lib)
+        r = _install(root, app, lib, tmp)
         if r.returncode != 0:
             skip("embedded runtime 启动 smoke", f"install 失败：{r.stderr[-200:]}")
             return
@@ -281,15 +362,31 @@ def _smoke_run(exe: Path, app: Path, lib: Path) -> None:
         logf.close()
 
 
+def _timed(label: str, fn) -> None:
+    """逐子测试计时 —— 让「慢 / 挂」能被精确定位到某一步，而不是整套静默卡死。"""
+    t0 = time.time()
+    try:
+        fn()
+    finally:
+        print(f"  ⏱ {label}: {time.time() - t0:.1f}s")
+
+
 def run_a1_tests() -> None:
     section("发布构建 + SSD 安装骨架")
-    _t_build()
-    _t_missing_app()
-    _t_missing_runtime()
-    _t_preserves_existing_library()
-    _t_reinstall_sha256_stable()
-    _t_failure_leaves_library()
-    _t_launch_smoke()
+    before = _real_side_effects()
+    for label, fn in (
+        ("t_build", _t_build),
+        ("t_missing_app", _t_missing_app),
+        ("t_missing_runtime", _t_missing_runtime),
+        ("t_preserves_existing_library", _t_preserves_existing_library),
+        ("t_reinstall_sha256_stable", _t_reinstall_sha256_stable),
+        ("t_failure_leaves_library", _t_failure_leaves_library),
+        ("t_launch_smoke", _t_launch_smoke),
+    ):
+        _timed(label, fn)
+    after = _real_side_effects()
+    check("A1 全程未写入真实 Desktop / LOCALAPPDATA（副作用只在 TEMP 沙箱）",
+          before == after, f"before={before} after={after}")
 
 
 if __name__ == "__main__":
