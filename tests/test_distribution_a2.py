@@ -13,6 +13,18 @@
 由 tests/test_suite.py 的 main() 调用 run_a2_tests() 并合并结果。
 事务逻辑以 in-process 方式加载 scripts/install_windows.py 并 monkeypatch 触发各失败分支，
 全程只用临时目录，绝不触碰真实 LOCALAPPDATA / Documents / Library / 桌面快捷方式。
+
+性能（2026-09-26 改造 —— RELEASE_REQUIRED / Test Infrastructure Performance Defect）：
+  * **只有 B(real verify) 是 heavy**：1 次真实 build + 2 次真实 install；
+    A/C/D/E/F/G 全部用 fake release + in-process 安装（秒级），各自独立小 TEMP，
+    不为此引入 session fixture。
+  * **所有真实 subprocess 有界**：``stdin=DEVNULL``；build 600s、install 1200s；
+    超时 → rc=-1 + 打印 phase/command/stdout 尾部/stderr 尾部，对应用例**明确 FAIL**，
+    绝不静默挂起（此前 build/install 都**没有** timeout）。
+  * **cleanup 有界且 best-effort**（``_cleanup_bounded``，150s）：B(verify) 的临时 App
+    含完整嵌入式 runtime（~13850 文件 / 515MB），无界 rmtree 曾让 A2 在 B(verify) 之后
+    **20+ 分钟无输出**。超时只打 ``CLEANUP_WARNING`` 并列残留，**不改 PASS/FAIL**。
+  * **逐 case 计时**（``_timed``）：A / B / B(real) / C / D / E / F / G 各自耗时可见。
 """
 from __future__ import annotations
 
@@ -34,6 +46,10 @@ from app.version import APP_VERSION                     # 唯一版本源  # noq
 PASS: list[str] = []
 FAIL: list[str] = []
 SKIP: list[str] = []
+
+# —— 计数（供 Release Gate 汇报：真实 build / install 次数）——
+BUILD_COUNT = 0
+INSTALL_COUNT = 0
 
 
 def check(name: str, cond: bool, detail: str = "") -> bool:
@@ -69,13 +85,47 @@ def _sha256_tree(root: Path) -> str:
     return h.hexdigest()
 
 
+def _print_cleanup_warning(root: Path, why: str) -> None:
+    print(f"\n  ⚠ CLEANUP_WARNING: 临时目录未在限时内清理（{why}）")
+    print(f"    leftover : {root}")
+    print("    → 不影响本次产品 PASS/FAIL；残留可后续人工/后台清理。")
+
+
+def _cleanup_bounded(root: Path, timeout: int = 150) -> bool:
+    """best-effort 清理：子进程 rmtree + 超时，**绝不阻塞 Release Gate**。
+
+    背景（实测，2026-09-26）：B(verify) 的临时 App 含完整嵌入式 runtime
+    （约 13850 个文件 / 515MB），同步无界 ``shutil.rmtree`` 在 Windows 实时防毒下要
+    10+ 分钟 —— 整轮 A2 曾因此在 B(verify) 之后 **20+ 分钟无任何输出**。
+    这是 A2 的**主要阻塞源**。这里把「产品断言」与「临时目录清理」解耦：
+    超时只打 ``CLEANUP_WARNING`` 并列残留，**不改任何 PASS/FAIL**，
+    不触碰真实 Library，也不 kill 无关进程。
+    """
+    if not root.exists():
+        return True
+    code = "import shutil,sys; shutil.rmtree(sys.argv[1], ignore_errors=True)"
+    try:
+        subprocess.run([sys.executable, "-c", code, str(root)],
+                       timeout=timeout, stdin=subprocess.DEVNULL, capture_output=True)
+    except subprocess.TimeoutExpired:
+        _print_cleanup_warning(root, f"超过 {timeout}s")
+        return False
+    if root.exists():
+        _print_cleanup_warning(root, "仍有残留（个别文件被占用）")
+        return False
+    return True
+
+
 class _tmp:
+    """各 fake 用例继续各自独立 TEMP（payload 很小，无需 session fixture）——
+    唯一改动：清理必须有界（见 ``_cleanup_bounded``）。"""
+
     def __enter__(self) -> Path:
         self.d = Path(tempfile.mkdtemp(prefix="wikiusb-a2-"))
         return self.d
 
     def __exit__(self, *a) -> None:
-        shutil.rmtree(self.d, ignore_errors=True)
+        _cleanup_bounded(self.d, timeout=150)
 
 
 def _fake_payload(tmp: Path, marker: str) -> Path:
@@ -96,13 +146,54 @@ def _install_inproc(iw, release, app, lib, **kw) -> int:
         return e.code if isinstance(e.code, int) else 1
 
 
-def _install_subprocess(release, app, lib, extra=None) -> subprocess.CompletedProcess:
+def _run_bounded(cmd, *, phase: str, timeout: int) -> subprocess.CompletedProcess:
+    """有界 subprocess —— Release 测试**禁止无限等待**。
+
+    A2 此前所有真实子进程（build_release / install）都**没有** timeout，
+    一旦环境 I/O 劣化就会让整个 Gate 静默挂起。这里统一收紧：
+
+    * ``stdin=DEVNULL``：本调用已给全 CLI 参数，绝不应进入 ``input()``；
+      生产代码若意外交互读取会立刻 EOF，而不是永久挂起。
+    * ``timeout``：超时返回 rc=-1 并打印 phase / command / stdout 尾部 / stderr 尾部，
+      让对应用例**明确 FAIL**，而不是让整套 suite 卡死在无声处。
+    """
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                              stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired as exc:
+        out = exc.stdout or b""
+        err = exc.stderr or b""
+        if isinstance(out, bytes):
+            out = out.decode("utf-8", "replace")
+        if isinstance(err, bytes):
+            err = err.decode("utf-8", "replace")
+        print(f"\n  ⏱ TIMEOUT（{phase}）超过 {timeout}s")
+        print(f"    command     : {' '.join(str(c) for c in cmd)}")
+        print(f"    stdout 尾部 : ...{out[-400:]}")
+        print(f"    stderr 尾部 : ...{err[-400:]}")
+        return subprocess.CompletedProcess(cmd, -1, stdout=out, stderr=err)
+
+
+def _build_real(dist: Path, timeout: int = 600) -> subprocess.CompletedProcess:
+    """真实构建发布包（仅 B(verify) 使用；A2 其余用例全用 fake）。"""
+    global BUILD_COUNT
+    BUILD_COUNT += 1
+    return _run_bounded(
+        [sys.executable, str(REPO / "scripts" / "build_release.py"), "--output", str(dist)],
+        phase="build_release", timeout=timeout)
+
+
+def _install_subprocess(release, app, lib, extra=None,
+                        timeout: int = 1200) -> subprocess.CompletedProcess:
+    """真实安装子进程（有界；1200s 上限与 A1 一致，容纳真实重装删除尖峰）。"""
+    global INSTALL_COUNT
+    INSTALL_COUNT += 1
     cmd = [sys.executable, str(REPO / "scripts" / "install_windows.py"), "install",
            "--release", str(release), "--app-target", str(app),
            "--library-target", str(lib), "--no-verify"]
     if extra:
         cmd += extra
-    return subprocess.run(cmd, capture_output=True, text=True)
+    return _run_bounded(cmd, phase="install", timeout=timeout)
 
 
 # ---------------------------------------------------------------------------
@@ -151,15 +242,24 @@ def _t_reinstall_success() -> None:
 
 
 def _t_reinstall_success_verify() -> None:
+    """B(real verify) —— 真实 runtime 重装 + installer ``--verify`` 启动验证。
+
+    覆盖对照（2026-09-26 审计，与 A1 逐项比对后**保留**）：本用例有 **A2 独有**覆盖 ——
+      * 真实大包重装后 ``App.staging`` / ``App.backup`` **无残留**（A1 未断言）；
+      * installer CLI ``--verify --port`` 这条**安装器自带的启动验证分支**
+        （A1 是直接对已安装 App 做 HTTP 探活，不经过 installer 的 verify 路径）。
+
+    因此**不做去重删除**（那会丢掉 A2 独有 invariant）；本轮只把它的
+    build / install 子进程与 cleanup 全部改成**有界**
+    （见 ``_run_bounded`` / ``_cleanup_bounded``）—— 优化的是 I/O，不是删验收项。
+    """
     if not _runtime_present():
         skip("B(verify) 重装 + 真实启动验证", "runtime 未构建")
         return
     with _tmp() as tmp:
         # 用真实 dist（含真实 app + 嵌入式 runtime）做重装 + 启动验证
         dist = tmp / "dist"
-        b = subprocess.run(
-            [sys.executable, str(REPO / "scripts" / "build_release.py"),
-             "--output", str(dist)], capture_output=True, text=True)
+        b = _build_real(dist)
         if b.returncode != 0:
             skip("B(verify) 重装 + 真实启动验证", f"build 失败：{b.stderr[-200:]}")
             return
@@ -317,20 +417,38 @@ def _t_library_untouched_on_failure() -> None:
         check("G 失败场景 Library SHA 完全一致 + 未被 staging/backup 触碰", ok, f"rc={rc}")
 
 
+def _timed(label: str, fn) -> None:
+    """逐 case 计时 —— 让「慢 / 挂」精确定位到某一步。
+
+    为什么必须有它：A2 曾出现「B(verify) 之后 20+ 分钟无任何输出」，
+    却无法判断是 build / install / cleanup 哪一段慢；加计时后卡点一眼可见。
+    """
+    t0 = time.time()
+    try:
+        fn()
+    finally:
+        print(f"  ⏱ {label}: {time.time() - t0:.1f}s")
+
+
 def run_a2_tests() -> None:
     section("Installer Hardening / 事务化安装 + 回滚")
-    _t_first_install_success()
-    _t_reinstall_success()
-    _t_reinstall_success_verify()
-    _t_copy_failure_keeps_old()
-    _t_verify_staging_failure_keeps_old()
-    _t_swap_then_launch_failure_rolls_back()
-    _t_first_install_failure_leaves_nothing()
-    _t_library_untouched_on_failure()
+    for label, fn in (
+        ("A_first_install", _t_first_install_success),
+        ("B_reinstall_fake", _t_reinstall_success),
+        ("B_real_verify", _t_reinstall_success_verify),
+        ("C_copy_failure", _t_copy_failure_keeps_old),
+        ("D_staging_failure", _t_verify_staging_failure_keeps_old),
+        ("E_swap_rollback", _t_swap_then_launch_failure_rolls_back),
+        ("F_first_install_failure", _t_first_install_failure_leaves_nothing),
+        ("G_library_untouched", _t_library_untouched_on_failure),
+    ):
+        _timed(label, fn)
+    print(f"  ℹ A2 build 次数={BUILD_COUNT}  install 次数={INSTALL_COUNT}")
 
 
 if __name__ == "__main__":
     run_a2_tests()
     total = len(PASS) + len(SKIP) + len(FAIL)
-    print(f"\n  A2 TOTAL={total} PASS={len(PASS)} SKIP={len(SKIP)} FAIL={len(FAIL)}")
+    print(f"\n  A2 TOTAL={total} PASS={len(PASS)} SKIP={len(SKIP)} FAIL={len(FAIL)}"
+          f"  builds={BUILD_COUNT} installs={INSTALL_COUNT}")
     raise SystemExit(1 if FAIL else 0)
