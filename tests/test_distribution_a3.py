@@ -15,11 +15,23 @@
  10. manifest 不含自身 / 不含临时文件 / 相对路径 / POSIX / 固定排序
  11. verify 命令**完全只读**（前后目录树逐字节一致，且不创建 Library）
  12. BUILD_INFO 无隐私（无用户名 / 绝对路径 / HOME / LOCALAPPDATA / IP）
- 13. 真实 runtime 下的 strict 构建（有运行时才跑）：门禁全绿 + 介质自校验通过
+ 13. 真实 runtime 下的 strict 构建（**已移出默认 suite**，见下「责任重划分」）
 
 设计：本模块自包含（自带 check/skip/section 与 PASS/FAIL/SKIP 列表），
 由 tests/test_suite.py 的 main() 调用 run_a3_tests() 并合并结果。
 **全程只用临时目录**，绝不触碰真实 LOCALAPPDATA / Documents / Library / 桌面。
+
+性能 / 责任重划分（2026-09-26，RELEASE_REQUIRED / Test Infrastructure Performance Defect）：
+  * **默认 suite 不执行真实 strict 构建**（_t_real_strict_build）。它做一次真实
+    ``build_release.py --strict``（拷贝 ~13850 文件 / 515MB 嵌入式 runtime + 全量哈希），
+    属「重 I/O」操作，曾多次成为长时间阻塞源。其完整端到端验证职责正式归属
+    **Windows Release Gate Step 2**（全套件 PASS 后由 run_a3_real_strict_build() 单独调用）。
+  * **默认 suite 保留全部 fake / 逻辑级严格闸门**：BUILD_INFO / LICENSES / MANIFEST /
+    SHA256SUMS / 自校验 / 严格门禁的**逻辑本体**均被覆盖，含最关键的「微型仓库 strict 全链路」
+    （_t_fake_repo_strict_build）、lock/runtime 一致性门禁、vendor 许可原文补齐等。
+  * **cleanup 全部有界**（_cleanup_bounded，120s）：超时只打 CLEANUP_WARNING 并列残留，
+    **不改 PASS/FAIL**；不再用无界 ``shutil.rmtree``（曾导致 20~74 分钟无输出）。
+  * **逐 case 计时**（_timed）：每一大项耗时可见，便于核对「A3 是否进入分钟级」。
 """
 from __future__ import annotations
 
@@ -32,6 +44,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -44,6 +57,10 @@ from app.core.migrations import CURRENT_SCHEMA_VERSION as _SCHEMA_VERSION  # noq
 PASS: list[str] = []
 FAIL: list[str] = []
 SKIP: list[str] = []
+
+# 真实 strict 构建次数：默认 suite 不再执行（见 run_a3_tests 注释），
+# 它由「Windows Release Gate Step 2」单独承担，故默认 = 0。
+REAL_STRICT_BUILD_COUNT = 0
 
 # 嵌入资源「不适用」桩：用于纯 BUILD_INFO / LICENSES 门禁单测（这些用例不构造随包嵌入）。
 # 必须与 build_release._stage_embedding 的返回结构一致；applicable=False ⇒ 门禁跳过嵌入校验。
@@ -64,6 +81,83 @@ def skip(name: str, reason: str = "") -> None:
 
 def section(t: str) -> None:
     print(f"\n── A3 {t} " + "─" * max(0, 54 - len(t)))
+
+
+def _print_cleanup_warning(root: Path, why: str) -> None:
+    print(f"\n  ⚠ CLEANUP_WARNING: 临时目录未在限时内清理（{why}）")
+    print(f"    leftover : {root}")
+    print("    → 不影响本次产品 PASS/FAIL；残留可后续人工/后台清理。")
+
+
+def _cleanup_bounded(root: Path, timeout: int = 120) -> bool:
+    """best-effort 清理：子进程 rmtree + 超时，**绝不阻塞 Release Gate**。
+
+    背景（实测，2026-09-26）：Windows 实时防毒下 ``shutil.rmtree`` 删除大量小文件
+    极慢（曾观测到 0.8s/文件，约正常 20×）；此前 A1/A2 的无界 ``shutil.rmtree``
+    让整轮测试在 cleanup 阶段 **20~74 分钟无任何输出**。
+    A3 默认 suite 各用例只造 **微型假仓库**（秒级构建、产物仅 KB 级），删速本应极快，
+    但为防止「个别文件被 Defender 锁住」导致 cleanup 无限拖尾，这里统一收紧为有界：
+    超时只打 ``CLEANUP_WARNING`` 并列残留，**不改任何 PASS/FAIL**，
+    不触碰真实 Library，也不 kill 无关进程。
+    """
+    if not root.exists():
+        return True
+    code = "import shutil,sys; shutil.rmtree(sys.argv[1], ignore_errors=True)"
+    try:
+        subprocess.run([sys.executable, "-c", code, str(root)],
+                       timeout=timeout, stdin=subprocess.DEVNULL, capture_output=True)
+    except subprocess.TimeoutExpired:
+        _print_cleanup_warning(root, f"超过 {timeout}s")
+        return False
+    if root.exists():
+        _print_cleanup_warning(root, "仍有残留（个别文件被占用）")
+        return False
+    return True
+
+
+def _run_bounded(cmd, *, phase: str, timeout: int, cwd=None) -> subprocess.CompletedProcess:
+    """有界 subprocess —— Release 测试**禁止无限等待**。
+
+    A3 真实 strict 构建（已移出默认 suite，由 Windows Release Gate Step 2 调用）
+    此前用 ``timeout=1800`` 且**未处理超时**，一旦环境 I/O 劣化就会让 Gate 静默挂起。
+    这里统一收紧：
+
+    * ``stdin=DEVNULL``：本调用已给全 CLI 参数，绝不应进入 ``input()``；
+      生产代码若意外交互读取会立刻 EOF，而不是永久挂起。
+    * ``encoding/errors``：固定 utf-8/replace，避免中文输出触发解码异常。
+    * ``cwd``：透传工作目录（真实构建依赖 ``cwd=REPO`` 取 git/lock）。
+    * ``timeout``：超时返回 rc=-1 并打印 phase / command / stdout 尾部 / stderr 尾部，
+      让对应用例**明确 FAIL**，而不是让整套 suite 卡死在无声处。
+    """
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                              stdin=subprocess.DEVNULL, cwd=cwd,
+                              encoding="utf-8", errors="replace")
+    except subprocess.TimeoutExpired as exc:
+        out = exc.stdout or b""
+        err = exc.stderr or b""
+        if isinstance(out, bytes):
+            out = out.decode("utf-8", "replace")
+        if isinstance(err, bytes):
+            err = err.decode("utf-8", "replace")
+        print(f"\n  ⏱ TIMEOUT（{phase}）超过 {timeout}s")
+        print(f"    command     : {' '.join(str(c) for c in cmd)}")
+        print(f"    stdout 尾部 : ...{out[-400:]}")
+        print(f"    stderr 尾部 : ...{err[-400:]}")
+        return subprocess.CompletedProcess(cmd, -1, stdout=out, stderr=err)
+
+
+def _timed(label: str, fn) -> None:
+    """逐 case 计时 —— 让「慢 / 挂」精确定位到某一步。
+
+    为什么必须有它：A1/A2 曾出现「某段之后 20+ 分钟无任何输出」却无法判断是哪一步慢；
+    加计时后卡点一眼可见，也便于核对「A3 是否进入分钟级」。
+    """
+    t0 = time.time()
+    try:
+        fn()
+    finally:
+        print(f"  ⏱ {label}: {time.time() - t0:.1f}s")
 
 
 def _runtime_present() -> bool:
@@ -92,7 +186,8 @@ class _tmp:
         return self.d
 
     def __exit__(self, *a) -> None:
-        shutil.rmtree(self.d, ignore_errors=True)
+        # 有界清理：超时只警告，绝不阻塞 Gate（见 _cleanup_bounded）
+        _cleanup_bounded(self.d, timeout=120)
 
 
 def _install_expect(iw, *args, **kw) -> int:
@@ -520,6 +615,16 @@ def _t_license_inventory_shape(tmp: Path) -> None:
 # ---------------------------------------------------------------------------
 # 13 —— 真实 runtime 下的 strict 构建（有运行时才跑）
 # ---------------------------------------------------------------------------
+# ⚠ 责任重划分（2026-09-26，RELEASE_REQUIRED / Test Infrastructure Performance Defect）：
+#   **默认 suite 不再执行本用例**。它做一次真实 ``build_release.py --strict``（拷贝 ~13850
+#   文件 / 515MB 嵌入式 runtime + 全量哈希 + 许可收集），属于「重 I/O」操作，曾多次成为
+#   长时间阻塞源。真实 strict 构建的完整验证职责正式归属 **Windows Release Gate Step 2**
+#   （在「全套件 PASS」之后单独运行 `run_a3_real_strict_build()`）。
+#   默认 suite 保留全部 **fake / 逻辑级** strict 闸门（见 _t_fake_repo_strict_build /
+#   _t_lock_mismatch_gate / _t_vendor_license_gate / _t_build_info_missing / _t_licenses_missing），
+#   已覆盖 BUILD_INFO / LICENSES / MANIFEST / SHA256SUMS / 自校验 / 严格门禁的**逻辑本体**，
+#   包括「微型仓库 strict 全链路」这一最关键链路。真实产物的端到端校验仍由 Gate Step 2 兜底。
+# ---------------------------------------------------------------------------
 def _in_ci() -> bool:
     """是否跑在 CI 里（GitHub Actions 会注入 GITHUB_ACTIONS=true / CI=true）。"""
     return (os.environ.get("GITHUB_ACTIONS", "").lower() == "true"
@@ -568,11 +673,15 @@ def _t_real_strict_build(tmp: Path) -> None:
 
     stale = expected_version_mismatch()
     out = tmp / "dist"
-    proc = subprocess.run(
+    # 真实 full build 拷贝 ~13850 文件 / 515MB 嵌入式 runtime，Windows 实时防毒下可能很慢；
+    # 用有界 subprocess（1200s 上限，与 A1/A2 install 一致，容纳真实删除/拷贝尖峰），
+    # 超时 → rc=-1 + 明确 TIMEOUT 提示，不静默挂起。
+    global REAL_STRICT_BUILD_COUNT
+    REAL_STRICT_BUILD_COUNT += 1
+    proc = _run_bounded(
         [sys.executable, str(REPO / "scripts" / "build_release.py"),
          "--strict", "--output", str(out)],
-        cwd=str(REPO), capture_output=True, text=True, encoding="utf-8",
-        errors="replace", timeout=1800)
+        phase="build_release (strict)", timeout=1200, cwd=str(REPO))
     stderr = proc.stderr or ""
 
     if stale:
@@ -981,10 +1090,37 @@ def _t_non_strict_never_claims_release_ready(tmp: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+def run_a3_real_strict_build() -> None:
+    """Windows Release Gate Step 2 入口：真实 strict 构建全链路验证。
+
+    默认 suite（run_a3_tests）**不**执行本用例 —— 它做一次真实 ``build_release.py --strict``
+    （拷贝 ~13850 文件 / 515MB 嵌入式 runtime + 全量哈希 + 许可收集），属「重 I/O」操作，
+    是此前长时间阻塞的元凶之一。按 RELEASE_REQUIRED 责任重划分，真实 strict 构建的完整
+    端到端验证正式归属 **Windows Release Gate Step 2**，在「全套件 PASS」之后单独调用本函数。
+    """
+    global REAL_STRICT_BUILD_COUNT
+    if not _runtime_present():
+        skip("A3 真实 strict 构建（Gate Step 2）",
+             "runtime/python-3.11-embed 未构建 —— 跳过真实构建验证")
+        return
+    with _tmp() as t:
+        _t_real_strict_build(t)
+
+
 def run_a3_tests() -> None:
+    """默认 A3 suite：全部 fake / 逻辑级严格闸门，**不**含真实 strict 构建。
+
+    责任重划分（2026-09-26，RELEASE_REQUIRED）：真实 strict 构建（拷贝 515MB 嵌入式
+    runtime + 全量哈希）已移出默认 suite，改由 Windows Release Gate Step 2 单独承担
+    （见 ``run_a3_real_strict_build``）。默认 suite 保留全部 fake/strict 逻辑验证，
+    包括最关键的「微型仓库 strict 全链路」（_t_fake_repo_strict_build），确保 BUILD_INFO /
+    LICENSES / MANIFEST / SHA256SUMS / 自校验 / 严格门禁的**逻辑本体**不退化。
+    cleanup 全部有界（_cleanup_bounded，120s），逐 case 计时（_timed）。
+    """
     print("\n" + "=" * 66)
     print("  A3 —— Release Integrity / BUILD_INFO / Checksums / Licensing")
     print("=" * 66)
+    print("  ℹ 默认 suite 不含真实 strict 构建（由 Windows Release Gate Step 2 承担）")
 
     cases = [
         ("payload 改 1 byte", _t_payload_byte_flip, "s1"),
@@ -1003,17 +1139,30 @@ def run_a3_tests() -> None:
         ("A3.1 vendor 许可原文补齐", _t_vendor_license_gate, "s17"),
         ("微型仓库 strict 全链路", _t_fake_repo_strict_build, "s13"),
         ("非 strict 不称可交付", _t_non_strict_never_claims_release_ready, "s14"),
-        ("真实 strict 构建", _t_real_strict_build, "s15"),
     ]
+
     for _label, fn, sub in cases:
-        with _tmp() as t:
-            d = t / sub
-            d.mkdir(parents=True, exist_ok=True)
-            try:
-                fn(d)
-            except Exception as exc:      # 单场景异常不得带崩整个套件
-                check(f"A3 {_label} 执行未抛异常", False,
-                      f"{type(exc).__name__}: {exc}")
+        def _run():
+            with _tmp() as t:
+                d = t / sub
+                d.mkdir(parents=True, exist_ok=True)
+                try:
+                    fn(d)
+                except Exception as exc:      # 单场景异常不得带崩整个套件
+                    check(f"A3 {_label} 执行未抛异常", False,
+                          f"{type(exc).__name__}: {exc}")
+        _timed(_label, _run)
 
     print(f"\n  A3 TOTAL={len(PASS) + len(FAIL) + len(SKIP)} "
-          f"PASS={len(PASS)} SKIP={len(SKIP)} FAIL={len(FAIL)}")
+          f"PASS={len(PASS)} SKIP={len(SKIP)} FAIL={len(FAIL)} "
+          f"real_strict_build={REAL_STRICT_BUILD_COUNT}")
+    if REAL_STRICT_BUILD_COUNT == 0:
+        print("  ℹ 真实 strict 构建次数 = 0（符合预期：已移出默认 suite）")
+
+
+if __name__ == "__main__":
+    run_a3_tests()
+    total = len(PASS) + len(SKIP) + len(FAIL)
+    print(f"\n  A3 TOTAL={total} PASS={len(PASS)} SKIP={len(SKIP)} "
+          f"FAIL={len(FAIL)} real_strict_build={REAL_STRICT_BUILD_COUNT}")
+    raise SystemExit(1 if FAIL else 0)
