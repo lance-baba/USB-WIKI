@@ -190,8 +190,112 @@ class _tmp:
         _cleanup_bounded(self.d, timeout=120)
 
 
+# ---------------------------------------------------------------------------
+# 安装测试安全沙箱（RELEASE_REQUIRED / Test Safety Isolation Defect, 2026-09-26）
+# ---------------------------------------------------------------------------
+# A3 安装类用例（_t_corrupt_media_keeps_app_and_library / _t_reinstall_from_intact_media）
+# 调用 iw.install() 会在**成功安装后**创建桌面快捷方式 + 写 install_state.json。
+# 默认情况下：
+#   * create_desktop_shortcut 走**真实桌面**（_desktop_dir 无测试钩子）→ 只能靠 install() 的
+#     desktop_dir 参数重定向；
+#   * _state_dir() 优先读 WIKIUSB_STATE_DIR，否则回退 LOCALAPPDATA/USB-WIKI。
+# 因此统一用 context manager 在 os.environ 注入隔离变量（in-process 实时读取；subprocess 继承），
+# 并对所有成功安装显式传 desktop_dir=<TEMP>/Desktop。进入时保存原值、退出时精确恢复：
+# 原本存在→恢复原值，原本不存在→删除注入值。**从一开始就不写真实位置**（禁止写后再删）。
+_SANDBOX = None  # 由 _install_sandbox.__enter__ 写入；_install_expect 读取 desktop_dir
+
+
+def _sandbox_desktop_dir():
+    return _SANDBOX["desktop_dir"] if _SANDBOX else None
+
+
+class _install_sandbox:
+    """为安装测试建立 scoped sandbox，注入隔离 env 并精确还原。
+
+    沙箱目录（全部位于 TEMP，绝不触碰真实 Desktop/LOCALAPPDATA/Library/Documents）：
+        <root>/localapp            → 冒充 LOCALAPPDATA
+        <root>/localapp/USB-WIKI   → 冒充 WIKIUSB_STATE_DIR（install_state.json 落此）
+        <root>/Desktop             → 冒充桌面（快捷方式落此）
+    注入：LOCALAPPDATA / WIKIUSB_STATE_DIR / PYTHONUTF8=1 / PYTHONIOENCODING=utf-8。
+    """
+
+    def __init__(self) -> None:
+        self._root = Path(tempfile.mkdtemp(prefix="wikiusb-a3-sandbox-"))
+        self._localapp = self._root / "localapp"
+        self._statedir = self._localapp / "USB-WIKI"
+        self._desktop = self._root / "Desktop"
+        self._localapp.mkdir(parents=True, exist_ok=True)
+        self._statedir.mkdir(parents=True, exist_ok=True)
+        self._desktop.mkdir(parents=True, exist_ok=True)
+        self._overrides = {
+            "LOCALAPPDATA": str(self._localapp),
+            "WIKIUSB_STATE_DIR": str(self._statedir),
+            "PYTHONUTF8": "1",
+            "PYTHONIOENCODING": "utf-8",
+        }
+        self._saved: dict[str, str] = {}
+        self._added: set[str] = set()
+
+    @property
+    def desktop_dir(self) -> Path:
+        return self._desktop
+
+    def __enter__(self) -> "_install_sandbox":
+        global _SANDBOX
+        _SANDBOX = {"desktop_dir": self._desktop}
+        for k, v in self._overrides.items():
+            if k in os.environ:
+                self._saved[k] = os.environ[k]
+            else:
+                self._added.add(k)
+            os.environ[k] = v
+        return self
+
+    def __exit__(self, *a) -> None:
+        global _SANDBOX
+        _SANDBOX = None
+        for k in self._overrides:
+            if k in self._added:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = self._saved[k]
+        _cleanup_bounded(self._root, timeout=120)
+
+
+def _snapshot_real_side_effects() -> dict:
+    """只读快照真实桌面快捷方式 + 真实 install_state.json（前后一致性断言用）。
+
+    必须在 sandbox 之外（用真实 env）调用——进入沙箱前拍一次，退出沙箱后拍一次。
+    * 真实桌面：Path.home()/"Desktop"（_desktop_dir 永远返回真实桌面，不受 env 影响）。
+    * 真实 install_state.json：LOCALAPPDATA/USB-WIKI/install_state.json（_state_dir 回退路径）。
+    """
+    paths = [
+        Path.home() / "Desktop" / "USB-WIKI.lnk",
+        Path(os.environ.get("LOCALAPPDATA") or (Path.home() / ".usb-wiki"))
+        / "USB-WIKI" / "install_state.json",
+    ]
+    snap: dict[str, tuple[str, object]] = {}
+    for p in paths:
+        if p.is_file():
+            try:
+                snap[str(p)] = ("file", hashlib.sha256(p.read_bytes()).hexdigest())
+            except OSError:
+                snap[str(p)] = ("file", "unreadable")
+        else:
+            snap[str(p)] = ("missing", None)
+    return snap
+
+
 def _install_expect(iw, *args, **kw) -> int:
-    """跑 install()，把 SystemExit 转成退出码；无异常返回 0。"""
+    """跑 install()，把 SystemExit 转成退出码；无异常返回 0。
+
+    自动注入 sandbox 的 desktop_dir（若存在），确保所有成功安装的快捷方式落在 TEMP/Desktop，
+    绝不写真实桌面。install_state.json 的隔离由 _install_sandbox 的 WIKIUSB_STATE_DIR 负责。
+    """
+    if "desktop_dir" not in kw:
+        d = _sandbox_desktop_dir()
+        if d is not None:
+            kw["desktop_dir"] = d
     try:
         return iw.install(*args, **kw)
     except SystemExit as e:
@@ -1141,17 +1245,28 @@ def run_a3_tests() -> None:
         ("非 strict 不称可交付", _t_non_strict_never_claims_release_ready, "s14"),
     ]
 
-    for _label, fn, sub in cases:
-        def _run():
-            with _tmp() as t:
-                d = t / sub
-                d.mkdir(parents=True, exist_ok=True)
-                try:
-                    fn(d)
-                except Exception as exc:      # 单场景异常不得带崩整个套件
-                    check(f"A3 {_label} 执行未抛异常", False,
-                          f"{type(exc).__name__}: {exc}")
-        _timed(_label, _run)
+    # 安全隔离：进入沙箱前拍真实副作用快照，全程 sandbox 隔离，退出后比对。
+    # 若沙箱失效导致真实桌面/LOCALAPPDATA 被写，快照不一致 → 明确 FAIL（绝不写后再删）。
+    snap_before = _snapshot_real_side_effects()
+    with _install_sandbox() as sb:
+        print(f"  ℹ 安装沙箱：LOCALAPPDATA→{os.environ['LOCALAPPDATA']} "
+              f"WIKIUSB_STATE_DIR→{os.environ['WIKIUSB_STATE_DIR']} "
+              f"desktop_dir→{sb.desktop_dir}")
+        for _label, fn, sub in cases:
+            def _run():
+                with _tmp() as t:
+                    d = t / sub
+                    d.mkdir(parents=True, exist_ok=True)
+                    try:
+                        fn(d)
+                    except Exception as exc:      # 单场景异常不得带崩整个套件
+                        check(f"A3 {_label} 执行未抛异常", False,
+                              f"{type(exc).__name__}: {exc}")
+            _timed(_label, _run)
+    snap_after = _snapshot_real_side_effects()
+    check("A3 全程未修改真实 Desktop / LOCALAPPDATA",
+          snap_before == snap_after,
+          f"before={snap_before} after={snap_after}")
 
     print(f"\n  A3 TOTAL={len(PASS) + len(FAIL) + len(SKIP)} "
           f"PASS={len(PASS)} SKIP={len(SKIP)} FAIL={len(FAIL)} "
