@@ -596,24 +596,278 @@ async function loadNotes() {
   }
   noteCache = r.data || [];
   $("#docCount").textContent = noteCache.length;
+  await loadCollections();   // 分类是管理视图数据；拉不到也不能阻断笔记列表
   renderNoteList();
 }
+/* -------------------- Collections（资料集）：用户组织层 --------------------
+ * 只做「组织 / 浏览 / 筛选」：类目、一篇多分类、显示标题、回收站。
+ * **完全不参与**搜索与问答 —— 默认检索仍全局（见 docs/COLLECTIONS_ARCHITECTURE.md）。
+ * 分类数据是 durable 用户状态，存 <Library>/metadata/collections.json（后端）。
+ * ------------------------------------------------------------------------- */
+let collCache = { collections: [], membership: {}, display_titles: {}, trash: [] };
+
+async function loadCollections() {
+  try {
+    const r = await api("/api/collections");
+    if (r && r.code === 200 && r.data) collCache = r.data;
+  } catch (e) { /* 分类用不了时保持旧缓存，绝不阻断笔记列表与正文 */ }
+  renderCollectionFilter();
+}
+
+function collById(id) { return (collCache.collections || []).find(c => c.id === id); }
+function docCollections(docId) {
+  return (collCache.membership[docId] || []).map(collById).filter(Boolean);
+}
+function docDisplayTitle(n) {
+  return collCache.display_titles[n.doc_id] || n.display_source || n.title || "(无标题)";
+}
+function isTrashed(n) { return (collCache.trash || []).indexOf(n.doc_id) >= 0; }
+
+function renderCollectionFilter() {
+  const sel = $("#noteCollectionFilter");
+  if (!sel) return;
+  const cur = sel.value;
+  const opts = ['<option value="">全部分类</option>'];
+  (collCache.collections || []).slice()
+    .sort((a, b) => a.name.localeCompare(b.name, "zh"))
+    .forEach(c => opts.push('<option value="' + esc(c.id) + '">' + esc(c.name) + "</option>"));
+  const nTrash = (collCache.trash || []).length;
+  opts.push('<option value="__trash__">回收站' + (nTrash ? "（" + nTrash + "）" : "") + "</option>");
+  sel.innerHTML = opts.join("");
+  if (Array.from(sel.options).some(o => o.value === cur)) sel.value = cur;
+}
+
 function renderNoteList() {
   const kw = $("#noteFilter").value.trim().toLowerCase();
-  // UX-1：列表显示与过滤都用 display_source（导入文件→源文件名），
-  //       内部 title 仍保留在索引里（检索/提示词用），只是不再当「来源名」展示。
-  const list = noteCache.filter(n =>
-    !kw || (n.display_source || "").toLowerCase().includes(kw)
-    || (n.title || "").toLowerCase().includes(kw) || (n.rel_path || "").toLowerCase().includes(kw));
-  $("#noteList").innerHTML = list.map(n =>
-    '<div class="list-item" data-path="' + esc(n.rel_path) + '">' +
-      '<div class="t">' + esc(n.display_source || n.title || "(无标题)") + "</div>" +
+  const cf = $("#noteCollectionFilter") ? $("#noteCollectionFilter").value : "";
+  const inTrash = cf === "__trash__";
+  // 回收站视图 vs 正常视图：正常视图永远不含已软删的笔记
+  let list = noteCache.filter(n => isTrashed(n) === inTrash);
+  if (!inTrash) {
+    if (cf) list = list.filter(n => (collCache.membership[n.doc_id] || []).indexOf(cf) >= 0);
+    if (kw) list = list.filter(n =>
+      (docDisplayTitle(n) || "").toLowerCase().includes(kw)
+      || (n.title || "").toLowerCase().includes(kw) || (n.rel_path || "").toLowerCase().includes(kw));
+  }
+  $("#noteList").innerHTML = list.map(n => {
+    const tags = docCollections(n.doc_id)
+      .map(c => '<span class="tag">' + esc(c.name) + "</span>").join("");
+    return '<div class="list-item" data-path="' + esc(n.rel_path) + '">' +
+      '<div class="t">' + esc(docDisplayTitle(n)) + "</div>" +
       '<div class="m"><span>' + esc(n.rel_path) + "</span>" +
       (n.status === "partial_fallback" ? '<span class="pill warn">快照</span>' : "") +
       "<span>" + (n.chunks || 0) + " 切片</span></div>" +
-    "</div>").join("") || '<div class="hint">暂无文档，去「剪藏」页录入一篇吧。</div>';
+      (tags ? '<div class="tags">' + tags + "</div>" : "") +
+      '<button class="more" title="更多操作">⋯</button>' +
+    "</div>";
+  }).join("") || '<div class="hint">'
+    + (inTrash ? "回收站是空的。" : "暂无文档，去「剪藏」页录入一篇吧。") + "</div>";
 
-  $$("#noteList .list-item").forEach(el => el.onclick = () => openNoteItem(el));
+  $$("#noteList .list-item").forEach(el => {
+    el.onclick = () => openNoteItem(el);
+    const btn = el.querySelector(".more");
+    if (btn) btn.onclick = (e) => {
+      e.stopPropagation();
+      const n = noteCache.find(x => x.rel_path === el.dataset.path);
+      if (n) openNoteMenu(btn, n, inTrash);
+    };
+  });
+}
+
+/* ---- 自绘弹层（零框架，零依赖）---- */
+function _closePop() { $$(".pop-layer").forEach(x => x.remove()); }
+
+function _popup(anchor, html) {
+  _closePop();
+  const wrap = document.createElement("div");
+  wrap.className = "pop-layer";
+  wrap.innerHTML = html;
+  document.body.appendChild(wrap);
+  const r = anchor.getBoundingClientRect();
+  wrap.style.left = Math.max(8, Math.min(r.right - wrap.offsetWidth, window.innerWidth - wrap.offsetWidth - 10)) + "px";
+  wrap.style.top = (r.bottom + 4) + "px";
+  setTimeout(() => document.addEventListener("click", _closePop, { once: true }), 0);
+  return wrap;
+}
+
+function openNoteMenu(anchor, n, inTrash) {
+  const items = inTrash
+    ? [["恢复", "restore", ""]]
+    : [["编辑标题", "title", ""], ["分类", "collections", ""], ["移入回收站", "trash", "danger"]];
+  const wrap = _popup(anchor, '<div class="menu">' + items.map(([label, act, cls]) =>
+    '<button data-act="' + act + '"' + (cls ? ' class="' + cls + '"' : "") + ">" + esc(label) + "</button>")
+    .join("") + "</div>");
+  wrap.querySelectorAll("button").forEach(b => b.onclick = (e) => {
+    e.stopPropagation();
+    _closePop();
+    const act = b.dataset.act;
+    if (act === "title") editNoteTitle(n);
+    else if (act === "collections") editNoteCollections(n);
+    else if (act === "trash") trashNote(n);
+    else if (act === "restore") restoreNote(n);
+  });
+}
+
+function _modal(title, bodyHtml, onReady) {
+  _closePop();
+  const mask = document.createElement("div");
+  mask.className = "modal-mask";
+  mask.innerHTML = '<div class="modal"><h4>' + esc(title) + "</h4>" + bodyHtml + "</div>";
+  document.body.appendChild(mask);
+  mask.onclick = (e) => { if (e.target === mask) mask.remove(); };
+  const close = () => mask.remove();
+  if (onReady) onReady(mask.querySelector(".modal"), close);
+  return mask;
+}
+
+function editNoteTitle(n) {
+  _modal("编辑标题",
+    '<input type="text" id="_titleIn" value="' + attrEsc(docDisplayTitle(n)) + '">' +
+    '<div class="hint" style="margin-top:8px">只改显示标题，不动文件名（文件仍是 ' + esc(n.rel_path) + "）。</div>" +
+    '<div class="row" style="margin-top:12px;justify-content:flex-end">' +
+    '<button class="btn" data-cancel>取消</button><button class="btn primary" data-ok>保存</button></div>',
+    (root, close) => {
+      const inp = root.querySelector("#_titleIn");
+      inp.focus(); inp.select();
+      root.querySelector("[data-cancel]").onclick = close;
+      root.querySelector("[data-ok]").onclick = async () => {
+        const r = await api("/api/notes/display_title", {
+          method: "POST", body: JSON.stringify({ doc_id: n.doc_id, title: inp.value })
+        });
+        if (r.code === 200) {
+          const t = inp.value.trim();
+          if (t) collCache.display_titles[n.doc_id] = t; else delete collCache.display_titles[n.doc_id];
+          close(); renderNoteList(); toast("标题已更新");
+        } else { toast(r.message || "保存失败", 3200); }
+      };
+    });
+}
+
+async function editNoteCollections(n) {
+  await loadCollections();
+  const cur = new Set(collCache.membership[n.doc_id] || []);
+  const rows = (collCache.collections || []).slice()
+    .sort((a, b) => a.name.localeCompare(b.name, "zh"))
+    .map(c => '<div class="ck-row">'
+      + '<label class="ck"><input type="checkbox" value="' + attrEsc(c.id) + '"'
+      + (cur.has(c.id) ? " checked" : "") + '> <span class="ck-name">' + esc(c.name) + "</span></label>"
+      + '<button class="ck-op" data-ren="' + attrEsc(c.id) + '" title="重命名类目">✎</button>'
+      + '<button class="ck-del" data-del="' + attrEsc(c.id) + '" title="删除类目（不会删除文档）">✕</button>'
+      + "</div>").join("");
+  _modal("分类（可多选）",
+    '<div class="ck-list">' + (rows || '<div class="hint">还没有类目，在下面新建一个。</div>') + "</div>" +
+    '<div class="row" style="margin-top:10px;gap:8px">' +
+    '<input type="text" id="_newColl" class="grow" placeholder="新建类目，回车添加">' +
+    '<button class="btn" id="_addColl">新建</button></div>' +
+    '<div class="row" style="margin-top:12px;justify-content:flex-end">' +
+    '<button class="btn" data-cancel>取消</button><button class="btn primary" data-ok>保存</button></div>',
+    (root, close) => {
+      // 重命名类目：点 ✎ → 就地变成输入框（Enter 提交 / Esc 取消 / 失焦提交）
+      const bindRen = (btn) => {
+        if (!btn) return;
+        btn.onclick = (e) => {
+          e.preventDefault(); e.stopPropagation();
+          const row = btn.closest(".ck-row");
+          const c = collCache.collections.find(x => x.id === btn.dataset.ren);
+          const nameEl = row && row.querySelector(".ck-name");
+          if (!c || !nameEl) return;
+          const input = document.createElement("input");
+          input.type = "text"; input.className = "ck-rename"; input.value = c.name;
+          nameEl.replaceWith(input); input.focus(); input.select();
+          let done = false;
+          const finish = async () => {
+            if (done) return; done = true;
+            const nm = input.value.trim();
+            if (!nm || nm === c.name) { if (input.parentNode) input.replaceWith(nameEl); return; }
+            const rr = await api("/api/collections/rename",
+              { method: "POST", body: JSON.stringify({ id: c.id, name: nm }) });
+            if (rr.code !== 200) { toast(rr.message || "重命名失败", 3200); if (input.parentNode) input.replaceWith(nameEl); return; }
+            c.name = nm;
+            close();
+            await loadCollections();
+            toast("类目已重命名");
+            editNoteCollections(n);
+          };
+          input.onkeydown = (ev) => {
+            if (ev.key === "Enter") { ev.preventDefault(); finish(); }
+            else if (ev.key === "Escape") { done = true; if (input.parentNode) input.replaceWith(nameEl); }
+          };
+          input.onblur = () => finish();
+        };
+      };
+      // 删除类目：只删类目，**绝不删除文档**（后端已保证；关系从所有成员移除）
+      const bindDel = (btn) => {
+        if (!btn) return;
+        btn.onclick = async (e) => {
+          e.preventDefault(); e.stopPropagation();
+          const c = collCache.collections.find(x => x.id === btn.dataset.del);
+          if (!confirm("删除类目「" + (c ? c.name : "") + "」？\n\n只删除这个类目，不会删除任何文档。")) return;
+          const r = await api("/api/collections/delete",
+            { method: "POST", body: JSON.stringify({ id: btn.dataset.del }) });
+          if (r.code !== 200) { toast(r.message || "删除失败", 3200); return; }
+          close();
+          await loadCollections();
+          toast("类目已删除");
+          editNoteCollections(n);   // 重开，反映最新类目与勾选状态
+        };
+      };
+      const addNew = async () => {
+        const inp = root.querySelector("#_newColl");
+        const name = inp.value.trim();
+        if (!name) return;
+        const r = await api("/api/collections/create", { method: "POST", body: JSON.stringify({ name }) });
+        if (r.code !== 200) { toast(r.message || "新建失败", 3200); return; }
+        inp.value = "";
+        collCache.collections.push(r.data);
+        const listEl = root.querySelector(".ck-list");
+        const hint = listEl.querySelector(".hint"); if (hint) hint.remove();
+        const row = document.createElement("div");
+        row.className = "ck-row";
+        row.innerHTML = '<label class="ck"><input type="checkbox" value="' + attrEsc(r.data.id)
+          + '" checked> <span class="ck-name">' + esc(r.data.name) + "</span></label>"
+          + '<button class="ck-op" data-ren="' + attrEsc(r.data.id) + '" title="重命名类目">✎</button>'
+          + '<button class="ck-del" data-del="' + attrEsc(r.data.id)
+          + '" title="删除类目（不会删除文档）">✕</button>';
+        listEl.appendChild(row);
+        bindRen(row.querySelector("[data-ren]"));
+        bindDel(row.querySelector("[data-del]"));
+      };
+      root.querySelectorAll("[data-ren]").forEach(bindRen);
+      root.querySelectorAll("[data-del]").forEach(bindDel);
+      root.querySelector("#_addColl").onclick = addNew;
+      root.querySelector("#_newColl").onkeydown = (e) => {
+        if (e.key === "Enter") { e.preventDefault(); addNew(); }
+      };
+      root.querySelector("[data-cancel]").onclick = close;
+      root.querySelector("[data-ok]").onclick = async () => {
+        const ids = $$('input[type=checkbox]', root).filter(x => x.checked).map(x => x.value);
+        const r = await api("/api/collections/assign", {
+          method: "POST", body: JSON.stringify({ doc_id: n.doc_id, collection_ids: ids })
+        });
+        if (r.code === 200) {
+          if (ids.length) collCache.membership[n.doc_id] = ids;
+          else delete collCache.membership[n.doc_id];
+          close(); renderNoteList(); toast("分类已更新");
+        } else { toast(r.message || "保存失败", 3200); }
+      };
+    });
+}
+
+async function trashNote(n) {
+  if (!confirm("把「" + docDisplayTitle(n) + "」移入回收站？\n\n文件不会被删除，可在「回收站」里恢复。")) return;
+  const r = await api("/api/notes/trash", { method: "POST", body: JSON.stringify({ doc_id: n.doc_id }) });
+  if (r.code === 200) {
+    if ((collCache.trash || []).indexOf(n.doc_id) < 0) collCache.trash.push(n.doc_id);
+    renderCollectionFilter(); renderNoteList(); toast("已移入回收站");
+  } else { toast(r.message || "操作失败", 3200); }
+}
+
+async function restoreNote(n) {
+  const r = await api("/api/notes/restore", { method: "POST", body: JSON.stringify({ doc_id: n.doc_id }) });
+  if (r.code === 200) {
+    collCache.trash = (collCache.trash || []).filter(x => x !== n.doc_id);
+    renderCollectionFilter(); renderNoteList(); toast("已恢复");
+  } else { toast(r.message || "操作失败", 3200); }
 }
 
 /* 打开一条笔记（列表项已渲染时使用）。抽成具名函数，供问答引用跳转复用。
@@ -1672,6 +1926,7 @@ $("#btnCapture").onclick = doCapture;
 $("#capUrl").addEventListener("keydown", e => { if (e.key === "Enter") doCapture(); });
 $("#btnSaveNote").onclick = doSaveNote;
 $("#noteFilter").oninput = renderNoteList;
+$("#noteCollectionFilter").onchange = renderNoteList;
 $("#btnCfgSave").onclick = () => saveConfig(false);
 $("#btnCfgReload").onclick = loadConfig;
 $("#btnCfgDefaults").onclick = applyConfigDefaults;

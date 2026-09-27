@@ -3877,6 +3877,14 @@ def main() -> int:
         test_archive_ssrf()
         test_ssrf_guard(ctx)
         test_lifecycle_shutdown()
+        # Collections（资料集）：用户组织层 —— durable metadata / 多对多 / 软删；
+        # 只做组织与浏览，**不影响**检索与问答（默认全局）。轻量，任何模式都跑。
+        from tests.test_collections import run_collections_tests
+        run_collections_tests()
+        from tests.test_collections import PASS as _colp, FAIL as _colf, SKIP as _cols
+        PASS.extend(_colp)
+        FAIL.extend(_colf)
+        SKIP.extend(_cols)
         # A1：发布构建 + SSD 安装骨架（临时目录，零真实 LOCALAPPDATA/Documents 写入）
         if fast:
             skip("A1 发布构建 + SSD 安装骨架（--fast 跳过：含真实 build+install）",

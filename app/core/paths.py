@@ -50,6 +50,10 @@ ORIGINALS_DIR: Path = DATA_DIR / "originals"
 # 按 URL 哈希命名 → 同一站点的样式与 logo 被多篇文章共用时只存一份。
 # 这样「原版预览」才能在不联网的前提下还原版式（Local-First / 零外发）。
 ASSETS_DIR: Path = DATA_DIR / "assets"
+# 用户组织层（Collections / 类目 / 成员关系 / 显示标题 / 回收站）——
+# 属 **durable 用户状态**，绝不可只存于可重建的 cache.db。
+# 见 docs/COLLECTIONS_ARCHITECTURE.md（§8 durable metadata / §9 方案 A sidecar）。
+METADATA_DIR: Path = DATA_DIR / "metadata"
 CACHE_DB: Path = DATA_DIR / "cache.db"
 WAL_FILE: Path = DATA_DIR / "cache.db-wal"
 SHM_FILE: Path = DATA_DIR / "cache.db-shm"
@@ -97,7 +101,7 @@ def ensure_dirs() -> None:
     刻意**不**创建 ``EMBEDDING_DIR``：嵌入资源是否存在是事实信息，
     空目录会让「未随包」与「随包但文件缺失」看起来一样。
     """
-    for d in (DATA_DIR, NOTES_DIR, SNAPSHOT_DIR, ORIGINALS_DIR, ASSETS_DIR, RUNTIME_DIR):
+    for d in (DATA_DIR, NOTES_DIR, SNAPSHOT_DIR, ORIGINALS_DIR, ASSETS_DIR, METADATA_DIR, RUNTIME_DIR):
         d.mkdir(parents=True, exist_ok=True)
 
 

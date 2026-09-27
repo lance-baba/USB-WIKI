@@ -3,6 +3,8 @@ data/notes/
 data/snapshots/
 data/originals/
 data/assets/
+# Collections 用户组织元数据（类目 / 成员关系 / 显示标题 / 回收站）—— 与 notes 同为 durable 用户数据
+data/metadata/
 data/cache.db
 data/cache.db-wal
 data/cache.db-shm

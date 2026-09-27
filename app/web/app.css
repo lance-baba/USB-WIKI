@@ -181,6 +181,61 @@
   .list-item .m{color:var(--faint);font-size:11px;margin-top:2px;display:flex;gap:7px}
   .pill{font-size:10.5px;padding:1px 7px;border-radius:999px;background:rgba(15,23,42,.06);color:var(--muted)}
   .pill.warn{background:var(--warn-bg);color:var(--warn);border:1px solid var(--warn-line)}
+  /* ---- Collections：列表项操作 + 分类标签 + 自绘弹层 ---- */
+  .list-item{position:relative}
+  .list-item .more{
+    position:absolute;right:6px;top:6px;border:0;background:transparent;color:var(--faint);
+    font-size:16px;line-height:1;padding:2px 7px;border-radius:7px;opacity:0;transition:.14s
+  }
+  .list-item:hover .more,.list-item .more:focus{opacity:1}
+  .list-item .more:hover{background:rgba(79,70,229,.1);color:var(--accent)}
+  .list-item .tags{display:flex;flex-wrap:wrap;gap:4px;margin-top:5px}
+  .tag{
+    font-size:10.5px;padding:1px 8px;border-radius:999px;
+    background:rgba(79,70,229,.1);color:var(--accent);border:1px solid rgba(79,70,229,.22)
+  }
+  .pop-layer{position:fixed;z-index:200}
+  .menu{
+    background:var(--panel-solid);border:1px solid var(--line-strong);border-radius:11px;
+    box-shadow:0 12px 34px rgba(2,6,23,.2);padding:5px;min-width:132px
+  }
+  .menu button{
+    display:block;width:100%;text-align:left;border:0;background:transparent;font:inherit;
+    font-size:13px;padding:7px 12px;border-radius:7px;color:var(--text)
+  }
+  .menu button:hover{background:rgba(79,70,229,.1);color:var(--accent)}
+  .menu button.danger{color:var(--danger)}
+  .menu button.danger:hover{background:#fef2f2;color:var(--danger)}
+  .modal-mask{
+    position:fixed;inset:0;background:rgba(2,6,23,.38);z-index:210;
+    display:flex;align-items:center;justify-content:center;padding:20px
+  }
+  .modal{
+    background:var(--panel-solid);border-radius:var(--radius);padding:18px;
+    width:min(440px,100%);box-shadow:0 24px 60px rgba(2,6,23,.34)
+  }
+  .modal h4{margin:0 0 12px;font-size:15px}
+  .ck-list{display:flex;flex-direction:column;gap:6px;max-height:230px;overflow:auto;margin-top:4px}
+  .ck{display:flex;align-items:center;gap:8px;font-size:13.5px;cursor:pointer;padding:3px 2px}
+  .ck input{width:auto;flex:0 0 auto}
+  .ck-row{display:flex;align-items:center;gap:6px}
+  .ck-row .ck{flex:1;min-width:0}
+  .ck-del{
+    border:0;background:transparent;color:var(--faint);cursor:pointer;font-size:12px;
+    padding:2px 7px;border-radius:6px;flex:0 0 auto;opacity:.55;transition:.14s
+  }
+  .ck-row:hover .ck-del{opacity:1}
+  .ck-del:hover{background:#fef2f2;color:var(--danger)}
+  .ck-op{
+    border:0;background:transparent;color:var(--faint);cursor:pointer;font-size:12px;
+    padding:2px 7px;border-radius:6px;flex:0 0 auto;opacity:.55;transition:.14s
+  }
+  .ck-row:hover .ck-op{opacity:1}
+  .ck-op:hover{background:rgba(79,70,229,.1);color:var(--accent)}
+  .ck-rename{
+    flex:1;min-width:0;border:1px solid var(--accent);border-radius:6px;
+    padding:2px 6px;font:inherit;font-size:13.5px
+  }
   pre.doc{
     margin:0;flex:1;overflow:auto;background:#fbfcfe;border:1px solid var(--line);
     border-radius:10px;padding:14px;font-size:12.5px;line-height:1.7;white-space:pre-wrap;overflow-wrap:anywhere

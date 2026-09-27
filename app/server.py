@@ -21,6 +21,7 @@ from .core import (archiver, paths,
                    redact as redact_mod,
                    security as security_mod)
 from .api import (ask as api_ask, capture as api_capture, config as api_config,
+                  collections as api_collections,
                   diagnostics as api_diagnostics, library as api_library,
                   search as api_search, system as api_system)
 from .core.context import AppContext, get_ctx
@@ -374,6 +375,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         if api_library.handle_get(self, path):
             return
+        if api_collections.handle_get(self, path):
+            return
         if api_capture.handle_get(self, path):
             return
 
@@ -391,6 +394,8 @@ class Handler(BaseHTTPRequestHandler):
         if api_ask.handle_post(self, path):
             return
         if api_library.handle_post(self, path):
+            return
+        if api_collections.handle_post(self, path):
             return
         if api_capture.handle_post(self, path):
             return
