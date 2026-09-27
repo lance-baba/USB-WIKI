@@ -1678,8 +1678,9 @@ def test_single_version_source(ctx) -> None:
     check("net_guard 不再硬编码 WikiUSB/1.3", "WikiUSB/1.3" not in nsrc)
 
     hsrc = (paths.BASE_DIR / "app" / "web" / "index.html").read_text(encoding="utf-8")
-    check("★ 前端品牌栏不再硬编码版本（改为从 /api/status 取）",
-          "v1.2" not in hsrc and "appVer" in hsrc)
+    # 正式版不在 UI 展示版本号：既不硬编码，也不放 appVer 占位（v1.3 起的产品决策）
+    check("★ 前端品牌栏不显示版本号（正式版不给用户看版本）",
+          "v1.2" not in hsrc and "v1.3" not in hsrc and "appVer" not in hsrc)
 
     # ---------- ⑤ /api/status 返回两个版本 ----------
     rep = ctx.boot_report or {}

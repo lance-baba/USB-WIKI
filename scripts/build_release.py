@@ -78,6 +78,15 @@ def _stage_payload(dist_root: Path) -> bool:
         _fail_build(f"仓库 app/ 不存在，无法构建 payload：{REPO / 'app'}")
     _copytree_prune(REPO / "app", payload / "app")
 
+    # 应用图标（客户版观感）：payload 根供安装器用；dist 根供「解压后文件夹」显示
+    ico_src = REPO / "resources" / "usb-wiki.ico"
+    if ico_src.is_file():
+        shutil.copy2(ico_src, payload / "USB-WIKI.ico")
+        shutil.copy2(ico_src, dist_root / "USB-WIKI.ico")
+        (dist_root / "desktop.ini").write_text(
+            "[.ShellClassInfo]\r\nIconResource=USB-WIKI.ico,0\r\n",
+            encoding="utf-8")
+
     rt_src = REPO / "runtime" / "python-3.11-embed"
     rt_dst = payload / "python-runtime"
     if (rt_src / "python.exe").is_file():

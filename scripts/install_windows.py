@@ -414,6 +414,10 @@ def _copy_to_staging(payload: Path, staging: Path) -> None:
     staging.mkdir(parents=True, exist_ok=True)
     shutil.copytree(payload / "app", staging / "app")
     shutil.copytree(payload / "python-runtime", staging / "runtime")
+    # 应用图标（若随包提供）→ App 根，供桌面快捷方式引用其 IconLocation
+    ico = payload / "USB-WIKI.ico"
+    if ico.is_file():
+        shutil.copy2(ico, staging / "USB-WIKI.ico")
     # 随包嵌入资源 → App/resources/embedding/（**属于 App，不属于 Library**）
     #   → 可重装 / 可覆盖 / 可 rollback / 可从 U 盘恢复；Library 完全不受影响。
     #   资源目录缺失不阻断安装：那是「未随包」的正常状态，运行时会降级为纯 FTS。
@@ -425,6 +429,9 @@ def _copy_to_staging(payload: Path, staging: Path) -> None:
 def _write_launcher(app_dir: Path, library_target: Path) -> None:
     # 用户双击入口：自动开浏览器（**不含 --no-browser**）
     (app_dir / LIBRARY_MARKER).write_text(str(library_target), encoding="utf-8")
+    # 用 pythonw.exe 启动 → **不弹出控制台窗口**（客户版核心体验）。
+    # `start ""` 让批处理立即退出、不留常驻控制台；Library 仍由本脚本从 marker 注入
+    # WIKIUSB_LIBRARY（runtime 只读环境变量、不读 marker —— 故入口必须保留 .bat）。
     lines = [
         "@echo off",
         "setlocal",
@@ -432,7 +439,10 @@ def _write_launcher(app_dir: Path, library_target: Path) -> None:
         f"if exist {LIBRARY_MARKER} (",
         f"  set /p WIKIUSB_LIBRARY=<{LIBRARY_MARKER}",
         ")",
-        "runtime\\python.exe app\\launcher.py %*",
+        "set PYTHONUTF8=1",
+        "set PYTHONIOENCODING=utf-8",
+        "set PYTHONDONTWRITEBYTECODE=1",
+        "start \"\" runtime\\pythonw.exe app\\launcher.py %*",
         "",
     ]
     (app_dir / LAUNCHER_NAME).write_text("\r\n".join(lines), encoding="utf-8")
@@ -567,12 +577,16 @@ def create_desktop_shortcut(app_target: Path,
         desktop = Path(desktop_dir) if desktop_dir else _desktop_dir()
         desktop.mkdir(parents=True, exist_ok=True)
         lnk = desktop / SHORTCUT_NAME
+        ico = Path(app_target) / "USB-WIKI.ico"
+        icon_line = ("$s.IconLocation=" + _psq(str(ico) + ",0") + ";") if ico.is_file() else ""
         ps = ("[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;"
               "$s=(New-Object -ComObject WScript.Shell).CreateShortcut("
               + _psq(lnk) + ");"
               "$s.TargetPath=" + _psq(target) + ";"
               "$s.WorkingDirectory=" + _psq(app_target) + ";"
-              "$s.Description='USB-WIKI';$s.Save()")
+              "$s.WindowStyle=7;"        # 最小化启动 → 减少批处理窗口闪现
+              + icon_line                # 自定义图标（金色书卷）
+              + "$s.Description='USB-WIKI';$s.Save()")
         r = subprocess.run(
             ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
             capture_output=True, timeout=60,

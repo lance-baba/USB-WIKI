@@ -184,14 +184,7 @@ function chatStateText(ai) {
   return (map[ai.state] || "尚未配置") + (ai.reason ? "：" + ai.reason : "");
 }
 
-function fillAppVersion(d) {
-  // 版本来自 /api/status（后端单一源 app/version.py），前端不自己硬编码
-  const el = document.getElementById('appVer');
-  if (el && d && d.app_version) el.textContent = 'v' + d.app_version;
-}
-
 function renderStats(d) {
-  fillAppVersion(d);
   if (!d || !d.ready) return;
   const emb = d.embedding || {}, ai = d.ai || {}, db = d.db || {}, syn = d.sync || {};
   const rows = [
