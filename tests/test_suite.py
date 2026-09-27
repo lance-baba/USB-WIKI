@@ -213,6 +213,52 @@ def test_index_and_search(ctx) -> None:
     check("bm25 排序不退化为全 0", res.references[0].score > 0)
 
 
+def test_genre_term_not_cited() -> None:
+    """回归：「主题词 + 体裁词」查询不得靠体裁词把无关文档拉进引用。
+
+    实机反例（用户报告）：问「儿女双全的新闻」→ Tier A/B 全空后下沉 Tier C 单召回，
+    单靠体裁词「新闻」就把《游本昌今日去世…_腾讯新闻》拉进了引用，与主题毫无关系。
+    修复：Tier C 阶段只要还存在更具体的实词，体裁词（含其语料扩展）整体不做召回锚点。
+    """
+    section("体裁词（新闻/报道…）不得成为独立召回锚点（引用精度回归）")
+    tmp = Path(tempfile.mkdtemp(prefix="usb-wiki-genre-"))
+    try:
+        d = db_mod.Database(tmp / "cache.db")
+        d.init_schema()
+        docs = {
+            # 主题文档：正文含「儿女双全」
+            "topic_child.md": (
+                "---\ntitle: 河南女子喜褥发现棉花小人\nstatus: success\n---\n\n"
+                "# 儿女双全的祝福\n\n高女士在喜褥里发现一对棉花小人，婆婆说是美好祝福，"
+                "寓意儿女双全。高女士说自己也确实儿女双全了。\n"
+            ),
+            # 无关新闻文档：仅靠体裁词「新闻」才可能被召回（正文含『腾讯新闻』）
+            "unrelated_news.md": (
+                "---\ntitle: 游本昌今日去世_腾讯新闻\nstatus: success\n---\n\n"
+                "# 游本昌今日去世，多位明星发文悼念_腾讯新闻\n\n"
+                "著名演员游本昌因病去世，多位明星发文悼念。\n"
+            ),
+        }
+        for name, body in docs.items():
+            parsed = chunker.parse(body, name)
+            indexer.index_parsed(d, parsed, len(body.encode("utf-8")), 0.0, None)
+
+        res = search.hybrid_search(d, None, "儿女双全的新闻", top_k_parents=5)
+        texts = " ".join(p["content"] for p in res.parents)
+        check("体裁词查询仍召回主题文档（不漏召）", "儿女双全" in texts,
+              " | ".join(p["title"] for p in res.parents))
+        check("无关新闻文档未被拉进引用（体裁词不做独立召回锚点）", "游本昌" not in texts,
+              " | ".join(p["title"] for p in res.parents))
+
+        # 对照：纯体裁词查询仍应可召回 —— 不得过度压制「就想搜『新闻』本身」的场景
+        res2 = search.hybrid_search(d, None, "新闻", top_k_parents=5)
+        texts2 = " ".join(p["content"] for p in res2.parents)
+        check("纯体裁词查询仍可召回（无过度压制）", "游本昌" in texts2,
+              " | ".join(p["title"] for p in res2.parents))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_crawler(ctx) -> None:
     section("摄入管道 / 降级判定")
     offline = os.environ.get("WIKIUSB_SKIP_NET") == "1"
@@ -4005,6 +4051,7 @@ def main() -> int:
         test_ingest_analysis(ctx)
         test_search_quality_guards(ctx)
         test_index_and_search(ctx)
+        test_genre_term_not_cited()
         test_gateway(ctx)
         test_crawler(ctx)
         test_archive_localization()

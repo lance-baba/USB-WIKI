@@ -96,6 +96,26 @@ _STOPWORDS = {
     "and", "or", "not", "no", "yes", "please", "tell", "show", "list",
 }
 
+#: 通用「体裁 / 载体」名词：它们只描述文档**是什么类型**（新闻 / 报道 / 视频…），
+#: 不指向任何具体主题。若把它们当作**独立召回锚点**，就会把「主题词 + 体裁词」型
+#: 查询里那些标题/来源恰好含该体裁词的**无关文档**整体拉进候选、进而进引用。
+#: 实测反例（用户实机报告）：「儿女双全的新闻」按虚词切成 ``[儿女双全, 新闻]`` 后，
+#: Tier A/B 全空、下沉到 Tier C 单召回 —— 单靠「新闻」就把《游本昌今日去世…
+#: _腾讯新闻》拉进了引用，与「儿女双全」毫无关系。
+#: 处理：**仅**在 Tier C 单召回阶段，当查询里还存在更具体的实词时，体裁词不独立召回
+#: （AND 层 A/B 仍保留全部词，故「某事故 报道」这类双词共现的查询不受影响）。
+#: 这是通用语言词表，不含任何项目内容。
+_GENRE_TERMS = frozenset({
+    "新闻", "报道", "报导", "消息", "资讯", "快讯", "简讯", "要闻", "头条",
+    "文章", "帖子", "博客", "视频", "图片", "图文",
+})
+
+
+def _is_genre_term(t: str) -> bool:
+    """是否为通用体裁/载体词（见 :data:`_GENRE_TERMS`）。"""
+    return (t or "").strip() in _GENRE_TERMS
+
+
 _CJK_RUN_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]+")
 
 # 问句的虚词几乎总是出现在两端（…吗 / …是什么 / …说了什么）。
@@ -1009,13 +1029,21 @@ def _tiered_recall(db: Database, scope: list[str], target: list[str],
     # 「观测点共有几个」这类 scope/target 分处不同分块的问题不漏召，但不会把
     # 顺带提及的干扰文档与真实答案混为一谈。
     if not ordered:
-        singles: list[str] = []
-        for t in (target or scope):
-            singles.append(t)
+        # 体裁词降级：查询里只要还有更具体的实词，体裁词就**整体**不做独立召回锚点
+        # （连同它可能扩展出的「腾讯新闻」这类更长词组一起跳过）—— 「主题词 + 体裁词」
+        # 型查询不能靠体裁词把无关新闻/文章拉进引用（见 _GENRE_TERMS）。
+        # 若候选**全部**是体裁词（用户就是想搜『新闻』本身），则不跳过，避免过度压制。
+        base_terms = list(target or scope)
+        has_specific = any(not _is_genre_term(t) for t in base_terms)
+        anchors: list[str] = []
+        for t in base_terms:
+            if has_specific and _is_genre_term(t):
+                continue
+            anchors.append(t)
             ext = expand_term_to_corpus(db, t)
             if ext and ext != t:
-                singles.append(ext)
-        for t in dict.fromkeys(singles):
+                anchors.append(ext)
+        for t in dict.fromkeys(anchors):
             ids, r = _lex_once(db, [t], limit, conj=True)
             absorb(ids, "C", r)
     return ordered, tier_of, (route or "like")
