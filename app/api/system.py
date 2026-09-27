@@ -27,7 +27,10 @@ def _rebuild_worker(h: "Handler", recreate_vec: bool = False) -> None:
 
 def handle_get(h: "Handler", path: str) -> bool:
     if path == "/api/status":
-        h._send_json({"code": 200, "data": h.ctx.status()})
+        # ?probe=1：绕过 60s 健康缓存现场重探（顶部「刷新」按钮专用）。
+        # 不带 probe 时 ai_readiness 也会在缓存过期后自动重探（TTL 门控）。
+        probe = h.query_flag("probe") == "1"
+        h._send_json({"code": 200, "data": h.ctx.status(probe=probe)})
         return True
     return False
 

@@ -237,11 +237,13 @@ class AppContext:
             return {"ok": False, "error": "上下文未初始化"}
         return indexer.rebuild_all(self.db, self.embedder, recreate_vec=recreate_vec)
 
-    def ai_readiness(self) -> dict:
-        """Level 3 对话能力就绪状态（**只读缓存**，不触发网络探测）。
+    def ai_readiness(self, probe: bool = False) -> dict:
+        """Level 3 对话能力就绪状态。
 
-        供 /api/status 与诊断复用；现场探测走 ``gateway.ai_readiness(probe=True)``
-        或 ``/api/ollama/models``（设置页用）。
+        ``probe=False``（默认）读网关缓存；网关侧会在缓存超过 HEALTH_TTL
+        过期时自动重探一次（TTL 门控，最多每 60s 发一次请求）——
+        这让「应用启动后才开启 Ollama」的场景能在 ≤60s 内自动转为在线。
+        ``probe=True`` 绕过缓存现场重探（/api/status?probe=1）。
         """
         if self.gateway is None:
             return {
@@ -252,7 +254,7 @@ class AppContext:
                 "cloud_api_configured": False,
             }
         try:
-            ready = self.gateway.ai_readiness()
+            ready = self.gateway.ai_readiness(probe=probe)
         except Exception as exc:  # noqa: BLE001 - 状态展示失败不得影响 /api/status
             log.debug("AI 就绪状态解析失败: %s", exc)
             return {
@@ -270,7 +272,7 @@ class AppContext:
             )
         }
 
-    def status(self) -> dict:
+    def status(self, probe: bool = False) -> dict:
         if self.db is None:
             return {"ready": False}
         stats = self.db.stats()
@@ -302,7 +304,7 @@ class AppContext:
                 "api_key_configured": bool(config.get_str("AI", "api_key", "")),
                 "resolved": gw_state.last_provider if gw_state else "",
                 "last_error": gw_state.last_error if gw_state else "",
-                **self.ai_readiness(),
+                **self.ai_readiness(probe=probe),
             },
             "sync": self.syncer.status() if self.syncer else {"running": False},
             "warnings": list(self.warnings),      # 需行动 → 顶部告警条

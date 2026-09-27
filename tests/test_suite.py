@@ -457,6 +457,64 @@ def test_wal_self_heal() -> None:
         Path(str(tmp) + s).unlink(missing_ok=True)
 
 
+def test_ai_readiness_ttl() -> None:
+    """AI 就绪缓存的 TTL 门控重探契约（Bug 修复回归：Ollama 后开不在线）。
+
+    此前 ai_readiness(probe=False) 只读缓存、从不重探 —— 应用启动时 Ollama
+    未开，之后无论开多久，状态面板/问答都永远「未在线」。修复后：
+    过期缓存自动重探一次（TTL 门控），新鲜缓存零网络，probe=True 强制重探。
+    """
+    section("AI 就绪 TTL 门控重探（Ollama 后开自愈）")
+    from app.core.llm import Gateway, STATE_READY
+
+    old_provider = config.get_str("AI", "provider", "auto")
+    old_model = config.get_str("AI", "ollama_chat_model", "")
+    real_probe = Gateway._probe_tags
+    calls = {"n": 0}
+
+    def fake_probe(self, timeout, host=None, update_cache=True):
+        calls["n"] += 1
+        if update_cache:
+            with self._lock:
+                self.state.ollama_healthy = True
+                self.state.ollama_checked_at = time.time()
+                self.state.ollama_detail = "在线，发现 1 个模型"
+                self.state.ollama_models = ["qwen-test:1b"]
+        return True, [{"name": "qwen-test:1b"}], "在线，发现 1 个模型"
+
+    Gateway._probe_tags = fake_probe  # type: ignore[assignment]
+    try:
+        config.update({"AI": {"provider": "ollama", "ollama_chat_model": "qwen-test:1b"}},
+                      persist=False)
+        gw = Gateway()
+
+        gw.state.ollama_checked_at = 0.0          # 模拟「启动时 Ollama 未开」的过期缓存
+        calls["n"] = 0
+        r = gw.ai_readiness(probe=False)
+        check("过期缓存 probe=False 自动重探一次", calls["n"] == 1, f"probe调用={calls['n']}")
+        check("重探后 state=ready（后开自愈）", r["state"] == STATE_READY, r["state"])
+
+        calls["n"] = 0
+        gw.ai_readiness(probe=False)
+        check("新鲜缓存 probe=False 零网络（高频轮询安全）", calls["n"] == 0,
+              f"probe调用={calls['n']}")
+
+        calls["n"] = 0
+        gw.ai_readiness(probe=True)
+        check("probe=True 强制重探一次", calls["n"] == 1, f"probe调用={calls['n']}")
+
+        # 问答路径：resolve_provider 读同一就绪状态，过期时必须同样自愈
+        gw2 = Gateway()
+        gw2.state.ollama_checked_at = 0.0
+        prov, _warns = gw2.resolve_provider()
+        check("resolve_provider 过期缓存自愈 → ollama（问答不再永久 offline）",
+              prov == "ollama", f"prov={prov}")
+    finally:
+        Gateway._probe_tags = real_probe          # type: ignore[assignment]
+        config.update({"AI": {"provider": old_provider, "ollama_chat_model": old_model}},
+                      persist=False)
+
+
 def test_graceful_shutdown_no_residue() -> None:
     section("TC-HARD-04 / 优雅退出无残留")
     tmp = paths.DATA_DIR / "_shutdown_probe.db"
@@ -3803,6 +3861,7 @@ def main() -> int:
         test_port_probe()
         test_signature_guard()
         test_wal_self_heal()
+        test_ai_readiness_ttl()
         test_graceful_shutdown_no_residue()
 
         reset_workspace()

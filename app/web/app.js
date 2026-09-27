@@ -217,9 +217,11 @@ function renderNotes(d) {
     '<div class="note-line">· ' + esc(n) + "</div>").join("");
 }
 
-async function pollStatus(loop) {
+async function pollStatus(loop, probe) {
   try {
-    const st = await api("/api/status");
+    // probe=true：让后端绕过 60s 健康缓存现场重探（顶部「刷新」按钮用）。
+    // 常规轮询不带 probe —— 后端会在缓存过期后自动重探（最多 60s 一次）。
+    const st = await api("/api/status" + (probe ? "?probe=1" : ""));
     applyStatus(st);
     if (loop) setTimeout(() => pollStatus(S.ready), S.ready ? 15000 : 900);
   } catch (e) {
@@ -906,7 +908,10 @@ async function openNoteItem(el, jump, nav, terms) {
     }
     // C：打开一篇笔记即清掉上一次引用的持久高亮（用户主动切换了上下文）
     _clearEvidenceHighlight();
-    NOTE.view = orig ? "original" : "rendered";
+    // 动态页降级（partial_fallback）的快照在沙箱里只会白屏（正文全靠脚本渲染），
+    // 默认进「阅读」视图才有内容；用户仍可手动点「网页快照」（有明确提示条）。
+    const isFallback = frontmatterValue(r.data.content, "status") === "partial_fallback";
+    NOTE.view = (orig && !isFallback) ? "original" : "rendered";
     setNoteView(NOTE.view);
 }
 
@@ -1314,8 +1319,16 @@ function setNoteView(view) {
         + '<span>剪藏页已禁用脚本，需登录/展开等交互时请用「下载原件」在浏览器打开</span></div>'
       : "";
 
+    // 动态页降级快照（partial_fallback）：正文完全靠前端脚本渲染，
+    // 沙箱（禁脚本——安全底线）里只会是一片空白。与其让用户对着白屏
+    // 以为「快照打不开」，不如把原因和出路一次说清楚。
+    const snapWarn = (isWeb && frontmatterValue(d.content, "status") === "partial_fallback")
+      ? '<div class="snap-warn">⚠️ 该网页由前端脚本动态渲染，安全沙箱内（已禁用脚本）无法显示其内容。' +
+        '请用上方「新标签打开快照」或「下载原件」在浏览器中查看完整快照；正文请回「阅读」视图。</div>'
+      : "";
+
     box.className = "doc-md doc-original";   // 让 #noteView 成为填满面板的 flex 列
-    box.innerHTML = meta + tools +
+    box.innerHTML = snapWarn + meta + tools +
       '<div class="frame-wrap fit"><iframe class="doc-frame" title="原版预览"></iframe></div>';
     const wrap = box.querySelector(".frame-wrap");
     const frame = wrap.querySelector("iframe");
@@ -1925,7 +1938,7 @@ $("#btnCfgReload").onclick = loadConfig;
 $("#btnCfgDefaults").onclick = applyConfigDefaults;
 $("#btnRebuild").onclick = () => rebuild(false);
 $("#btnRebuildVec").onclick = () => rebuild(true);
-$("#btnRefresh").onclick = async () => { await pollStatus(false); await loadNotes(); toast("状态已刷新"); };
+$("#btnRefresh").onclick = async () => { await pollStatus(false, true); await loadNotes(); toast("状态已刷新"); };
 
 $("#btnShutdown").onclick = async () => {
   if (!confirm("将执行 WAL 检查点并释放数据库锁，确保 U 盘可直接拔出。\n\n确定要安全退出吗？")) return;

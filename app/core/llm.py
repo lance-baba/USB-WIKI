@@ -350,12 +350,13 @@ class Gateway:
     def ai_readiness(self, *, probe: bool = False) -> dict:
         """统一的 AI 就绪状态 —— **不是** `ollama_healthy` 的别名。
 
-        `probe=False`（默认，供 /api/status 与诊断）**只读缓存、不发网络请求**：
-        status 在冒烟测试里被高频轮询，探测不能拖慢首屏。
-        `probe=True`（设置页 / 显式自测）现场刷新一次。
+        `probe=False`（默认，供 /api/status 与诊断）读缓存；**缓存超过
+        HEALTH_TTL 过期时会自动重探一次**（TTL 门控，最多每 60s 发一次请求）。
+        此前这里只读缓存、从不重探 —— Ollama 在应用启动后才开启时，
+        状态面板/问答会永远停在「未在线」，直到用户手动点「测试」。
+        `probe=True`（显式刷新 / ?probe=1）绕过缓存现场重探。
         """
-        if probe:
-            self.ollama_status(force=True)
+        self.ollama_status(force=probe)
         with self._lock:
             probed = self.state.ollama_checked_at > 0
             available = bool(probed and self.state.ollama_healthy)
