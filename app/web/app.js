@@ -687,7 +687,7 @@ function _popup(anchor, html) {
 
 function openNoteMenu(anchor, n, inTrash) {
   const items = inTrash
-    ? [["恢复", "restore", ""]]
+    ? [["恢复", "restore", ""], ["永久删除", "purge", "danger"]]
     : [["编辑标题", "title", ""], ["分类", "collections", ""], ["移入回收站", "trash", "danger"]];
   const wrap = _popup(anchor, '<div class="menu">' + items.map(([label, act, cls]) =>
     '<button data-act="' + act + '"' + (cls ? ' class="' + cls + '"' : "") + ">" + esc(label) + "</button>")
@@ -700,6 +700,7 @@ function openNoteMenu(anchor, n, inTrash) {
     else if (act === "collections") editNoteCollections(n);
     else if (act === "trash") trashNote(n);
     else if (act === "restore") restoreNote(n);
+    else if (act === "purge") purgeNote(n);
   });
 }
 
@@ -863,6 +864,53 @@ async function restoreNote(n) {
     collCache.trash = (collCache.trash || []).filter(x => x !== n.doc_id);
     renderCollectionFilter(); renderNoteList(); toast("已恢复");
   } else { toast(r.message || "操作失败", 3200); }
+}
+
+/* 永久删除 —— 回收站的最后一站，**不可逆**。
+ * 交互强度：明确警告的确认弹层（红字「此操作不可撤销」+ 取消/永久删除）。
+ * 删除范围：默认只删 Markdown 真相源与派生索引（索引可全量重建）；
+ *   「原件」（剪藏网页 / 导入的 Office / PDF）往往**无法再生**，
+ *   所以做成勾选框由用户当场决定 —— 不替用户销毁不可替代的数据。 */
+function purgeNote(n) {
+  const name = docDisplayTitle(n);
+  _modal("永久删除？",
+    '<div style="line-height:1.75">即将<b>永久删除</b>「' + esc(name) + '」<br>' +
+      '<span class="hint">' + esc(n.rel_path) + '</span><br><br>' +
+      '<span style="color:var(--danger);font-weight:600">此操作不可撤销</span>：' +
+      '笔记文件与其检索索引会被彻底清除，无法再从回收站恢复。</div>' +
+    '<label class="row" style="margin-top:12px;gap:7px;align-items:flex-start;' +
+      'font-size:12.5px;line-height:1.55;cursor:pointer">' +
+      '<input type="checkbox" id="_purgeOrig" style="margin-top:3px">' +
+      '<span>同时删除它的<b>原件文件</b>（剪藏网页 / 导入的 Office、PDF 等）<br>' +
+      '<span class="hint">默认不勾选 —— 原件往往无法再生；该笔记若无原件，勾选也无影响。</span>' +
+      '</span></label>' +
+    '<div class="row" style="margin-top:14px;justify-content:flex-end">' +
+      '<button class="btn" data-cancel>取消</button>' +
+      '<button class="btn danger" data-ok>永久删除</button></div>',
+    (root, close) => {
+      root.querySelector("[data-cancel]").onclick = close;
+      root.querySelector("[data-ok]").onclick = async () => {
+        const also = !!root.querySelector("#_purgeOrig").checked;
+        const r = await api("/api/notes/purge", {
+          method: "POST",
+          body: JSON.stringify({ doc_id: n.doc_id, delete_originals: also })
+        });
+        if (r.code !== 200) { toast(r.message || "删除失败", 3200); return; }
+        collCache.trash = (collCache.trash || []).filter(x => x !== n.doc_id);
+        delete collCache.membership[n.doc_id];
+        delete collCache.display_titles[n.doc_id];
+        noteCache = noteCache.filter(x => x.doc_id !== n.doc_id);
+        close();
+        renderCollectionFilter(); renderNoteList();
+        // 删掉的正好是当前打开的那篇 → 清掉面板，避免留下「已删除内容」的残影
+        if (NOTE && NOTE.path === n.rel_path) {
+          NOTE.payload = null;
+          $("#noteTitleBar").textContent = "";
+          $("#noteView").innerHTML = '<span class="empty">该笔记已被永久删除。</span>';
+        }
+        toast("已永久删除");
+      };
+    });
 }
 
 /* 打开一条笔记（列表项已渲染时使用）。抽成具名函数，供问答引用跳转复用。
@@ -1305,11 +1353,16 @@ function setNoteView(view) {
     const visit = (isWeb && /^https?:\/\//i.test(srcUrl))
       ? '　<a href="' + esc(srcUrl) + '" target="_blank" rel="noopener noreferrer">访问原网页</a>'
       : "";
+    const isPdf = orig.ext === ".pdf";
+    // Office 原件（docx/xlsx）：浏览器不认这类格式，必须由服务端转成 HTML 再预览
+    const isOffice = /^\.(docx|docm|dotx|dotm|xlsx|xlsm|xltx)$/.test(orig.ext);
     const meta = '<div class="doc-meta">' + labels.original + "：" + esc(orig.name) +
       "（" + fmtSize(orig.size) + "）" + visit +
+      (isOffice
+        ? '<span class="hint">　预览由服务端转换生成，保留表格与结构，不还原原始排版</span>'
+        : "") +
       '　<a href="' + url + '" target="_blank" rel="noopener noreferrer">' + openLabel + "</a>" +
       '　<a href="' + url + '?download=1" download>下载原件</a></div>';
-    const isPdf = orig.ext === ".pdf";
 
     // 剪藏页加宽度切换；PDF 用浏览器自带查看器（自带缩放），无需切换
     const tools = isWeb
@@ -1351,6 +1404,15 @@ function setNoteView(view) {
       frame.src = url;
     } else if (/^\.(png|jpe?g|gif|webp|bmp|svg)$/.test(orig.ext)) {
       wrap.outerHTML = '<img src="' + url + '" alt="' + esc(orig.name) + '" style="max-width:100%;border-radius:9px">';
+      return;
+    } else if (isOffice) {
+      // Office 原件预览：服务端转 HTML（?as=html），沿用与剪藏快照同一条安全底线
+      // —— sandbox="" 禁脚本 + 禁 referrer。产物本身也不含任何 script。
+      frame.setAttribute("sandbox", "");
+      frame.setAttribute("referrerpolicy", "no-referrer");
+      frame.style.width = "100%";
+      frame.style.height = "100%";
+      frame.src = url + "&as=html";
       return;
     } else {
       wrap.outerHTML = '<div class="doc-dl">该格式无法内嵌预览。<br><br>' +

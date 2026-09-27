@@ -12,15 +12,19 @@
 from __future__ import annotations
 
 import base64
+import io
 import json
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
 import tempfile
 import sys
 import time
+import zipfile
 from pathlib import Path
+from urllib.parse import quote
 
 
 # ⚠ Windows 上 stdout 被重定向（CI 管道）时，Python 用系统代码页编码输出：
@@ -257,6 +261,238 @@ def test_genre_term_not_cited() -> None:
               " | ".join(p["title"] for p in res2.parents))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _synthetic_docx() -> bytes:
+    """最小 docx（一段正文 + 一张 2x2 表），供 Office 预览测试用。"""
+    doc = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        "<w:body>"
+        '<w:p><w:r><w:t>工程概况</w:t></w:r></w:p>'
+        '<w:p><w:r><w:t>本工程位于镇海区。</w:t></w:r></w:p>'
+        "<w:tbl>"
+        '<w:tr><w:tc><w:p><w:r><w:t>设备</w:t></w:r></w:p></w:tc>'
+        '<w:tc><w:p><w:r><w:t>型号</w:t></w:r></w:p></w:tc></w:tr>'
+        '<w:tr><w:tc><w:p><w:r><w:t>水准仪</w:t></w:r></w:p></w:tc>'
+        '<w:tc><w:p><w:r><w:t>DINI03</w:t></w:r></w:p></w:tc></w:tr>'
+        "</w:tbl>"
+        "</w:body></w:document>"
+    )
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("[Content_Types].xml",
+                   '<?xml version="1.0" encoding="UTF-8"?><Types '
+                   'xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>')
+        z.writestr("word/document.xml", doc)
+    return buf.getvalue()
+
+
+def _synthetic_xlsx() -> bytes:
+    """最小 xlsx（一个 sheet、表头 + 一行数据），供 Office 预览测试用。"""
+    ns = 'xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"'
+    sheet = ('<?xml version="1.0" encoding="UTF-8"?><worksheet ' + ns + "><sheetData>"
+             '<row r="1"><c r="A1" t="inlineStr"><is><t>姓名</t></is></c>'
+             '<c r="B1" t="inlineStr"><is><t>型号</t></is></c></row>'
+             '<row r="2"><c r="A2" t="inlineStr"><is><t>张三</t></is></c>'
+             '<c r="B2" t="inlineStr"><is><t>DINI03</t></is></c></row>'
+             "</sheetData></worksheet>")
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("[Content_Types].xml",
+                   '<?xml version="1.0" encoding="UTF-8"?><Types '
+                   'xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>')
+        z.writestr("xl/workbook.xml", '<?xml version="1.0" encoding="UTF-8"?><workbook ' + ns + ">")
+        z.writestr("xl/worksheets/sheet1.xml", sheet)
+    return buf.getvalue()
+
+
+def test_office_preview(ctx) -> None:
+    """Office 原件预览：docx/xlsx → 无脚本 HTML。
+
+    守三条：① 表格/正文真的转出来了；② 产物**零 script、零外部资源**；
+    ③ 文档里的 HTML 被转义（不可信输入不能变成可执行内容）。
+    """
+    section("Office 原件预览（docx/xlsx → 无脚本 HTML）")
+    from app.core import office_preview as op
+
+    check("supported 认 docx/xlsx、不认 pdf",
+          op.supported(".docx") and op.supported(".xlsx") and not op.supported(".pdf"),
+          str(sorted(op.SUPPORTED_EXTS)))
+
+    for label, data, name, needles in (
+        ("docx", _synthetic_docx(), "预览测试.docx", ["工程概况", "DINI03"]),
+        ("xlsx", _synthetic_xlsx(), "预览测试.xlsx", ["张三", "DINI03"]),
+    ):
+        try:
+            html = op.to_html(data, name)
+        except Exception as exc:  # noqa: BLE001
+            check(f"{label} 生成预览", False, f"{type(exc).__name__}: {exc}")
+            continue
+        check(f"{label} 生成预览", bool(html.strip()), "空 HTML")
+        check(f"{label} 表格被渲染成 <table>", "<table>" in html and "<th>" in html,
+              html[:120])
+        check(f"{label} 正文内容保留", all(x in html for x in needles), str(needles))
+        check(f"{label} 产物零 <script>", "<script" not in html.lower())
+        check(f"{label} 产物零外部资源", "http://" not in html and "https://" not in html)
+
+    # 不可信输入必须被转义 —— 文档里写 <script> 只能变成可见文本
+    body, _nav = op._render_md("# <script>alert(1)</script>\n\n<img src=x onerror=alert(2)>\n\n"
+                               "| <b>粗</b> | x |\n| --- | --- |\n| <script> | y |\n")
+    allow = {"p", "ul", "ol", "li", "table", "thead", "tbody", "tr", "th", "td",
+             "strong", "code", "pre", "blockquote", "h1", "h2", "h3", "h4", "h5", "h6"}
+    tags = set(re.findall(r"<([a-zA-Z][a-zA-Z0-9]*)", body))
+    check("转义：输出仅白名单标签", tags <= allow, str(sorted(tags - allow)))
+    check("转义：<script> 退化为可见文本", "<script" not in body and "&lt;script&gt;" in body)
+    check("转义：事件属性不可执行", "onerror=" not in body.split("&lt;")[0])
+
+    # 坏输入要如实失败，而不是产出一段空 HTML 假装成功
+    for bad, desc in ((b"", "空文件"), (b"not a zip at all", "非 Office 文件")):
+        try:
+            op.to_html(bad, "坏文件.docx")
+            check(f"坏输入如实失败（{desc}）", False, "未抛异常")
+        except ValueError:
+            check(f"坏输入如实失败（{desc}）", True)
+        except Exception as exc:  # noqa: BLE001
+            check(f"坏输入如实失败（{desc}）", False, f"{type(exc).__name__}: {exc}")
+
+    # ---------- 端到端：真起服务发一次 HTTP，确认端点接线没问题 ----------
+    # 上面测的是模块；而「端点挂错路由 / 参数名写错」这类事故只有真发请求才挡得住
+    # （同类事故：/api/capture/duplicate 被误插进 POST 路由，GET 预检从未工作过）。
+    import http.client
+    import threading as _th
+    import time as _t
+    from app.server import Server
+
+    stem = "office_e2e_demo"
+    note_p = paths.NOTES_DIR / f"{stem}.md"
+    orig_p = paths.ORIGINALS_DIR / f"{stem}.xlsx"
+    pre_existing = {f.name for f in paths.NOTES_DIR.glob("*.md")}
+    try:
+        note_p.write_text(f"---\ntitle: {stem}\n---\n\n# {stem}\n\n端到端预览测试。\n",
+                          encoding="utf-8")
+        orig_p.write_bytes(_synthetic_xlsx())
+        rel = paths.rel_to_data(note_p)
+
+        srv = Server(("127.0.0.1", 0), ctx, allow_lan=False)
+        port = srv.server_address[1]
+        _th.Thread(target=srv.serve_forever, daemon=True).start()
+        _t.sleep(0.4)
+        try:
+            c = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+            c.request("GET", "/api/notes/original?path=" + quote(rel, safe="") + "&as=html",
+                      headers={"Host": f"127.0.0.1:{port}"})
+            resp = c.getresponse()
+            body = resp.read().decode("utf-8", "replace")
+            ctype = resp.getheader("Content-Type") or ""
+            code = resp.status
+            c.close()
+            check("★ GET /api/notes/original?as=html 真实可用", code == 200, f"HTTP {code}")
+            check("  返回 text/html", "text/html" in ctype, ctype)
+            check("  响应体是真 HTML 表格页", "<table>" in body and "<!DOCTYPE html>" in body,
+                  body[:120])
+        finally:
+            srv.shutdown()
+            srv.server_close()
+    finally:
+        for f in (note_p, orig_p):
+            if f.exists():
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
+        for _f in paths.NOTES_DIR.glob("*.md"):
+            if _f.name not in pre_existing and _f.name.startswith("office_e2e"):
+                try:
+                    _f.unlink()
+                except OSError:
+                    pass
+
+
+def test_trash_purge(ctx) -> None:
+    """回收站「永久删除」契约（不可逆动作，边界必须钉死）。
+
+    * 默认只删 Markdown 真相源 + 派生索引；**原件必须显式勾选才删**
+      —— 原件往往无法再生，不能替用户销毁。
+    * Collections 痕迹（trash / membership / display_titles）一次抹净，
+      否则同名文件重新导入时旧类目会「诈尸」。
+    * 越权路径一律拒绝，绝不删到 Library 之外。
+    """
+    section("回收站永久删除（不可逆 / 原件须勾选 / 越权拦截）")
+    from app.core import collections as C
+    from app.api import collections as api_coll
+
+    class _H:
+        """最小 Handler 替身：purge_note 只用到 ctx.db / _read_json / _send_json。"""
+
+        def __init__(self, body: dict):
+            self.ctx = type("Ctx", (), {"db": ctx.db})()
+            self._body = body
+            self.resp: tuple | None = None
+
+        def _read_json(self) -> dict:
+            return self._body
+
+        def _send_json(self, payload, status: int = 200) -> None:
+            self.resp = (payload, status)
+
+    db = ctx.db
+    store = C.store_path()
+    if store.exists():
+        store.unlink()
+
+    def _mk(stem: str, body: str) -> tuple:
+        rel = f"notes/{stem}.md"
+        p = paths.NOTES_DIR / f"{stem}.md"
+        p.write_text(f"---\ntitle: {stem}\n---\n\n# {stem}\n\n{body}\n", encoding="utf-8")
+        indexer.index_file(db, p, ctx.embedder)
+        return rel, chunker.doc_id_for(rel), p
+
+    # ---------- Case A：默认删除（原件必须活下来）----------
+    rel_a, did_a, p_a = _mk("purge_demo_a", "默认删除用例：原件应保留。")
+    orig_a = paths.ORIGINALS_DIR / "purge_demo_a.pdf"
+    orig_a.write_bytes(b"%PDF-1.4 fake original")
+    cid = C.create_collection("待清理类目")["id"]
+    C.assign(did_a, [cid])
+    C.set_display_title(did_a, "自定义标题")
+    C.trash_doc(did_a)
+
+    h = _H({"doc_id": did_a})
+    api_coll.handle_post(h, "/api/notes/purge")
+    ok = bool(h.resp and h.resp[0].get("code") == 200)
+    check("路由命中 /api/notes/purge", ok, str(h.resp))
+    check("Markdown 真相源已删除", not p_a.exists(), str(p_a))
+    check("派生索引已清除",
+          db.query_one("SELECT doc_id FROM documents WHERE doc_id = ?", (did_a,)) is None)
+    check("原件默认**不**删（Pilot 不销毁不可替代数据）", orig_a.exists(), str(orig_a))
+    st = C.load_store()
+    check("Collections 痕迹抹净（trash/membership/标题）",
+          did_a not in st["trash"] and did_a not in st["membership"]
+          and did_a not in st["display_titles"], str(st))
+
+    # ---------- Case B：显式勾选才删原件 ----------
+    rel_b, did_b, p_b = _mk("purge_demo_b", "勾选删除用例：原件应一并删除。")
+    orig_b = paths.ORIGINALS_DIR / "purge_demo_b.pdf"
+    orig_b.write_bytes(b"%PDF-1.4 fake original")
+    h2 = _H({"doc_id": did_b, "delete_originals": True})
+    api_coll.handle_post(h2, "/api/notes/purge")
+    check("勾选后原件被删除", not orig_b.exists() and not p_b.exists(),
+          f"orig={orig_b.exists()} md={p_b.exists()}")
+
+    # ---------- Case C：越权路径必须被拒绝 ----------
+    rel_c, did_c, p_c = _mk("purge_demo_c", "越权用例。")
+    h3 = _H({"path": "../config.ini"})
+    api_coll.handle_post(h3, "/api/notes/purge")
+    check("越权路径被拒绝（400，不删 Library 之外的文件）",
+          bool(h3.resp and h3.resp[1] == 400), str(h3.resp))
+    check("越权用例未误删任何笔记", p_c.exists())
+
+    # 现场还原：清掉本次用例残留，避免影响后续 section
+    for leftover in (orig_a, p_c, paths.ORIGINALS_DIR / "purge_demo_c.pdf"):
+        if leftover.exists():
+            leftover.unlink()
+    if store.exists():
+        store.unlink()
 
 
 def test_crawler(ctx) -> None:
@@ -4052,6 +4288,8 @@ def main() -> int:
         test_search_quality_guards(ctx)
         test_index_and_search(ctx)
         test_genre_term_not_cited()
+        test_office_preview(ctx)
+        test_trash_purge(ctx)
         test_gateway(ctx)
         test_crawler(ctx)
         test_archive_localization()

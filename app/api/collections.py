@@ -9,6 +9,9 @@
   POST /api/notes/display_title    改显示标题      {doc_id|path, title}
   POST /api/notes/trash            移入回收站      {doc_id|path}
   POST /api/notes/restore          从回收站恢复    {doc_id|path}
+  POST /api/notes/purge            永久删除        {doc_id|path, delete_originals?:bool}
+                                                  —— 不可逆；默认只删 Markdown + 索引，
+                                                     原件须显式勾选才删
 
 Collections 只做组织 / 浏览，**完全不影响**检索与问答（默认全局）。
 只处理业务，响应统一走 Handler 的 response 原语（与 library.py 同约定）。
@@ -19,6 +22,7 @@ from typing import TYPE_CHECKING
 
 from ..core import chunker
 from ..core import collections as collections_mod
+from ..core import crawler, indexer, paths
 
 if TYPE_CHECKING:
     from ..server import Handler
@@ -120,6 +124,74 @@ def trash_note(h: "Handler") -> None:
         _fail(h, exc)
 
 
+def purge_note(h: "Handler") -> None:
+    """永久删除笔记（**不可逆**）—— 回收站的最后一站。
+
+    分两级 capabilities，避免替用户销毁无法再生的数据：
+      * 默认删 **Markdown 真相源 + 派生索引**（索引可全量重建，删除不会丢积木）；
+      * 原件（ originals/ ）**只在调用方显式勾 delete_originals 时**才删。
+
+    为什么原件要显式勾选：既有政策是「孤儿原件只报告、不自动删」
+    （``crawler.find_orphan_originals`` 只列清单）。永久删除是 UI 上的不可逆动作，
+    要不要连原件一起销毁必须让用户当场拍板。
+    """
+    body = h._read_json()
+    try:
+        did = _doc_id(body)
+        if not did:
+            raise ValueError("缺少 doc_id 或 path")
+        also_originals = bool(body.get("delete_originals"))
+
+        # rel_path 优先用请求里给的；没有再回查索引（前端往往只带 doc_id）
+        rel = str(body.get("path") or "").strip()
+        if not rel:
+            row = h.ctx.db.query_one(
+                "SELECT rel_path FROM documents WHERE doc_id = ?", (did,))
+            rel = str(row["rel_path"]) if row else ""
+        if not rel:
+            raise ValueError("找不到该文档的笔记路径（可能已被清理）")
+
+        # ⚠ rel 是**相对 DATA_DIR** 的路径（形如 notes/xxx.md，见 paths.rel_to_data），
+        #   回绝对路径必须用 DATA_DIR 拼 —— 拿 NOTES_DIR 拼会变成 notes/notes/xxx.md，
+        #   结果文件根本没删、索引却清了（真机踩过）。
+        # 安全底线：解析后必须仍在 notes 目录下（防 ../ 越权删本机任意文件）
+        note = (paths.DATA_DIR / rel).resolve()
+        try:
+            note.relative_to(paths.NOTES_DIR.resolve())
+        except ValueError:
+            raise ValueError("越权访问被拒绝")
+
+        note_bytes = 0
+        if note.is_file():
+            note_bytes = note.stat().st_size
+            note.unlink()
+
+        purged_chunks = indexer.purge_by_rel_path(h.ctx.db, rel)
+
+        orig_removed = 0
+        orig_bytes = 0
+        if also_originals:
+            orig = crawler.find_original(rel)
+            if orig is not None and orig.is_file():
+                try:
+                    orig.resolve().relative_to(paths.ORIGINALS_DIR.resolve())
+                except ValueError:
+                    raise ValueError("原件路径越权访问被拒绝")
+                orig_bytes = orig.stat().st_size
+                orig.unlink()
+                orig_removed = 1
+
+        collections_mod.purge_doc(did)      # membership / display_titles / trash 一次抹净
+        h._send_json({"code": 200, "message": "已永久删除",
+                      "data": {"doc_id": did, "rel_path": rel,
+                               "note_bytes": note_bytes,
+                               "purged_chunks": purged_chunks,
+                               "originals_removed": orig_removed,
+                               "original_bytes": orig_bytes}})
+    except Exception as exc:  # noqa: BLE001
+        _fail(h, exc)
+
+
 def restore_note(h: "Handler") -> None:
     body = h._read_json()
     try:
@@ -160,5 +232,8 @@ def handle_post(h: "Handler", path: str) -> bool:
         return True
     if path == "/api/notes/restore":
         restore_note(h)
+        return True
+    if path == "/api/notes/purge":
+        purge_note(h)
         return True
     return False

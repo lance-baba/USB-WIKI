@@ -15,7 +15,8 @@ import base64
 import mimetypes
 from typing import TYPE_CHECKING
 
-from ..core import archiver, converters, crawler, paths, search as search_mod
+from ..core import (archiver, converters, crawler, office_preview, paths,
+                    search as search_mod)
 
 if TYPE_CHECKING:
     from ..server import Handler
@@ -100,6 +101,20 @@ def note_original(h: "Handler", rel: str) -> None:
         return
 
     ext = orig.suffix.lower()
+
+    # Office 原件预览（?as=html）：服务端把 docx/xlsx 转成**无脚本 HTML**，
+    # 交给前端既有的 sandbox iframe 渲染。走这条路而不是「浏览器直接打开 Office」，
+    # 因为浏览器根本不认 .docx/.xlsx；也不是「下载后再看」，因为用户要的是就地预览。
+    if h.query_flag("as") == "html" and office_preview.supported(ext):
+        try:
+            payload = office_preview.to_html(orig.read_bytes(), orig.name)
+        except (OSError, ValueError) as exc:
+            # 降级：预览生成不了就如实说，绝不留白屏给猜
+            h._send_json({"code": 400, "message": f"无法生成预览：{exc}"}, 400)
+            return
+        h._send_bytes(payload.encode("utf-8"), "text/html; charset=utf-8")
+        return
+
     ctype = h.INLINE_TYPES.get(ext) or mimetypes.guess_type(str(orig))[0] \
         or "application/octet-stream"
     if ctype.startswith("text/"):

@@ -229,5 +229,21 @@ def restore_doc(doc_id: str) -> None:
     save_store(data)
 
 
+def purge_doc(doc_id: str) -> None:
+    """彻底抹掉一个文档在 Collections 里的**全部痕迹**（回收站的最后一站）。
+
+    与 :func:`restore_doc` 的区别：这里是给「笔记文件已被物理删除」之后用的。
+    若只移除 trash 而留下 membership / display_titles，一旦用户把同名文件重新
+    导入，旧的类目归属与自定义标题会「诈尸」挂到新文档上 —— 必须一次性抹干净。
+    """
+    if not doc_id:
+        raise ValueError("缺少 doc_id")
+    data = load_store()
+    data["trash"] = [x for x in data["trash"] if x != doc_id]
+    data["membership"].pop(doc_id, None)
+    data["display_titles"].pop(doc_id, None)
+    save_store(data)
+
+
 def is_trashed(doc_id: str) -> bool:
     return doc_id in load_store()["trash"]
