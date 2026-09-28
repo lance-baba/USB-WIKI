@@ -370,8 +370,18 @@ def find_by_normalized_url(db: Database, url: str) -> dict | None:
 def rebuild_all(db: Database, embedder=None, recreate_vec: bool = False) -> dict:
     """全量重建：清空索引 -> 扫描 notes -> 逐文件重建（可重建向量表维度）。"""
     started = time.time()
-    if recreate_vec and embedder is not None:
-        db.recreate_vec_table(getattr(embedder, "dim", db.embedding_dim))
+    # 维度/模型签名不匹配时，必须重建向量表（旧维度下的向量已不可用），
+    # 否则「全量重建索引」只会清空行、却写不进新维度向量、也不解除召回阻断 ——
+    # 表现就是「点了全量重建索引，上面的提示也不消失」。
+    new_dim = getattr(embedder, "dim", None) if embedder is not None else None
+    need_recreate = recreate_vec or (
+        embedder is not None and bool(getattr(db, "signature_mismatch", None))
+    )
+    if need_recreate and new_dim is not None:
+        db.recreate_vec_table(new_dim, embedder=embedder)
+    elif recreate_vec and new_dim is None:
+        # 显式要求重建向量表但无嵌入源：只重建表结构，不写签名（降级由上层处理）
+        db.recreate_vec_table(db.embedding_dim)
 
     # 全清
     conn = db.conn()

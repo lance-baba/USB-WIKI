@@ -495,6 +495,145 @@ def test_trash_purge(ctx) -> None:
         store.unlink()
 
 
+def test_ollama_capabilities() -> None:
+    """模型能力感知：嵌入模型不能被当成对话模型（防 HTTP 400）。
+
+    实机事故：用户在「本地对话模型」里选了 bge-m3（只有 embedding 能力），
+    保存成功、状态还显示"就绪"，一提问才撞 Ollama 400 "does not support chat"。
+    现在按 `/api/tags` 的 capabilities 判定；旧版 Ollama 无标签时保持向后兼容。
+    """
+    section("模型能力感知（嵌入模型不得被当对话模型）")
+    from app.core import llm as llm_mod
+    from app.core.llm import Gateway
+
+    old_model = config.get_str("AI", "ollama_chat_model", "")
+    old_provider = config.get_str("AI", "provider", "auto")
+
+    # _parse_tags 必须把 capabilities 带出来
+    tags = json.dumps({"models": [
+        {"name": "bge-m3:latest", "size": 1, "details": {"family": "bert"},
+         "capabilities": ["embedding"]},
+        {"name": "qwen2.5:7b-instruct", "size": 2, "details": {},
+         "capabilities": ["completion", "tools"]},
+        {"name": "legacy:1b", "size": 3, "details": {}},   # 旧版无 capabilities
+    ]}).encode("utf-8")
+    models, ok = llm_mod._parse_tags(tags)
+    by = {m["name"]: m for m in models}
+    check("_parse_tags 解析 capabilities", ok and by["bge-m3:latest"]["capabilities"] == ["embedding"],
+          str(by.get("bge-m3:latest")))
+    check("缺 capabilities 时为 []（向后兼容）", by["legacy:1b"]["capabilities"] == [])
+
+    # 宽松 tag 匹配：写 bge-m3 应命中 bge-m3:latest
+    meta = models
+    check("_caps_of 宽松 tag 匹配（bge-m3 → bge-m3:latest）",
+          llm_mod._caps_of("bge-m3", meta) == ["embedding"])
+    check("_caps_of 未装模型返回 []", llm_mod._caps_of("nope:1b", meta) == [])
+
+    def _seed(gw, chat_model):
+        with gw._lock:
+            gw.state.ollama_healthy = True
+            gw.state.ollama_checked_at = time.time()     # 新鲜缓存 → 不触网
+            gw.state.ollama_detail = "在线，发现 3 个模型"
+            gw.state.ollama_models = [m["name"] for m in models]
+            gw.state.ollama_models_meta = list(models)
+        config.update({"AI": {"provider": "ollama", "ollama_chat_model": chat_model}},
+                      persist=False)
+
+    try:
+        gw = Gateway()
+        _seed(gw, "bge-m3:latest")
+        r = gw.ai_readiness(probe=False)
+        check("选嵌入模型 → state=model_not_chat",
+              r["state"] == llm_mod.STATE_MODEL_NOT_CHAT, r["state"])
+        check("选嵌入模型 → chat_ready 必须为 False（这才是 400 的根因）",
+              r["chat_ready"] is False)
+        check("原因里点名模型", "bge-m3" in r["reason"], r["reason"])
+        prov, _w = gw.resolve_provider()
+        check("选嵌入模型 → 不解析为 ollama（从源头挡住 400）", prov != "ollama", prov)
+
+        _seed(gw, "qwen2.5:7b-instruct")
+        r2 = gw.ai_readiness(probe=False)
+        check("选对话模型 → ready 且 chat_ready", r2["state"] == llm_mod.STATE_READY
+              and r2["chat_ready"] is True, r2["state"])
+
+        # 旧版 Ollama 不给能力标签 → 不得因「拿不到标签」而误判不可用
+        gw_old = Gateway()
+        with gw_old._lock:
+            gw_old.state.ollama_healthy = True
+            gw_old.state.ollama_checked_at = time.time()
+            gw_old.state.ollama_detail = "在线"
+            gw_old.state.ollama_models = ["legacy:1b"]
+            gw_old.state.ollama_models_meta = [{"name": "legacy:1b", "capabilities": []}]
+        config.update({"AI": {"provider": "ollama", "ollama_chat_model": "legacy:1b"}},
+                      persist=False)
+        r3 = gw_old.ai_readiness(probe=False)
+        check("无能力标签时向后兼容（不误判不可用）",
+              r3["state"] == llm_mod.STATE_READY and r3["chat_ready"] is True, r3["state"])
+    finally:
+        config.update({"AI": {"ollama_chat_model": old_model, "provider": old_provider}},
+                      persist=False)
+
+
+def test_ollama_autostart() -> None:
+    """Ollama 静默自启动：找不到 / 未启用 / 已在跑 都要如实返回，绝不抛异常。
+
+    产品把本地 AI 全押在 Ollama 上，但 Ollama 默认不是开机自启服务 ——
+    自启动让用户不必先手动开 Ollama。这里用替身把四条分支都钉死（不起真进程）。
+    """
+    section("Ollama 静默自启动（不阻塞 / 不抛异常 / 四条分支）")
+    from app.core import ollama_runtime as R
+
+    real_reachable = R.reachable
+    real_find = R.find_ollama_exe
+    real_spawn = R._spawn_serve
+    host = "http://127.0.0.1:11434"
+
+    try:
+        # 1) 已在运行 → already=True，什么都不做
+        R.reachable = lambda h, timeout=2.0: True          # type: ignore[assignment]
+        out = R.ensure_running(host)
+        check("已在运行 → already=True 且未启动新进程",
+              out["already"] is True and out["started"] is False, str(out))
+
+        # 2) 未启用 → 明确说「未启用自动启动」，不尝试拉起
+        R.reachable = lambda h, timeout=2.0: False         # type: ignore[assignment]
+        out = R.ensure_running(host, enabled=False)
+        check("未启用 → reason 明示且不启动",
+              out["enabled"] is False and out["started"] is False
+              and "未启用" in out["reason"], str(out))
+
+        # 3) 启用但找不到 ollama → 如实报「未找到」，不抛异常
+        R.find_ollama_exe = lambda: None                    # type: ignore[assignment]
+        out = R.ensure_running(host, enabled=True)
+        check("找不到 ollama → 如实返回未找到（不抛）",
+              out["started"] is False and "未找到" in out["reason"], str(out))
+
+        # 4) 启用且能拉起 → started=True（用替身模拟「起完就可达」）
+        from pathlib import Path as _P
+        R.find_ollama_exe = lambda: _P("C:/fake/ollama.exe")   # type: ignore[assignment]
+        R._spawn_serve = lambda exe: None                      # type: ignore[assignment]
+        state = {"n": 0}
+
+        def _flip(h, timeout=2.0):
+            state["n"] += 1
+            return state["n"] > 1                              # 第一次不可达，之后可达
+
+        R.reachable = _flip                                  # type: ignore[assignment]
+        out = R.ensure_running(host, enabled=True, wait_s=5.0)
+        check("能拉起 → started=True 并记录等待时长",
+              out["started"] is True and out["waited_s"] >= 0, str(out))
+
+        # 5) 拉起后始终不可达 → 有界返回（绝不无限等），原因可读
+        R.reachable = lambda h, timeout=2.0: False            # type: ignore[assignment]
+        out = R.ensure_running(host, enabled=True, wait_s=1.0)
+        check("拉起后始终不可达 → 有界返回并说明原因（不无限等）",
+              out["started"] is False and "仍不可达" in out["reason"], str(out))
+    finally:
+        R.reachable = real_reachable        # type: ignore[assignment]
+        R.find_ollama_exe = real_find       # type: ignore[assignment]
+        R._spawn_serve = real_spawn         # type: ignore[assignment]
+
+
 def test_crawler(ctx) -> None:
     section("摄入管道 / 降级判定")
     offline = os.environ.get("WIKIUSB_SKIP_NET") == "1"
@@ -838,6 +977,71 @@ def test_signature_guard() -> None:
     d.checkpoint_and_close()
     for s in ("", "-wal", "-shm"):
         Path(str(tmp) + s).unlink(missing_ok=True)
+
+
+def test_rebuild_clears_dimension_mismatch() -> None:
+    """回归：库内是 Ollama@768，切到本地 512 维 ONNX 后，点「全量重建索引」
+    （recreate_vec=False）必须解除召回阻断并把签名守卫对齐到 512 —— 否则提示永不消失。
+
+    对应真实反馈：「嵌入模型维度已变更（768 → 512）…需点击全量重建索引」，
+    点了全量重建索引后上面的提示也不消失。根因：旧实现只清空向量行、不重建向量表、
+    也不更新签名元数据，重启后又会重新报维度变更。
+    """
+    section("全量重建索引解除维度变更阻断")
+    import json as _json
+    import shutil
+    import tempfile
+    from pathlib import Path as _P
+
+    tmpdir = _P(tempfile.mkdtemp(prefix="usbwiki_sig_"))
+    try:
+        d = db_mod.Database(db_path=tmpdir / "cache.db", embedding_dim=768)
+        d.init_schema()
+        # 模拟旧库：签名守卫记录的是 Ollama nomic-embed-text@768
+        d.set_signature("ollama", "nomic-embed-text:latest", 768)
+        # 启动阶段会据此置 mismatch（与 context.py:146 同口径）
+        d.signature_mismatch = d.check_signature(
+            "local_onnx", "bge-small-zh-v1.5-int8", 512,
+            extra={"artifact_sha256": "deadbeef"},
+        )
+        check("启动即报维度变更阻断", bool(d.signature_mismatch) and "768" in d.signature_mismatch,
+              str(d.signature_mismatch))
+
+        emb = embedder.HashEmbedder(512)  # 当前激活的 512 维嵌入源
+        # 隔离：不让 rebuild_all 去扫真实 notes 目录
+        _orig = indexer.scan_notes
+        indexer.scan_notes = lambda: []  # type: ignore[assignment]
+        try:
+            # 模拟点击「全量重建索引」：recreate_vec=False
+            rep = indexer.rebuild_all(d, emb, recreate_vec=False)
+        finally:
+            indexer.scan_notes = _orig  # type: ignore[assignment]
+
+        check("全量重建后阻断解除", d.signature_mismatch is None, str(d.signature_mismatch))
+        check("向量维度已对齐到 512",
+              d.embedding_dim == 512 and (d.get_signature() or {}).get("dim") == 512,
+              f"dim={d.embedding_dim} sig={d.get_signature()}")
+        check("报告标记向量就绪", bool(rep.get("vec_ready")), str(rep))
+        # 旧 768 维向量写不进去（表维度已变），证明向量表真的重建了
+        raised = False
+        try:
+            d.conn().execute(
+                "INSERT INTO chunks_vec(chunk_id, embedding) VALUES(?,?)",
+                ("probe768", _json.dumps([0.0] * 768)),
+            )
+        except sqlite3.Error:
+            raised = True
+        check("重建后 768 维向量被拒绝（表维度已变）", raised)
+        # 512 维可以正常写入
+        d.conn().execute(
+            "INSERT INTO chunks_vec(chunk_id, embedding) VALUES(?,?)",
+            ("probe512", _json.dumps([0.0] * 512)),
+        )
+        d.conn().commit()
+        check("重建后 512 维向量可正常写入", True)
+        d.checkpoint_and_close()
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def test_alert_classification() -> None:
@@ -3855,6 +4059,10 @@ def test_portable_containment() -> None:
         "library.py": "解析用户自行指定的外部资料库路径",
         "file_guard.py": "safe_join 把含 ~ 的 root 解析成绝对路径",
         "crawler.py": "查找宿主已安装的 Chrome 可执行文件（只读，非落盘）",
+        # 与上一条同类的**只读**用途：定位宿主已安装的 Ollama 可执行文件以便
+        # 静默自启；这里只是「去哪个已装程序的位置找 exe」，绝不把任何数据写到
+        # AppData。真正的落盘红线由下面的动态写入探针把关（写标记再全盘找）。
+        "ollama_runtime.py": "查找宿主已安装的 Ollama 可执行文件（只读，非落盘）",
     }
 
     # 必须「取完整调用参数」再判断：atomic_io.mkstemp(..., dir=target.parent)
@@ -3885,6 +4093,37 @@ def test_portable_containment() -> None:
             appdata_viol.append(str(f.relative_to(ROOT)))
     check("★ 源码不引用 AppData / LOCALAPPDATA 作为落盘位置",
           not appdata_viol, "; ".join(appdata_viol))
+
+    # 窗口抑制静态红线：app/ 下**任何** spawn 子进程的地方都必须带窗口抑制参数。
+    # 应用以 pythonw.exe（无控制台）启动时，未抑制的 console 子进程会被 Windows
+    # 分配一个**可见黑框**并闪一下 —— 用户看到的是「一开程序就弹 dos 窗口」。
+    # 这条来自真实用户报告，必须静态守住，不能只靠"记得加"。
+    def _call_body(txt: str, open_idx: int) -> str:
+        """从 '(' 位置起按括号配对取出整段调用实参。"""
+        depth = 0
+        for i in range(open_idx, len(txt)):
+            ch = txt[i]
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    return txt[open_idx:i + 1]
+        return txt[open_idx:]
+
+    win_viol: list[str] = []
+    for f in sorted((ROOT / "app").rglob("*.py")):
+        if f.name in exempt:
+            continue
+        txt = f.read_text(encoding="utf-8", errors="replace")
+        for m in _re.finditer(
+                r"subprocess\.(?:run|Popen|call|check_output|check_call)\(", txt):
+            body = _call_body(txt, m.end() - 1)
+            if not any(k in body for k in
+                       ("silent_kwargs", "creationflags", "_no_window_flag")):
+                win_viol.append(f"{f.relative_to(ROOT)} -> 未抑制控制台窗口")
+    check("★ 源码 spawn 子进程必须抑制控制台窗口（静态红线）",
+          not win_viol, "; ".join(dict.fromkeys(win_viol))[:240])
 
     # ---------- ② 运行时写入落点（动态探针）----------
     # 写一个肉眼可辨的唯一标记，再去宿主侧找它 —— 找得到即说明外泄。
@@ -4290,6 +4529,8 @@ def main() -> int:
         test_genre_term_not_cited()
         test_office_preview(ctx)
         test_trash_purge(ctx)
+        test_ollama_capabilities()
+        test_ollama_autostart()
         test_gateway(ctx)
         test_crawler(ctx)
         test_archive_localization()

@@ -30,7 +30,7 @@ import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import net_util, paths
+from . import net_util, paths, proc as proc_mod
 from .log_util import get_logger
 
 log = get_logger()
@@ -47,7 +47,11 @@ _onnx_probe_result: tuple[bool, str] | None = None
 # CPU 能力探测
 # --------------------------------------------------------------------------
 def cpu_flags() -> dict[str, bool | None]:
-    system = platform.system()
+    # ⚠ 不要用 platform.system()：它在 Windows 上会经 uname()→win32_ver() 调起
+    # `cmd /c ver` 子进程；pythonw 无控制台启动时这会闪出一个**可见黑框**。
+    # 改用 sys.platform（'win32'/'linux'/'darwin'），零子进程、零黑框。
+    system = {"win32": "Windows", "linux": "Linux", "darwin": "Darwin"}.get(
+        sys.platform, sys.platform)
     if system == "Windows":
         try:
             import ctypes
@@ -75,6 +79,7 @@ def cpu_flags() -> dict[str, bool | None]:
             out = subprocess.run(
                 ["sysctl", "-n", "machdep.cpu.features"],
                 capture_output=True, text=True, timeout=5,
+                **proc_mod.silent_kwargs(),
             ).stdout.lower()
             return {
                 "sse4_2": "sse4_2" in out,
@@ -182,6 +187,10 @@ def probe_onnxruntime(force: bool = False) -> tuple[bool, str]:
                 [sys.executable, "-c", _PROBE_CODE],
                 capture_output=True, text=True, timeout=25,
                 env={**__import__("os").environ, "PYTHONIOENCODING": "utf-8"},
+                # ⚠ 必须抑制窗口：应用以 pythonw 启动时自身无控制台，这个 python.exe
+                #   子进程会被 Windows 分配一个**可见的黑框**并闪一下 —— 用户看到的是
+                #   「一开程序就弹 dos 窗口」。见 app/core/proc.py。
+                **proc_mod.silent_kwargs(),
             )
         except (OSError, subprocess.SubprocessError) as exc:
             _onnx_probe_result = (False, f"onnxruntime 探针执行失败: {exc}")
@@ -709,6 +718,36 @@ def _ollama_installed(host: str) -> list[str]:
     return out
 
 
+def _ollama_embed_capable(host: str) -> list[str]:
+    """本机**能做嵌入**的模型名（按 Ollama 的 capabilities 过滤）。
+
+    只按名字列备选会闹笑话：把 `qwen2.5:7b-instruct` 这种对话模型推荐给
+    「改用嵌入模型」的提示，用户照做就会踩 `HTTP 400 does not support embedding`。
+    拿不到 capabilities（旧版 Ollama）时返回空列表 —— 调用方据此换一句更诚实的话。
+    """
+    status, body, _ = net_util.http_get(
+        net_util.join_url(host, "/api/tags"), timeout=4.0, with_proxy=False
+    )
+    if status != 200:
+        return []
+    try:
+        import json as _json
+
+        data = _json.loads(body.decode("utf-8", "replace"))
+    except Exception:  # noqa: BLE001
+        return []
+    out: list[str] = []
+    for m in data.get("models") or []:
+        if not isinstance(m, dict):
+            continue
+        caps = m.get("capabilities")
+        if isinstance(caps, list) and "embedding" in [str(c) for c in caps]:
+            name = str(m.get("name") or "").strip()
+            if name:
+                out.append(name)
+    return sorted(out)
+
+
 def resolve(cfg_get, ollama_healthy=None) -> EmbedderResolution:
     """按配置 + 可用性逐级解析嵌入源。
 
@@ -781,11 +820,19 @@ def resolve(cfg_get, ollama_healthy=None) -> EmbedderResolution:
             if installed and model_name not in installed:
                 loose = {n.split(":")[0] for n in installed}
                 if model_name.split(":")[0] not in loose:
-                    # 这条要用户动手（pull 模型或改配置），保留为告警
+                    # 这条要用户动手（pull 模型或改配置），保留为告警。
+                    # ⚠ 备选只列**真正能嵌入**的模型：早先直接列全部已装模型，
+                    #   把对话模型（qwen2.5 之类）当成嵌入模型推荐，用户照做即踩 400。
+                    _alts = _ollama_embed_capable(ollama_host)
+                    _alt_txt = (
+                        "，或改用本机已装的嵌入模型：" + ", ".join(_alts[:4])
+                        if _alts else
+                        "；本机暂无其它能嵌入的模型，请先 ollama pull 一个嵌入模型"
+                        "（如 bge-m3）"
+                    )
                     warnings.append(
                         f"Ollama 在线，但未安装嵌入模型「{model_name}」—— "
-                        f"可执行 ollama pull {model_name}，或改用已安装的："
-                        f"{', '.join(sorted(installed)[:4])}"
+                        f"可执行 ollama pull {model_name}{_alt_txt}"
                     )
             real = emb.probe_dim()  # 维度由模型决定，自动适配，不让用户手填
             if real:

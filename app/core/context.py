@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 
 from .db import SCHEMA_VERSION  # noqa: E402
 from . import migrations as migrations_mod  # noqa: E402
-from . import config, db as db_mod, embedder as embedder_mod, indexer, llm, net_util, paths, sync
+from . import config, db as db_mod, embedder as embedder_mod, indexer, llm, net_util, ollama_runtime, paths, proc as proc_mod, sync
 from .log_util import get_logger
 
 log = get_logger()
@@ -40,6 +40,10 @@ class AppContext:
 
     # ------------------------------------------------------------------
     def boot(self, db_path=None, start_syncer: bool = True, probe_ollama: bool = True) -> dict:
+        # 0) 子进程「一律不弹窗」的进程级默认（Windows）—— 必须早于任何可能
+        #    import 第三方重量级库（如 onnxruntime）的动作，否则第三方内部
+        #    的 platform.system() → cmd /c ver 会闪出黑框。见 app/core/proc.py。
+        proc_mod.install_silent_subprocess()
         with self._boot_lock:
             if self.db is not None:
                 return self.boot_report
@@ -162,6 +166,11 @@ class AppContext:
 
             # 7) 预解析一次 AI 提供方，让状态面板显示「真实可用」而非初始占位值。
             #    注意 resolve_provider 只返回结果，必须手动回写 last_provider。
+            #    在这之前先把「Ollama 静默自启动」丢到后台 —— 它会（若需要）拉起
+            #    ollama serve 并刷新健康缓存；本步不阻塞，拿到的可能是「未在线」，
+            #    随后前端轮询会自然收敛到真实状态。
+            if probe_ollama:
+                threading.Thread(target=self._autostart_ollama, daemon=True).start()
             try:
                 _prov, _warns = self.gateway.resolve_provider()
                 self.gateway.state.last_provider = _prov
@@ -262,15 +271,50 @@ class AppContext:
                 "chat_ready": False, "ollama_available": False, "ollama_probed": False,
                 "installed_models": [], "installed_model_count": 0,
                 "selected_model": None, "selected_model_installed": False,
+                "selected_model_capabilities": [],
                 "cloud_api_configured": False,
             }
         return {
             k: ready[k] for k in (
                 "state", "reason", "chat_ready", "ollama_available", "ollama_probed",
                 "installed_models", "installed_model_count", "selected_model",
-                "selected_model_installed", "cloud_api_configured",
+                "selected_model_installed", "selected_model_capabilities",
+                "cloud_api_configured",
             )
         }
+
+    def _autostart_ollama(self) -> None:
+        """后台把 Ollama 拉起来（配置 ``ollama_autostart=0`` 时只探测不拉起）。
+
+        为什么要有它：产品把本地 AI 全押在 Ollama 上，但 Ollama 默认**不是**开机自启的
+        系统服务 —— 用户不点开托盘程序，`/api/tags` 就连不上，本地对话与向量检索一起
+        降级，而用户很难自己想到「得先去开 Ollama」。这里静默补上这一步。
+
+        铁律：**只在自己的线程里做**，绝不阻塞启动；找不到 / 起不来一律按降级链继续，
+        只往 notes 里留一句实话，不抛异常、不改任何既有行为。
+        """
+        try:
+            enabled = config.get_bool("AI", "ollama_autostart", True)
+        except Exception:  # noqa: BLE001 - 配置读不到就按默认开
+            enabled = True
+        host = config.get_str("AI", "ollama_host", "http://127.0.0.1:11434")
+        try:
+            res = ollama_runtime.ensure_running(host, enabled=enabled)
+        except Exception as exc:  # noqa: BLE001 - 自启动失败绝不能影响应用
+            log.debug("Ollama 自启动异常（已忽略）: %s", exc)
+            return
+        try:
+            if res.get("started"):
+                self.notes.append(
+                    f"已自动启动本地 Ollama（等待 {res.get('waited_s')}s 后就绪）")
+            elif enabled and not res.get("already"):
+                # 如实告知「没拉起」，用户才有线索去自查（比如没装 Ollama）
+                self.notes.append(f"未能自动启动本地 Ollama：{res.get('reason')}")
+            # 刷新健康与模型缓存 —— 否则前端轮询拿到的还是启动时的「未在线」
+            if self.gateway is not None:
+                self.gateway.ollama_status(force=True)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("自启动后刷新状态失败: %s", exc)
 
     def status(self, probe: bool = False) -> dict:
         if self.db is None:
@@ -278,6 +322,22 @@ class AppContext:
         stats = self.db.stats()
         sig = self.db.get_signature()
         gw_state = self.gateway.state if self.gateway else None
+        # 顶栏「AI 对话」标签：按当前配置 + 就绪状态实时推导（详见下方 "resolved" 注释）
+        mode = config.get_str("AI", "provider", "auto").strip().lower()
+        readiness = self.ai_readiness(probe=probe)
+        has_key = bool(config.get_str("AI", "api_key", ""))
+        if mode == "offline":
+            resolved_now = "offline"
+        elif mode == "api":
+            resolved_now = "api" if has_key else "error"
+        elif mode == "ollama":
+            resolved_now = "ollama" if readiness.get("chat_ready") else "offline"
+        elif readiness.get("chat_ready"):
+            resolved_now = "ollama"
+        elif has_key:
+            resolved_now = "api"
+        else:
+            resolved_now = "offline"
         return {
             "app_version": __import__("app.version", fromlist=["x"]).APP_VERSION,
             "schema_version": migrations_mod.CURRENT_SCHEMA_VERSION,
@@ -296,15 +356,20 @@ class AppContext:
                 "fallback_reason": self.embedding_fallback_reason or None,
             },
             "ai": {
-                "provider_mode": config.get_str("AI", "provider", "auto"),
+                "provider_mode": mode,
                 # ⚠ ollama_healthy 只表示「/api/tags 可访问」，不代表能对话；
                 #   能否对话看 state / chat_ready（A4.1 契约）。
                 "ollama_healthy": bool(gw_state and gw_state.ollama_healthy),
                 "ollama_detail": gw_state.ollama_detail if gw_state else "",
                 "api_key_configured": bool(config.get_str("AI", "api_key", "")),
-                "resolved": gw_state.last_provider if gw_state else "",
+                # 「AI 对话」顶栏标签必须是**按当前配置与就绪状态实时算**的结果。
+                # 早先直接透传 last_provider（=「上次实际解析结果」），用户改完设置后
+                # 它不会自动更新 → 出现「设置页说『对话能力就绪』、顶栏说『尚未配置』」
+                # 的自相矛盾，用户据此判断「没设置成功」。last_provider 仅留作诊断。
+                "resolved": resolved_now,
+                "last_provider": gw_state.last_provider if gw_state else "",
                 "last_error": gw_state.last_error if gw_state else "",
-                **self.ai_readiness(probe=probe),
+                **readiness,
             },
             "sync": self.syncer.status() if self.syncer else {"running": False},
             "warnings": list(self.warnings),      # 需行动 → 顶部告警条

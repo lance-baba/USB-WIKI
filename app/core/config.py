@@ -41,6 +41,10 @@ api_chat_model = deepseek-chat
 
 # --- 本地 Ollama 守护进程配置 ---
 ollama_host = http://127.0.0.1:11434
+# 启动时若检测到 Ollama 未运行，是否**自动在后台拉起** ollama serve (1 开 / 0 关)。
+# 开=用户不必自己去开 Ollama，程序静默把它启动起来；找不到 ollama 或启动失败时
+# 按既有降级链继续，不会阻塞启动、不会崩。介意程序自起后台进程的用户可置 0。
+ollama_autostart = 1
 # ⚠ 本地对话模型**故意留空**：产品尚未推荐任何模型，Core 不得替用户预设。
 #   留空时程序会报告 selection_required，由用户在「设置 → AI → 本地对话模型」
 #   里从**本机已安装**的模型中选择；选之前不会自动挑任何一个（也不猜 models[0]）。

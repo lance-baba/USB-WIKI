@@ -290,8 +290,13 @@ class Database:
         ).fetchone()
         return row is not None
 
-    def recreate_vec_table(self, dim: int | None = None) -> bool:
-        """全量重建向量表（维度过期/重建索引时由上层调用）。"""
+    def recreate_vec_table(self, dim: int | None = None, embedder=None) -> bool:
+        """全量重建向量表（维度过期/重建索引时由上层调用）。
+
+        *embedder* 传入时，重建后把嵌入签名守卫也对齐到当前嵌入源
+        （更新 ``embedding_signature`` 元数据 + 清除 ``signature_mismatch``），
+        否则重启后又会报「维度已变更」—— 这正是「点全量重建索引提示不消失」的根因。
+        """
         dim = int(dim or self.embedding_dim)
         self.embedding_dim = dim
         c = self.conn()
@@ -304,6 +309,15 @@ class Database:
                         "INSERT OR REPLACE INTO sys_meta(key, value) VALUES(?, ?)",
                         (META_VEC_DIM, str(dim)),
                     )
+                    # 让签名守卫与当前嵌入源对齐：旧库可能是 Ollama@768，现切到本地
+                    # 512 维 ONNX，不更新签名则重启仍报维度变更、向量召回仍被阻断。
+                    if embedder is not None:
+                        extra = {}
+                        try:
+                            extra = embedder.signature_extra() or {}
+                        except Exception:  # noqa: BLE001 - 只影响签名粒度
+                            pass
+                        self.set_signature(embedder.source, embedder.model, dim, extra=extra)
                     c.commit()
                     self.vec_table_ready = True
                     self.signature_mismatch = None

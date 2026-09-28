@@ -402,7 +402,10 @@ def _runtime_probe() -> dict:
     return {
         "python_version": sys.version.split()[0],
         "os": os.name,
-        "machine": platform.machine() or None,
+        # ⚠ 不用 platform.machine()：Windows 上它会经 uname()→win32_ver() 调起
+        # `cmd /c ver` 子进程（pythonw 下闪黑框）。改用环境变量拿架构，零子进程。
+        "machine": (os.environ.get("PROCESSOR_ARCHITEW6432")
+                    or os.environ.get("PROCESSOR_ARCHITECTURE") or None),
         "portable_runtime": bool(portable),
         "frozen": bool(getattr(sys, "frozen", False)),
         "dependency_lock_sha256": lock_sha,

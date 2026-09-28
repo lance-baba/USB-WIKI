@@ -49,16 +49,22 @@ STATE_NO_RUNTIME = "no_runtime"                  # 本机没有可用的 Ollama 
 STATE_NO_MODEL = "no_model"                      # Ollama 在线，但一个模型都没装
 STATE_SELECTION_REQUIRED = "selection_required"  # 有模型，但用户还没选对话模型
 STATE_MODEL_MISSING = "model_missing"            # 选过的模型在本机已不存在
+STATE_MODEL_NOT_CHAT = "model_not_chat"          # 选中的模型本机有，但**不支持对话**（嵌入/向量模型）
 STATE_READY = "ready"                            # 已选择且本机可用
 
+#: Ollama capability 标签 —— 对话需要 completion，嵌入需要 embedding。
+CAP_CHAT = "completion"
+CAP_EMBED = "embedding"
+
 AI_STATES = (STATE_NO_RUNTIME, STATE_NO_MODEL, STATE_SELECTION_REQUIRED,
-             STATE_MODEL_MISSING, STATE_READY)
+             STATE_MODEL_MISSING, STATE_MODEL_NOT_CHAT, STATE_READY)
 
 _STATE_REASON = {
     STATE_NO_RUNTIME: "未检测到本地 Ollama 运行时",
     STATE_NO_MODEL: "Ollama 已启动，但本机尚未安装任何模型",
     STATE_SELECTION_REQUIRED: "本机已有模型，但尚未选择用哪个模型对话",
     STATE_MODEL_MISSING: "原来选择的模型在本机已不存在",
+    STATE_MODEL_NOT_CHAT: "该模型不支持对话（通常是嵌入/向量模型）",
     STATE_READY: "已选择模型且本机可用",
 }
 
@@ -94,6 +100,8 @@ class GatewayState:
     ollama_detail: str = "未探测"
     #: 上次探测到的已安装模型名（与健康状态同一次请求取得，故同一 TTL）
     ollama_models: list[str] = field(default_factory=list)
+    #: 同一次探测的模型详情（含 capabilities）—— 判定「能不能对话 / 能不能嵌入」用
+    ollama_models_meta: list[dict] = field(default_factory=list)
     last_provider: str = "offline"
     last_error: str = ""
     warnings: list[str] = field(default_factory=list)
@@ -125,6 +133,11 @@ def _parse_tags(body) -> tuple[list[dict], bool]:
         if not name:
             continue
         details = m.get("details") or {}
+        # capabilities 是 Ollama 自己给出的**能力标签**（如 ["completion","tools"] /
+        # ["embedding"]）。它把「这模型到底能不能对话」从猜测变成事实 ——
+        # 没有它就只能靠模型名瞎猜，用户把嵌入模型选成对话模型后会一路 "就绪"，
+        # 直到提问时撞 HTTP 400。
+        caps = m.get("capabilities")
         models.append(
             {
                 "name": name,
@@ -134,6 +147,7 @@ def _parse_tags(body) -> tuple[list[dict], bool]:
                 "family": str(details.get("family") or ""),
                 "params": str(details.get("parameter_size") or ""),
                 "quant": str(details.get("quantization_level") or ""),
+                "capabilities": ([str(c) for c in caps] if isinstance(caps, list) else []),
             }
         )
     models.sort(key=lambda x: x["name"])
@@ -157,6 +171,22 @@ def _model_present(selected: str, installed: list[str]) -> bool:
     if ":" not in selected:
         return f"{selected}:latest" in installed
     return False
+
+
+def _caps_of(selected: str, meta: list[dict]) -> list[str]:
+    """按与 :func:`_model_present` **相同**的宽松 tag 规则，取选中模型的能力标签。
+
+    取不到时返回 ``[]``（模型不在列表 / 旧版 Ollama 不返回 capabilities）——
+    调用方据此**不做能力拦截**，保持向后兼容：绝不因为「拿不到标签」就误判不可用。
+    """
+    if not selected or not meta:
+        return []
+    want = selected if ":" in selected else f"{selected}:latest"
+    for m in meta:
+        if str(m.get("name") or "") == want:
+            caps = m.get("capabilities")
+            return [str(c) for c in caps] if isinstance(caps, list) else []
+    return []
 
 
 def _query_window(text: str, query: str, limit: int) -> str:
@@ -308,6 +338,7 @@ class Gateway:
                 self.state.ollama_checked_at = time.time()
                 self.state.ollama_detail = detail
                 self.state.ollama_models = [m["name"] for m in models]
+                self.state.ollama_models_meta = list(models)
         return available, models, detail
 
     def ollama_status(self, force: bool = False) -> bool:
@@ -361,10 +392,15 @@ class Gateway:
             probed = self.state.ollama_checked_at > 0
             available = bool(probed and self.state.ollama_healthy)
             names = list(self.state.ollama_models) if available else []
+            meta = list(self.state.ollama_models_meta) if available else []
             detail = self.state.ollama_detail
 
         selected = self.ollama_model
         installed = _model_present(selected, names)
+        # 能力标签：有标签且不含 completion → 明确判定「不能对话」（嵌入/向量模型）。
+        # 标签缺失（旧版 Ollama 不返回 capabilities）→ caps 为空 → 不做拦截，向后兼容。
+        caps = _caps_of(selected, meta) if installed else []
+        chat_capable = (not caps) or (CAP_CHAT in caps)
 
         if not available:
             state = STATE_NO_RUNTIME
@@ -374,11 +410,13 @@ class Gateway:
             state = STATE_SELECTION_REQUIRED
         elif not installed:
             state = STATE_MODEL_MISSING
+        elif not chat_capable:
+            state = STATE_MODEL_NOT_CHAT
         else:
             state = STATE_READY
 
         reason = _STATE_REASON[state]
-        if state == STATE_MODEL_MISSING:
+        if state in (STATE_MODEL_MISSING, STATE_MODEL_NOT_CHAT):
             reason = f"{reason}：{selected}"
         elif state == STATE_SELECTION_REQUIRED:
             reason = f"{reason}（本机发现 {len(names)} 个）"
@@ -398,6 +436,7 @@ class Gateway:
             "installed_model_count": len(names),
             "selected_model": selected or None,
             "selected_model_installed": bool(installed),
+            "selected_model_capabilities": caps,
             "provider_mode": config.get_str("AI", "provider", "auto").lower(),
             "api_key_configured": bool(api_key),
             "cloud_api_configured": bool(api_key and api_base),

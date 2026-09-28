@@ -129,7 +129,11 @@ function applyStatus(st) {
   cE.textContent = vecOK ? "本地智能搜索：可用" : "本地智能搜索：仅关键词";
   cE.className = "chip " + (vecOK ? "on" : "warn");
 
-  cA.textContent = "AI 对话：" + ({ ollama: "本地模型", api: "云端", offline: "尚未配置", error: "不可用" }[ai.resolved] || ai.provider_mode || "—");
+  const aiLabel = ({ ollama: "本地模型", api: "云端", offline: "尚未配置", error: "不可用" }[ai.resolved] || ai.provider_mode || "—");
+  cA.textContent = "AI 对话：" + aiLabel;
+  // 悬停说明「为什么是当前状态」—— offline 时尤其要给 reason（如「该模型不支持对话」），
+  // 否则用户只看到「尚未配置」，根本不知道卡在哪一步。
+  cA.title = ai.reason ? ("AI 对话：" + aiLabel + " —— " + ai.reason) : "";
   cA.className = "chip " + (ai.resolved === "ollama" || ai.resolved === "api" ? "on" : (ai.resolved === "error" ? "warn" : "off"));
 
   cS.textContent = "同步：" + (syn.running ? (syn.tracked + " 篇 · " + syn.interval + "s") : "未运行");
@@ -1574,9 +1578,15 @@ const CFG_SCHEMA = [
         options: [["auto", "自动（推荐）"], ["ollama", "只用本地 Ollama"], ["api", "只用云端 API"], ["offline", "纯离线，不调用 AI"]] },
       { key: "ollama_host", label: "Ollama 服务地址", type: "text", placeholder: "http://127.0.0.1:11434",
         tip: "Ollama 装在本机就用默认值，别改。" },
+      { key: "ollama_autostart", label: "自动启动 Ollama", type: "select",
+        tip: "开启后，程序启动时若发现 Ollama 没在跑，会在**后台静默拉起**（无窗口、不阻塞启动）——" +
+             "你就不必自己去开 Ollama。找不到 Ollama 或启动失败时会自动降级为纯离线检索，不影响使用。" +
+             "介意程序自起后台进程的话可以关掉。",
+        options: [["1", "自动启动（推荐）"], ["0", "不自动启动"]] },
       { key: "ollama_chat_model", label: "本地对话模型", type: "ollama-model",
-        tip: "从你本机已安装的 Ollama 模型里挑一个。程序不会替你预设或自动选择任何模型；" +
-             "本机还没有模型时请先用 Ollama 自行安装，然后点「刷新模型列表」。" },
+        tip: "从你本机已安装的 Ollama 模型里挑一个。下拉只会列出**能对话**的模型" +
+             "（嵌入/向量模型不会出现，选了也没用）。程序不会替你预设或自动选择任何模型；" +
+             "本机还没有模型时请先用 Ollama 安装，然后点「刷新模型列表」。" },
       { key: "api_base_url", label: "云端接口地址", type: "preset-text", placeholder: "https://api.deepseek.com/v1",
         tip: "选一家常用服务商，或自己填兼容 OpenAI 协议的地址。",
         options: [["https://api.deepseek.com/v1", "DeepSeek"], ["https://dashscope.aliyuncs.com/compatible-mode/v1", "通义千问"], ["https://api.moonshot.cn/v1", "Kimi 月之暗面"], ["https://open.bigmodel.cn/api/paas/v4", "智谱 GLM"], ["https://api.openai.com/v1", "OpenAI"]] },
@@ -1606,7 +1616,8 @@ const CFG_SCHEMA = [
              + "ollama 借本机 Ollama 算；api 用云端算。本机没有嵌入能力时会自动降级为纯词法检索，不会崩。",
         options: [["local_onnx", "本地 ONNX"], ["ollama", "本地 Ollama"], ["api", "云端 API"]] },
       { key: "embedding_model_name", label: "嵌入模型名", type: "ollama-model",
-        tip: "用 Ollama 做嵌入时，从下拉里选（推荐 nomic-embed-text / bge-m3 这类 embedding 专用模型，别选 chat 模型）。用 local_onnx / api 时会自动变回手动填写。" },
+        tip: "用 Ollama 做嵌入时从下拉里选——下拉只列出**能嵌入**的模型（如 bge-m3、nomic-embed-text），" +
+             "对话模型不会出现。用 local_onnx / api 时会自动变回手动填写。" },
       { key: "embedding_dim", label: "向量维度", type: "number", min: 64, max: 4096,
         tip: "用 ollama / api 时程序会自动探测并覆盖这个值，不用填。只有 local_onnx 才需要手填。改错会让向量检索被自动禁用。" },
       { key: "top_k_parents", label: "送入 AI 的段落数", type: "number", min: 1, max: 20,
@@ -1805,8 +1816,9 @@ function applyConfigDefaults() {
   toast("已填回默认值，确认后点「保存配置」生效");
 }
 
-/* Ollama 模型下拉（对话模型 + 嵌入模型通用）：在线就列出本机已装模型；
-   不在线退化成手填，绝不丢用户已填的值 */
+/* Ollama 模型下拉（对话模型 + 嵌入模型通用）：在线就列出本机已装模型，
+   **并按用途做能力过滤**（对话只列 completion、嵌入只列 embedding）；
+   不在线退化成手填，绝不丢用户已填的值。 */
 async function refreshOllamaModels() {
   const sels = $$(".ollama-sel");
   if (!sels.length) return;
@@ -1828,6 +1840,14 @@ async function refreshOllamaModels() {
     const current = String(sel.value || "").trim();
     const field = sel.closest(".ollama-ctl").parentElement;
     const hint = field.querySelector(".ollama-hint");
+    // 每个下拉只列**真正胜任该用途**的模型（以 Ollama 的 capabilities 为准）：
+    // 对话只认 completion，嵌入只认 embedding。否则用户会把 bge-m3 这类嵌入模型
+    // 选成对话模型 —— 保存成功、状态还显示"就绪"，一提问才撞 HTTP 400
+    // "does not support chat"。能力过滤把这类错误挡在**选择之前**。
+    const role = sel.dataset.key === "embedding_model_name" ? "embed" : "chat";
+    const needCap = role === "embed" ? "embedding" : "completion";
+    const roleName = role === "embed" ? "嵌入模型" : "本地对话模型";
+
     if (!d.available) {
       const inp = document.createElement("input");
       inp.type = "text";
@@ -1840,29 +1860,41 @@ async function refreshOllamaModels() {
         " —— 已切换为手动填写。装好 Ollama 后点「刷新模型列表」可恢复下拉。";
       return;
     }
-    const models = d.models || [];
+    const all = d.models || [];
+    const capsOf = m => (m.capabilities || []);
+    // 旧版 Ollama 不返回 capabilities → 按能力过滤会把模型全藏掉。宁可全列 + 说明，
+    // 也不能让用户以为「本机一个模型都没有」。后端状态判定同样对此保持向后兼容。
+    const hasCaps = all.some(m => capsOf(m).length);
+    const models = hasCaps ? all.filter(m => capsOf(m).indexOf(needCap) >= 0) : all;
     const bits = m => [m.params, m.size_text].filter(Boolean).join(" · ");
-    const installed = models.some(m => m.name === current);
+    const installed = all.some(m => m.name === current);
+    const usableNow = models.some(m => m.name === current);
     sel.innerHTML = '<option value="">— 未选择（请从下方本机模型里挑一个）—</option>' +
-      (current && !installed
-        ? '<option value="' + esc(current) + '">' + esc(current) + "（原配置，本机未找到）</option>"
+      (current && !usableNow
+        ? '<option value="' + esc(current) + '">' + esc(current) +
+          (installed ? "（不支持此用途，请另选）" : "（原配置，本机未找到）") + "</option>"
         : "") +
       models.map(m =>
         '<option value="' + esc(m.name) + '">' + esc(m.name) +
         (bits(m) ? "　" + esc(bits(m)) : "") + "</option>").join("");
-    // ⚠ **绝不自动选中 models[0]**：用户没选就保持「未选择」。
-    //   本机模型可能是 embedding 模型、vision 模型，或资源要求过高的模型 ——
-    //   替用户挑一个等于偷偷替他拍板。选了就在保存时显式持久化。
+    // ⚠ **绝不自动选中 models[0]**：用户没选就保持「未选择」——
+    //   替用户挑一个模型等于偷偷替他拍板。选了就在保存时显式持久化。
     sel.value = current;
     if (hint) {
-      if (!models.length) {
+      if (!all.length) {
         hint.innerHTML = "⚠ Ollama 在线，但本机尚未安装任何模型 —— " +
           "请先用 Ollama 装好模型，再点「刷新模型列表」。";
+      } else if (hasCaps && !models.length) {
+        hint.innerHTML = "⚠ 本机没有可用于「" + roleName + "」的模型 —— 请先用 Ollama 安装" +
+          "（对话模型如 qwen2.5，嵌入模型如 bge-m3），再点「刷新模型列表」。";
       } else if (!current) {
-        hint.innerHTML = "发现 " + models.length + " 个本机模型，请选择一个作为本地对话模型" +
-          "（程序不会自动替你选）。";
-      } else if (!installed) {
-        hint.innerHTML = "⚠ 原配置的「" + esc(current) + "」在本机已不存在，请重新选择。";
+        hint.innerHTML = "已筛出 " + models.length + " 个可用「" + roleName + "」的模型，请选一个" +
+          "（程序不会自动替你选）。" +
+          (hasCaps ? "" : "　⚠ 当前 Ollama 未提供能力标签，无法自动分辨用途。");
+      } else if (!usableNow) {
+        hint.innerHTML = "⚠ 当前配置的「" + esc(current) + "」" +
+          (installed ? "不支持「" + roleName + "」（能力标签里没有 " + needCap + "）"
+                     : "在本机已不存在") + "，请重新选择。";
       } else {
         hint.innerHTML = "✅ 当前模型：" + esc(current) + "　（Ollama：" + esc(d.host) + "）";
       }
