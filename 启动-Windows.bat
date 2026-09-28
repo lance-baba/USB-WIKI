@@ -23,6 +23,14 @@ setlocal enableextensions
 cd /d "%~dp0"
 title Wiki-USB
 
+rem Dev mode: the bundled embedding model bytes live in vendor\cache\embedding\
+rem (Git-ignored, ~24MB; fetched by scripts\fetch_embedding_resource.py).
+rem Point WIKIUSB_EMBEDDING_DIR there so running straight from the repo also
+rem uses the local 512-dim ONNX model instead of degrading to Ollama.
+rem In a released install the installer places them under App\resources\embedding
+rem and this variable is not needed (harmless if left set).
+set "WIKIUSB_EMBEDDING_DIR=%~dp0vendor\cache\embedding"
+
 set "EMBED_PYW=%~dp0runtime\python-3.11-embed\pythonw.exe"
 set "EMBED_PY=%~dp0runtime\python-3.11-embed\python.exe"
 set "LAUNCHER=%~dp0app\launcher.py"
