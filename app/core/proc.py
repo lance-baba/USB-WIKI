@@ -52,7 +52,17 @@ def silent_kwargs() -> dict:
 
 
 def detach_flags() -> int:
-    """让子进程在父进程退出后**继续存活**的额外 creationflags（Windows）。"""
+    """让子进程脱离父控制台的额外 creationflags（Windows）。
+
+    ⚠⚠ **不要把它用于会自己再拉 console 子进程的守护进程**（如 ``ollama serve``）：
+    ``DETACHED_PROCESS`` 让子进程**没有控制台**，它再拉自己的 console 子进程时
+    无控制台可继承，Windows 会给**孙进程**分配**新的可见控制台** → 黑框
+    （2026-09-30 实机取证）。此类场景请改用 ``silent_kwargs()``
+    （``CREATE_NO_WINDOW``：子进程持有一个**隐藏**控制台，孙进程可继承）。
+
+    另外，子进程能否**活得比父进程久**与控制台 flags **无关** ——
+    「DETACHED_PROCESS = 后台存活」是误解。
+    """
     if os.name != "nt":
         return 0
     return (getattr(subprocess, "DETACHED_PROCESS", 0)

@@ -387,7 +387,11 @@ class AppContext:
             },
             "sync": self.syncer.status() if self.syncer else {"running": False},
             "license": self.license or {},        # 离线授权状态（顶栏芯片 + 设置页卡片）
-            "warnings": list(self.warnings),      # 需行动 → 顶部告警条
+            # 需行动 → 顶部告警条。⚠ db.signature_mismatch 会经 db 通道单独在前端渲染，
+            # 这里若原样再列一份，同一段文字会出现**两张一模一样的告警卡片**
+            # （2026-09-30 用户实测「多了个提示」）。故按文本去重，单一事实源是 db。
+            "warnings": [w for w in self.warnings
+                         if w != getattr(self.db, "signature_mismatch", None)],
             "notes": list(self.notes),            # 已自愈 → 设置页运行详情
             "boot": self.boot_report,
         }

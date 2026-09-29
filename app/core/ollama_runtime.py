@@ -77,9 +77,21 @@ def _spawn_serve(exe: Path) -> None:
 
     ⚠ 这里的窗口抑制不是可选项：App 以 pythonw 无控制台启动时，未抑制的
     ``ollama.exe``（console 程序）会被分配一个可见黑框并闪一下。见 ``proc.py``。
+
+    ⚠⚠ **绝不能用 ``DETACHED_PROCESS``**（2026-09-30 实机取证的黑框真因）：
+    它让 ollama 自己「没有控制台」，而 ollama 启动后会**再拉自己的 console 子进程**
+    （``lib/ollama/llama-server.exe``，每个模型/GPU 一个）—— 子进程无控制台可继承，
+    Windows 就给它分配**新的可见控制台** → 用户看到「连弹好几个黑框」。
+    本进程的 ``STARTUPINFO(SW_HIDE)`` 只管直接子进程，管不到孙进程。
+
+    正解：``CREATE_NO_WINDOW``（ollama 自带一个**隐藏**控制台，孙进程**继承**它，
+    不再新开窗口）+ ``CREATE_NEW_PROCESS_GROUP``（隔离 Ctrl+C）。子进程能否
+    **活得比父进程久**与控制台 flags 无关，不需要 DETACHED_PROCESS。
     """
     kw = proc_mod.silent_kwargs()
-    kw["creationflags"] = int(kw.get("creationflags", 0)) | proc_mod.detach_flags()
+    if os.name == "nt":
+        kw["creationflags"] = int(kw.get("creationflags", 0)) \
+            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
     subprocess.Popen(  # noqa: S603 - 路径来自 find_ollama_exe，参数固定
         [str(exe), "serve"],
         stdin=subprocess.DEVNULL,
