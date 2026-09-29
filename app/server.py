@@ -23,6 +23,7 @@ from .core import (archiver, paths,
 from .api import (ask as api_ask, capture as api_capture, config as api_config,
                   collections as api_collections,
                   diagnostics as api_diagnostics, library as api_library,
+                  license as api_license,
                   search as api_search, system as api_system)
 from .core.context import AppContext, get_ctx
 from .core.log_util import get_logger
@@ -369,6 +370,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         if api_diagnostics.handle_get(self, path):
             return
+        if api_license.handle_get(self, path):
+            return
         if api_search.handle_get(self, path):
             return
         if api_ask.handle_get(self, path):
@@ -390,6 +393,8 @@ class Handler(BaseHTTPRequestHandler):
         if api_system.handle_post(self, path):
             return
         if api_config.handle_post(self, path):
+            return
+        if api_license.handle_post(self, path):
             return
         if api_ask.handle_post(self, path):
             return

@@ -14,6 +14,7 @@
       <span class="chip off" id="chipReady">初始化中…</span>
       <span class="chip off" id="chipEmbed">本地智能搜索 —</span>
       <span class="chip off" id="chipAI">AI 对话 —</span>
+      <span class="chip off" id="chipLicense">授权 —</span>
       <span class="chip off" id="chipSync">同步 —</span>
     </div>
     <div class="spacer"></div>
@@ -150,7 +151,28 @@
           </div>
         </div>
         <div class="card scroll">
-          <h3>运行状态</h3>
+          <h3>产品授权</h3>
+          <div id="licState" class="hint">正在读取…</div>
+          <div class="field" style="margin-top:10px">
+            <label>本机设备码（发给授权方）</label>
+            <div class="row">
+              <input type="text" id="licDeviceCode" class="grow" readonly placeholder="读取中…">
+              <button class="btn" id="btnLicCopy">复制</button>
+            </div>
+          </div>
+          <div class="field" style="margin-top:9px">
+            <label>输入激活码</label>
+            <textarea id="licCode" placeholder="粘贴授权方发来的激活码…"></textarea>
+          </div>
+          <div class="row" style="margin-top:9px">
+            <button class="btn primary" id="btnLicActivate">激活</button>
+            <button class="btn danger" id="btnLicClear">清除本机激活</button>
+          </div>
+          <div class="hint" style="margin-top:10px;line-height:1.6">
+            完全离线：激活码由授权方用私钥签名，本机仅用内置公钥验签，<b>不联网</b>。
+            把整个目录复制到另一台电脑后，激活会因设备码不匹配而失效。
+          </div>
+          <h3 style="margin-top:18px">运行状态</h3>
           <div class="kv" id="statKV"></div>
           <h3 style="margin-top:18px">索引维护</h3>
           <div class="row" style="flex-wrap:wrap">

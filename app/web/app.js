@@ -139,6 +139,16 @@ function applyStatus(st) {
   cS.textContent = "同步：" + (syn.running ? (syn.tracked + " 篇 · " + syn.interval + "s") : "未运行");
   cS.className = "chip " + (syn.running ? "on" : "off");
 
+  // 离线授权芯片（状态由后端在 boot 时重算设备指纹并验签得到）
+  const cL = $("#chipLicense");
+  if (cL) {
+    const lic = d.license || {};
+    const licOK = lic.status === "OK";
+    cL.textContent = "授权：" + (licOK ? "已激活" : (lic.status === "NO_LICENSE" ? "未激活" : "异常"));
+    cL.className = "chip " + (licOK ? "on" : (lic.status === "NO_LICENSE" ? "off" : "warn"));
+    cL.title = lic.message || "";
+  }
+
   renderAlerts(d);
   renderStats(d);
   renderEmptyGuide(d);
@@ -1980,12 +1990,83 @@ async function rebuild(vec) {
   }, 2500);
 }
 
+/* ---------------------------- 产品授权 ---------------------------- */
+function licStatusLabel(st) {
+  const m = { OK: "已激活", NO_LICENSE: "未激活", DEVICE_MISMATCH: "设备不符",
+              EXPIRED: "已过期", BAD_SIGNATURE: "签名无效",
+              PRODUCT_MISMATCH: "产品不符", MALFORMED: "格式错误",
+              CRYPTO_UNAVAILABLE: "无法验证" };
+  return m[(st && st.status) || ""] || "未知";
+}
+
+function renderLicense(st) {
+  st = st || {};
+  const box = $("#licState");
+  if (box) {
+    const cls = st.status === "OK" ? "on" : (st.status === "NO_LICENSE" ? "off" : "warn");
+    let html = '<span class="lic-badge ' + cls + '">' + esc(licStatusLabel(st)) + "</span> " +
+               esc(st.message || "");
+    if (st.customer_id) {
+      html += '<div class="note-line">客户：' + esc(st.customer_id) +
+              "　功能：" + esc((st.features || []).join("、") || "—") + "</div>";
+    }
+    if (st.expires_at) html += '<div class="note-line">有效期至：' + esc(st.expires_at) + "</div>";
+    else if (st.perpetual) html += '<div class="note-line">永久授权</div>';
+    if (st.key_id) html += '<div class="note-line">验签公钥指纹：' + esc(st.key_id) + "</div>";
+    box.innerHTML = html;
+  }
+  const dc = $("#licDeviceCode");
+  if (dc && st.device_code) dc.value = st.device_code;
+}
+
+async function loadLicense() {
+  try {
+    const r = await api("/api/license/status");
+    renderLicense(r.data || {});
+  } catch (e) {
+    const box = $("#licState");
+    if (box) box.innerHTML = '<span class="lic-badge warn">读取失败</span> ' + esc(e.message);
+  }
+}
+
+function copyDeviceCode() {
+  const v = $("#licDeviceCode") ? $("#licDeviceCode").value : "";
+  if (!v) { toast("设备码尚未加载"); return; }
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(v).then(() => toast("设备码已复制"), () => fallbackCopy());
+  } else { fallbackCopy(); }
+  function fallbackCopy() {
+    const el = $("#licDeviceCode"); el.removeAttribute("readonly"); el.select();
+    try { document.execCommand("copy"); toast("设备码已复制"); } catch (e) { toast("复制失败，请手动选择"); }
+    el.setAttribute("readonly", "readonly");
+  }
+}
+
+async function doActivate() {
+  const code = ($("#licCode") ? $("#licCode").value : "").trim();
+  if (!code) { toast("请先粘贴激活码"); return; }
+  const r = await api("/api/license/activate", {
+    method: "POST", body: JSON.stringify({ code }),
+  });
+  const d = r.data || {};
+  toast((d.ok ? "✅ " : "⚠ ") + (r.message || ""));
+  if (d.ok) { $("#licCode").value = ""; renderLicense(d.state || {}); pollStatus(false); }
+}
+
+async function doClearLicense() {
+  if (!confirm("清除本机激活？\n\n清除后本机立即回到未激活状态（不影响资料库与笔记）。")) return;
+  const r = await api("/api/license/clear", { method: "POST", body: "{}" });
+  const d = r.data || {};
+  toast(r.message || "已清除");
+  renderLicense(d.state || {}); pollStatus(false);
+}
+
 /* ---------------------------- 标签页 ---------------------------- */
 function switchTab(name) {
   $$(".tab").forEach(t => t.classList.toggle("active", t.dataset.tab === name));
   $$(".panel").forEach(p => p.classList.toggle("active", p.id === "panel-" + name));
   if (name === "notes") loadNotes();
-  if (name === "settings") { loadConfig(); pollStatus(false); }
+  if (name === "settings") { loadConfig(); loadLicense(); pollStatus(false); }
 }
 
 /* 问答引用跳转（A/B）：
@@ -2033,6 +2114,9 @@ $("#btnCfgDefaults").onclick = applyConfigDefaults;
 $("#btnRebuild").onclick = () => rebuild(false);
 $("#btnRebuildVec").onclick = () => rebuild(true);
 $("#btnRefresh").onclick = async () => { await pollStatus(false, true); await loadNotes(); toast("状态已刷新"); };
+if ($("#btnLicCopy")) $("#btnLicCopy").onclick = copyDeviceCode;
+if ($("#btnLicActivate")) $("#btnLicActivate").onclick = doActivate;
+if ($("#btnLicClear")) $("#btnLicClear").onclick = doClearLicense;
 
 $("#btnShutdown").onclick = async () => {
   if (!confirm("将执行 WAL 检查点并释放数据库锁，确保 U 盘可直接拔出。\n\n确定要安全退出吗？")) return;
@@ -2051,6 +2135,7 @@ initDropZone();
 loadImportFormats();
 loadConfig();
 loadNotes();
+loadLicense();
 pollStatus(true);
 
 $$("#noteSeg button").forEach(b => {

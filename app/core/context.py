@@ -37,6 +37,9 @@ class AppContext:
     _needs_full_rebuild: bool = False
     _shutting_down: bool = False      # 初始化期间收到退出请求时置位，供 boot 提前收手
     _migration: dict = field(default_factory=dict)
+    #: 离线授权状态（boot 时重算设备指纹并验签；见 app/core/license.py）。
+    #  只读快照，供 /api/status 的顶栏与设置页展示；**不参与任何功能放行**。
+    license: dict = field(default_factory=dict)
 
     # ------------------------------------------------------------------
     def boot(self, db_path=None, start_syncer: bool = True, probe_ollama: bool = True) -> dict:
@@ -187,6 +190,17 @@ class AppContext:
             if start_syncer:
                 self.syncer = sync.NoteSyncer(self.db, self.embedder)
                 self.syncer.start()
+
+            # 10) 离线授权校验：重算本机设备指纹 + 用内置公钥验签。
+            #     需求：每次启动都重算并校验。只读、不写盘、**绝不阻断启动** ——
+            #     授权不足是「功能策略」，不是启动故障。异常一律吞掉只记 debug。
+            try:
+                from . import license as _license  # noqa: PLC0415
+
+                self.license = _license.status()
+            except Exception as exc:  # noqa: BLE001
+                log.debug("授权状态解析失败（忽略）: %s", exc)
+                self.license = {}
 
             self.started_at = time.time()
             # 两个版本**语义不同，分开返回**：
@@ -372,6 +386,7 @@ class AppContext:
                 **readiness,
             },
             "sync": self.syncer.status() if self.syncer else {"running": False},
+            "license": self.license or {},        # 离线授权状态（顶栏芯片 + 设置页卡片）
             "warnings": list(self.warnings),      # 需行动 → 顶部告警条
             "notes": list(self.notes),            # 已自愈 → 设置页运行详情
             "boot": self.boot_report,

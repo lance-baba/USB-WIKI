@@ -147,6 +147,7 @@ Wiki-USB/
 │   │   ├── search.py           # /api/search
 │   │   ├── ask.py              # /api/chat/completions(SSE) · /api/ai/test · /api/ollama/models
 │   │   ├── library.py          # /api/notes* · /api/notes/import · /api/import/formats
+│   │   ├── license.py          # /api/license/{status,device-code,activate,clear}（离线授权）
 │   │   └── capture.py          # /api/capture/{url,duplicate}
 │   ├── core/
 │   │   ├── paths.py            # 相对路径解析（杜绝盘符绑定）
@@ -160,6 +161,8 @@ Wiki-USB/
 │   │   ├── llm.py              # 双模 AI 网关 + SSE 流式
 │   │   ├── sync.py             # exFAT 双指纹增量同步
 │   │   ├── net_util.py         # 标准库 HTTP（代理 / certifi / UTF-8）
+│   │   ├── license.py          # 离线机器绑定授权（设备指纹 + Ed25519 验签，只验不签）
+│   │   ├── license_pubkey.py   # 内置公钥（唯一可信根；私钥在 tools/，从不随包）
 │   │   └── context.py          # 应用上下文装配
 │   └── web/
 │       ├── index.html          # 控制台壳（零框架 / 零 CDN）
@@ -169,9 +172,12 @@ Wiki-USB/
 │   ├── notes/                  # 唯一真相源：手写笔记与剪藏 Markdown
 │   ├── snapshots/              # 降级页面的原始 HTML 快照
 │   └── cache.db                # 衍生索引（可全量重建）
-└── tests/
-    ├── test_suite.py           # 自动化测试统一入口（数据目录整体隔离，不碰真实知识库）
-    └── smoke_core.py           # 核心链路冒烟
+├── tests/
+│   ├── test_suite.py           # 自动化测试统一入口（数据目录整体隔离，不碰真实知识库）
+│   ├── smoke_core.py           # 核心链路冒烟
+│   └── test_license_offline.py # 离线授权层单测（standalone，不接入 test_suite）
+└── tools/license_generator/    # 授权方签发工具（genkey.py / license_gen.py；见其 README）
+                                #   私钥只在此目录，永不入库、永不进发布包
 ```
 
 ---
@@ -187,6 +193,7 @@ Wiki-USB/
 | **精确溯源** | 回答携带 `[^n]` 角标，悬停展示父分块来源文件与原文摘要 |
 | **外部编辑器共存** | 15s 轮询 + exFAT 双指纹（含等长编辑哈希比对），Obsidian/Typora 随意读写 |
 | **介质安全** | WAL + `synchronous=NORMAL` 抑制写放大；启动自愈 + 优雅退出保证拔盘后主库自洽 |
+| **离线授权（可选）** | Ed25519 一机一码：设备指纹 SHA-256、完全离线验签、换机即失效；客户端只内置公钥，私钥与签发工具在 `tools/`（不随包）。软门禁，默认不影响使用 |
 
 ---
 
