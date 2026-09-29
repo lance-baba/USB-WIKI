@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import os
 import threading
 import time
 from dataclasses import dataclass, field
@@ -35,6 +36,8 @@ class AppContext:
     _boot_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     # 索引结构升级状态（由 boot 的版本检查填写）
     _needs_full_rebuild: bool = False
+    #: 签名不兼容 → 后台**自动**重建向量（用户无感的自愈，见 ``_heal_vectors``）
+    _needs_vec_rebuild: bool = False
     _shutting_down: bool = False      # 初始化期间收到退出请求时置位，供 boot 提前收手
     _migration: dict = field(default_factory=dict)
     #: 离线授权状态（boot 时重算设备指纹并验签；见 app/core/license.py）。
@@ -153,8 +156,12 @@ class AppContext:
                 mismatch = self.db.check_signature(resolved.source, sig_model,
                                                    actual_dim, extra=extra)
                 if mismatch:
-                    self.warnings.append(mismatch + "，需点击「全量重建索引」")
                     self.db.signature_mismatch = mismatch
+                    # **自动自愈**（后台）：向量索引是**纯派生数据**，签名不兼容时静默重建 ——
+                    # 用户既不必看到横幅，也不必手动点「全量重建索引」。
+                    # 只有自愈失败（或当前无可用嵌入源）才升级为告警 —— 遵循
+                    # 「只有明显错误才提示」的原则，其余一律不留横幅。
+                    self._needs_vec_rebuild = True
             else:
                 # 兜底降级（无任何嵌入源）：绝不动已有向量索引，也不提示重建。
                 # 否则会形成「Ollama 关→哈希签名覆盖→Ollama 开→又要重建」的破坏性循环。
@@ -166,6 +173,13 @@ class AppContext:
                         f"已退化为纯 FTS5 词法检索；原 {stored_dim} 维向量索引已保留，"
                         f"恢复嵌入源后自动恢复向量召回"
                     )
+
+            # 6.5) 向量自愈：签名不兼容时后台重建，**不阻塞首屏**。
+            #      ⚠ 测试模式（WIKIUSB_TEST_MODE）不自愈 —— 后台重建会干扰用例断言，
+            #         因此既有 Release Gate 行为完全不变。
+            if self._needs_vec_rebuild and not os.environ.get("WIKIUSB_TEST_MODE"):
+                threading.Thread(target=self._heal_vectors,
+                                 name="vec-selfheal", daemon=True).start()
 
             # 7) 预解析一次 AI 提供方，让状态面板显示「真实可用」而非初始占位值。
             #    注意 resolve_provider 只返回结果，必须手动回写 last_provider。
@@ -258,7 +272,40 @@ class AppContext:
     def rebuild_index(self, recreate_vec: bool = False) -> dict:
         if self.db is None:
             return {"ok": False, "error": "上下文未初始化"}
-        return indexer.rebuild_all(self.db, self.embedder, recreate_vec=recreate_vec)
+        rep = indexer.rebuild_all(self.db, self.embedder, recreate_vec=recreate_vec)
+        # 重建完立刻清掉残留的旧阻断文案 —— 否则横幅要重启才消失（用户实测反馈）
+        self._prune_vec_warnings()
+        return rep
+
+    def _heal_vectors(self) -> None:
+        """后台自愈：重建向量索引（纯派生数据），成功即自动解除向量阻断、**不留横幅**。"""
+        try:
+            rep = indexer.rebuild_all(self.db, self.embedder)
+            log.info("向量索引自愈完成: %s", rep)
+            if self.db is not None and self.db.signature_mismatch:
+                # 自愈没能解除阻断 → 这才升级为「需用户行动」的告警
+                self.warnings.append(
+                    "向量索引自愈未生效，请到「设置」点一次「全量重建索引」")
+            else:
+                self.notes.append(
+                    f"索引已自动重建：{rep.get('indexed', 0)} 篇 / "
+                    f"{rep.get('chunks', 0)} 切片")
+        except Exception as exc:  # noqa: BLE001 - 自愈失败不得影响应用
+            log.error("向量索引自愈失败: %s", exc)
+            self.warnings.append(
+                "向量索引自动重建失败，请到「设置」手动点一次「全量重建索引」")
+        finally:
+            self._needs_vec_rebuild = False
+            self._prune_vec_warnings()
+
+    def _prune_vec_warnings(self) -> None:
+        """清掉已自愈 / 已重建的旧阻断告警，避免「重启才消失」的残留横幅。"""
+        if self.db is None or self.db.signature_mismatch:
+            return
+        self.warnings = [w for w in self.warnings
+                         if not w.startswith("嵌入模型已更换")
+                         and not w.startswith("嵌入模型维度已变更")
+                         and "需点击「全量重建索引」" not in w]
 
     def ai_readiness(self, probe: bool = False) -> dict:
         """Level 3 对话能力就绪状态。
@@ -387,6 +434,9 @@ class AppContext:
             },
             "sync": self.syncer.status() if self.syncer else {"running": False},
             "license": self.license or {},        # 离线授权状态（顶栏芯片 + 设置页卡片）
+            # 向量自愈进行中（换过嵌入模型后的首次启动）：前端据此显示「正在重建」的
+            # 中性提示，而不是把不兼容误当成一条错误横幅。
+            "vec_healing": bool(self._needs_vec_rebuild),
             # 需行动 → 顶部告警条。⚠ db.signature_mismatch 会经 db 通道单独在前端渲染，
             # 这里若原样再列一份，同一段文字会出现**两张一模一样的告警卡片**
             # （2026-09-30 用户实测「多了个提示」）。故按文本去重，单一事实源是 db。

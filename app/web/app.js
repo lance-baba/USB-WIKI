@@ -173,7 +173,10 @@ function renderEmptyGuide(d) {
 function renderAlerts(d) {
   const box = $("#alerts");
   const items = [];
-  if (d && d.db && d.db.signature_mismatch) {
+  if (d && d.vec_healing) {
+    // 自愈中：只给中性提示，不吓人 —— 换过嵌入模型后首次启动会短暂出现，完成后自动消失
+    items.push({ cls: "", text: "正在后台重建向量索引，完成后自动恢复智能搜索（无需任何操作）。" });
+  } else if (d && d.db && d.db.signature_mismatch) {
     // 文案由后端生成：真配置变更会给「需重建」指引，临时降级会说明「索引已保留」
     items.push({ cls: "err", text: d.db.signature_mismatch });
   }
@@ -353,9 +356,9 @@ function handleFrame(f, bub) {
     if (bub) bub._terms = S.terms;
     const [safe] = splitHold(S.full);
     // 注意：必须带 bub._refs，否则 meta 帧重绘会丢掉角标的 data-* 身份（点不动）
-    bub.innerHTML = mdToHtml(safe, bub._refs) + '<span class="pending-dot"></span>' +
-      '<div class="hint" style="margin-top:6px">提供方：' + esc(f.provider || "—") +
-      " · 检索路由：" + esc(f.route || "—") + "</div>";
+    // 「提供方 / 检索路由」这类内部术语不再展示 —— 用户只在意"是不是智能回答"，
+    // 专业字段留给设置页「运行状态」自己去查。
+    bub.innerHTML = mdToHtml(safe, bub._refs) + '<span class="pending-dot"></span>';
   } else if (f.type === "notice") {
     toast("⚠ " + f.message, 3600);
   } else if (f.type === "delta") {
