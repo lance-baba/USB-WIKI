@@ -147,6 +147,67 @@ def _self_test() -> int:
     return 0 if (ok1 and ok2 and ok3) else 1
 
 
+def _emit(priv, *, product, device_code, customer_id, features,
+          issued_at, expires_at, out) -> int:
+    """签发并把结果打印到屏幕（可选写入文件）。CLI 与交互模式共用。"""
+    code, payload = generate(
+        priv, product=product, device_code=device_code, customer_id=customer_id,
+        features=features, issued_at=issued_at, expires_at=expires_at)
+    print("─" * 68)
+    print("USB-WIKI 激活码（发给客户，让他们粘贴进「设置 → 产品授权」）")
+    print("─" * 68)
+    print(code)
+    print("─" * 68)
+    print(f"  产品     {payload['product']}")
+    print(f"  客户     {payload['customer_id']}")
+    print(f"  设备指纹 {payload['device_hash'][:16]}…")
+    print(f"  功能位   {payload['features'] or '（无）'}")
+    print(f"  签发时间 {payload['issued_at']}")
+    print(f"  到期时间 {payload['expires_at'] or '永久'}")
+    print(f"  签名公钥 {pubkey_mod.KEY_ID}")
+    if out:
+        Path(out).write_text(code + "\n", encoding="utf-8")
+        print(f"\n已写入：{out}")
+    return 0
+
+
+def _interactive(private_path: Path, product: str) -> int:
+    """双击/无参数运行时的引导式签发（逐项提问，免记命令行参数）。"""
+    print("=" * 68)
+    print("  Wiki-USB 离线授权 · 签发激活码")
+    print("=" * 68)
+    print("  流程：客户在程序「设置 → 产品授权」里复制「设备码」→ 发给你 →")
+    print("        你在下面粘贴设备码 → 生成激活码 → 发回客户激活。")
+    print()
+    try:
+        device = input("  ① 设备码（客户提供的整段）: ").strip()
+        if not device:
+            print("\n[已取消] 未输入设备码。")
+            return 2
+        customer = input("  ② 客户编号（如 CUST-0001）: ").strip()
+        if not customer:
+            print("\n[已取消] 未输入客户编号。")
+            return 2
+        mode = (input("  ③ 授权模式 [1=永久 / 2=到期，回车=永久]: ").strip() or "1")
+        expires_at = None
+        if mode == "2":
+            raw = input("     到期日期（YYYY-MM-DD）: ").strip()
+            if not raw:
+                print("\n[已取消] 未输入到期日期。")
+                return 2
+            expires_at = _norm_expires(raw)
+        feat = input("  ④ 功能位（逗号分隔，可留空）: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print("\n[已取消]")
+        return 2
+
+    features = [x.strip() for x in feat.split(",") if x.strip()]
+    priv = load_private_key(private_path)
+    print()
+    return _emit(priv, product=product, device_code=device, customer_id=customer,
+                 features=features, issued_at=None, expires_at=expires_at, out=None)
+
+
 def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(
         description="USB-WIKI 离线激活码生成器（Ed25519 签名，私钥不出本机）",
@@ -168,42 +229,21 @@ def main(argv: list[str]) -> int:
     if args.self_test:
         return _self_test()
 
+    # 无参数且处于交互终端（双击 .bat）→ 走引导式签发
+    if not args.device_code and not args.customer_id and sys.stdin.isatty():
+        return _interactive(Path(args.private), args.product)
+
     if not args.device_code or not args.customer_id:
-        ap.error("必须提供 --device-code 与 --customer-id（或使用 --self-test）")
+        ap.error("必须提供 --device-code 与 --customer-id（或直接双击运行进入引导模式）")
     if not args.perpetual and not args.expires:
         ap.error("请显式选择授权模式：--perpetual（永久）或 --expires（到期）")
 
     features = [x.strip() for x in str(args.features or "").split(",") if x.strip()]
     expires_at = None if args.perpetual else _norm_expires(args.expires)
-
     priv = load_private_key(Path(args.private))
-    code, payload = generate(
-        priv,
-        product=args.product,
-        device_code=args.device_code,
-        customer_id=args.customer_id,
-        features=features,
-        issued_at=args.issued,
-        expires_at=expires_at,
-    )
-
-    print("─" * 68)
-    print("USB-WIKI 激活码（发给客户，让他们粘贴进「设置 → 产品授权」）")
-    print("─" * 68)
-    print(code)
-    print("─" * 68)
-    print(f"  产品     {payload['product']}")
-    print(f"  客户     {payload['customer_id']}")
-    print(f"  设备指纹 {payload['device_hash'][:16]}…")
-    print(f"  功能位   {payload['features'] or '（无）'}")
-    print(f"  签发时间 {payload['issued_at']}")
-    print(f"  到期时间 {payload['expires_at'] or '永久'}")
-    print(f"  签名公钥 {pubkey_mod.KEY_ID}")
-
-    if args.out:
-        Path(args.out).write_text(code + "\n", encoding="utf-8")
-        print(f"\n已写入：{args.out}")
-    return 0
+    return _emit(priv, product=args.product, device_code=args.device_code,
+                 customer_id=args.customer_id, features=features,
+                 issued_at=args.issued, expires_at=expires_at, out=args.out)
 
 
 if __name__ == "__main__":

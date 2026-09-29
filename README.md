@@ -125,6 +125,7 @@ Wiki-USB/
 ├── 启动-Windows.bat            # Windows 入口（默认无控制台窗口；UTF-8 编码锁死）
 ├── 启动-Windows-调试.bat       # 排错入口：保留控制台窗口，便于看启动横幅与报错
 ├── 停止-Windows.bat            # 停止无窗口运行的服务（优先 /api/system/shutdown 优雅退出）
+├── 签发激活码.bat              # 授权方专用：签发激活码（双击＝引导模式，无需记参数）
 ├── 启动-macOS.command          # macOS 入口（权限与依赖检测）
 ├── 启动-Linux.sh               # Linux 入口
 ├── setup_runtime_windows.py    # 嵌入式运行时安装器 / 体检器 / 发布校验器 / 垃圾清理
