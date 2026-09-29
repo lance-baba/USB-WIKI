@@ -91,3 +91,35 @@ runtime\python-3.11-embed\python.exe tools\license_generator\license_gen.py --se
 
 `signature` 是对前 6 个字段（规范化 JSON）的 Ed25519 签名。客户端用内置公钥验签，
 并逐字比对 `device_hash` 与本机指纹 —— 换一台电脑即 `DEVICE_MISMATCH`。
+
+---
+
+## 五、更换 / 轮换密钥
+
+密钥用久了要换（疑似泄露、产品更名、改用你自己新生成的密钥）时：
+
+```bat
+rem 1) 备份旧密钥（轮换不可逆，旧码将全部失效）
+xcopy /E /I /Y tools\license_generator\keys  "%USERPROFILE%\.usb-wiki-license\keys-backup" >nul
+
+rem 2) 生成新密钥对（--force 才允许覆盖已有私钥）
+runtime\python-3.11-embed\python.exe tools\license_generator\genkey.py --force
+
+rem 3) 把打印出的两行覆盖进 app/core/license_pubkey.py，然后重启程序
+```
+
+⚠ **轮换 = 一次性吊销全部已签发激活码**：客户端换了公钥，旧码一律验签失败
+（显示「激活码无效或已被篡改。」），**所有客户必须重新激活**。轮换前先通知客户。
+
+> 完整操作手册（含"密钥存哪 / 怎么把密钥挪到仓库外 / 各种提示怎么办"）见
+> `docs/授权使用与密钥管理.md`。
+
+## 六、把密钥存到别处
+
+工具默认读 `keys/private_ed25519.pem`；改用别处用 `--private` 显式指定：
+
+```bat
+runtime\python-3.11-embed\python.exe tools\license_generator\license_gen.py ^
+    --private "%USERPROFILE%\.usb-wiki-license\keys\private_ed25519.pem" ^
+    --device-code "…" --customer-id CUST-0003 --perpetual
+```
