@@ -9,6 +9,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from ..core import crawler, indexer
+from . import _gate
 
 if TYPE_CHECKING:
     from ..server import Handler
@@ -51,6 +52,8 @@ def handle_get(h: "Handler", path: str) -> bool:
 
 def handle_post(h: "Handler", path: str) -> bool:
     if path == "/api/capture/url":
+        if not _gate.require_activation(h):      # 网页抓取属受限能力
+            return True
         capture_url(h)
         return True
     return False

@@ -23,6 +23,7 @@ const S = {
   // 不用 snippet 文本匹配 —— 那带 Markdown 语法，必然匹配失败。
   terms: [],
   busy: false,
+  licenseOK: true,   // 已激活？未激活时禁用受限功能（抓网页 / 问答）；由 applyLicenseGate 维护
 };
 
 // B：导航串行化守卫 —— 连续点击不同 citation 时，旧请求不得覆盖较新的点击结果。
@@ -152,6 +153,27 @@ function applyStatus(st) {
   renderAlerts(d);
   renderStats(d);
   renderEmptyGuide(d);
+  applyLicenseGate(d);
+}
+
+/* 未激活时的功能门禁：只拦「抓网页入库 / AI 问答」，
+   笔记浏览、本地搜索、拖入文件与粘贴文字入库**始终可用**（绝不锁用户自己的数据）。 */
+function applyLicenseGate(d) {
+  const lic = (d && d.license) || {};
+  if (typeof lic.activated === "boolean") S.licenseOK = lic.activated;
+  const show = (sel, on) => { const el = $(sel); if (el) el.hidden = !on; };
+  const dis = (sel, off) => {
+    const el = $(sel); if (!el) return;
+    el.disabled = off; el.title = off ? "需激活后使用" : "";
+  };
+  if (!S.licenseOK) {
+    dis("#btnCapture", true); dis("#capUrl", true); dis("#btnSend", true);
+  } else {
+    dis("#btnCapture", false); dis("#capUrl", false);
+    // btnSend 交回 send() 自己管理（避免问答流式期间被抢管）
+  }
+  show("#capGate", !S.licenseOK);
+  show("#chatGate", !S.licenseOK);
 }
 
 /* 知识库为空时，在问答页顶部直接给出「下一步该点哪里」 */
@@ -268,6 +290,7 @@ function renderStream(bub) {
 }
 
 async function send() {
+  if (!S.licenseOK) { toast("问答需激活后使用（设置 → 产品授权）", 3600); return; }
   const input = $("#chatInput");
   const q = input.value.trim();
   if (!q || S.busy) return;
@@ -375,6 +398,7 @@ function handleFrame(f, bub) {
      注意后端在真正抓取时**自己也会再查一次** —— 这里的预检只是为了让界面
      能在重复时给出选择，不是安全/正确性的依据。 */
   async function doCapture() {
+  if (!S.licenseOK) { toast("抓取网页需激活后使用（设置 → 产品授权）", 3600); return; }
     const url = $("#capUrl").value.trim();
     if (!url) return toast("请输入 URL");
     const box = $("#capResult");
@@ -2015,7 +2039,6 @@ function renderLicense(st) {
     }
     if (st.expires_at) html += '<div class="note-line">有效期至：' + esc(st.expires_at) + "</div>";
     else if (st.perpetual) html += '<div class="note-line">永久授权</div>';
-    if (st.key_id) html += '<div class="note-line">验签公钥指纹：' + esc(st.key_id) + "</div>";
     box.innerHTML = html;
   }
   const dc = $("#licDeviceCode");

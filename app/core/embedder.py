@@ -786,11 +786,9 @@ def resolve(cfg_get, ollama_healthy=None) -> EmbedderResolution:
                 emb = OnnxEmbedder(resource)
                 loaded, load_why = emb.probe()
                 if loaded:
+                    # 面向用户的话术：不暴露 precision / artifact 哈希等工程细节
                     notes.append(
-                        f"随包嵌入资源已启用：{resource.id}"
-                        f"（{resource.precision}，{resource.dimension} 维，"
-                        f"artifact {resource.artifact_sha256[:12]}…）"
-                    )
+                        f"内置模型已启动：{resource.id}（{resource.dimension} 维）")
                     return EmbedderResolution(emb, "local_onnx", warnings, notes,
                                               resource=resource)
                 # 资源在、依赖在，但加载失败（tokenizer 损坏 / 模型不可读 / CPU 不兼容）

@@ -10,6 +10,7 @@ import json
 from typing import TYPE_CHECKING
 
 from ..core.log_util import get_logger
+from . import _gate
 
 if TYPE_CHECKING:
     from ..server import Handler
@@ -75,6 +76,8 @@ def handle_get(h: "Handler", path: str) -> bool:
 
 def handle_post(h: "Handler", path: str) -> bool:
     if path == "/api/chat/completions":
+        if not _gate.require_activation(h):      # AI 问答属受限能力
+            return True
         chat_completions(h)
         return True
     if path == "/api/ai/test":

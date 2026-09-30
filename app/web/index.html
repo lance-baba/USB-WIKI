@@ -48,6 +48,9 @@
           <textarea id="chatInput" class="grow" placeholder="向你的知识库提问…  (Enter 发送 / Shift+Enter 换行)"></textarea>
           <button class="btn primary" id="btnSend">发送</button>
         </div>
+        <div class="hint" id="chatGate" hidden style="margin-top:8px;color:#b45309">
+          问答需激活后使用 —— 到「设置 → 产品授权」激活；笔记浏览与本地搜索不受限制。
+        </div>
       </div>
     </section>
 
@@ -80,8 +83,11 @@
           <input type="text" id="capUrl" class="grow" placeholder="https://example.com/posts/transformer-guide">
           <button class="btn primary" id="btnCapture">抓取入库</button>
         </div>
+        <div class="hint" id="capGate" hidden style="margin-top:8px;color:#b45309">
+          抓取网页需激活后使用 —— 到「设置 → 产品授权」激活；拖入文件与粘贴文字不受限制。
+        </div>
         <div class="hint" style="margin-top:8px">
-          静态博客与科技文章优先。动态 SPA / 强反爬页面会自动降级为「保留快照 + 引导粘贴」。
+          动态 SPA / 强反爬页面会自动降级为「保留快照 + 引导粘贴」。
         </div>
         <div id="capResult" style="margin-top:12px"></div>
       </div>
@@ -168,10 +174,6 @@
             <button class="btn primary" id="btnLicActivate">激活</button>
             <button class="btn danger" id="btnLicClear">清除本机激活</button>
           </div>
-          <div class="hint" style="margin-top:10px;line-height:1.6">
-            完全离线：激活码由授权方用私钥签名，本机仅用内置公钥验签，<b>不联网</b>。
-            把整个目录复制到另一台电脑后，激活会因设备码不匹配而失效。
-          </div>
           <h3 style="margin-top:18px">运行状态</h3>
           <div class="kv" id="statKV"></div>
           <h3 style="margin-top:18px">索引维护</h3>
@@ -187,7 +189,7 @@
 
           <h3 style="margin-top:18px">运行详情</h3>
           <div class="hint" style="margin:-4px 0 8px;line-height:1.6">
-            系统自动降级 / 自动适配的过程记录。<b>功能正常时无需理会</b>；排查问题时可在这里查证实际走了哪条路径。
+            系统自动降级 / 自动适配的过程记录。<b>功能正常时无需理会</b>。
           </div>
           <div id="runNotes" class="notes-box"></div>
         </div>

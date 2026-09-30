@@ -38,14 +38,16 @@ def _activate(h: "Handler") -> None:
     body = h._read_json()
     code = str(body.get("code") or "").strip()
     res = license_mod.activate(code)
+    # 刷新 ctx 快照 → 功能门禁（抓网页/AI 问答）**立即**按最新状态放行/拦截，无需重启
+    state = license_mod.status()
+    h.ctx.license = state
     h._send_json({
         "code": 200,
         "data": {"ok": res["ok"], "status": res["status"],
                  "feature": list((res.get("payload") or {}).get("features") or []),
                  "customer_id": (res.get("payload") or {}).get("customer_id"),
                  "expires_at": (res.get("payload") or {}).get("expires_at"),
-                 # 成功后再回读一次完整状态，前端免二次请求
-                 "state": license_mod.status() if res["ok"] else None},
+                 "state": state},
         "message": res["message"],
     })
 
@@ -53,8 +55,9 @@ def _activate(h: "Handler") -> None:
 def _clear(h: "Handler") -> None:
     h._read_json()
     res = license_mod.clear()
+    h.ctx.license = license_mod.status()
     h._send_json({"code": 200, "data": {"ok": res["ok"], "removed": res["removed"],
-                                        "state": license_mod.status()},
+                                        "state": h.ctx.license},
                   "message": res["message"]})
 
 

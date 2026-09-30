@@ -146,6 +146,9 @@ runtime\python-3.11-embed\python.exe tests\test_license_offline.py
 
 ## 11. 边界与后续（明确不在本次范围）
 
-* 本层为**软门禁**：默认只呈现状态，不阻断任何功能。是否按 `features` 硬性限制功能，属后续策略决定。
+* 门禁边界（**受限模式**）：未激活时**允许**笔记浏览、本地检索、拖入文件入库、粘贴文字入库；
+  **禁止**网页抓取入库（`/api/capture/url`）与 AI 问答（`/api/chat/completions`）。
+  实现见 `app/api/_gate.py`。原则：**绝不用"锁死用户自己的数据"来施压** —— 已录入/将录入的笔记永远可读可写可搜。
+* 激活成功后**立即解锁**（`/api/license/activate` 会刷新 `ctx.license`），无需重启。
 * 未做：吊销列表（离线场景无法实时吊销，只能靠吊销时下发新公钥并要求重签）、按功能位放行的功能开关、批量签发 UI。
 * 密钥轮换：`genkey.py --force` 后需把新公钥覆盖进 `app/core/license_pubkey.py`——轮换会让**已签发激活码全部失效**，需重签。
