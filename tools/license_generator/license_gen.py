@@ -7,7 +7,7 @@
     ────────                     ────────────
     首启 → 生成「设备码」
              │  （把设备码发给你）
-             └──────────────►   license_gen.py --device-code … --customer-id … --perpetual
+             └──────────────►   license_gen.py --device-code … --customer-id …
                                  │  （把生成的激活码发回客户）
              ◄──────────────┘
     输入激活码 → 本机验签通过 → 激活完成（以后**完全离线**）
@@ -16,15 +16,16 @@
 
 ## 举例
 
-    永久授权：
-      python license_gen.py --device-code "C3285E2A-3A90-A661-…" --customer-id CUST-0001 --perpetual
+    标准做法（永久授权，激活后长期可用）：
+      python license_gen.py --device-code "C3285E2A-3A90-A661-…" --customer-id CUST-0001
 
-    到期授权（含功能位）：
-      python license_gen.py --device-code "C3285E2A-…" --customer-id CUST-0002 \
-          --features pro,sync --expires 2027-09-29
+    带功能位（可选）：
+      python license_gen.py --device-code "C3285E2A-…" --customer-id CUST-0002 --features pro,sync
 
     自检（生成临时密钥对→签发→用客户端逻辑验签，证明通路一致）：
       python license_gen.py --self-test
+
+    ⚠ 到期授权（`--expires`）属**进阶选项，产品默认不使用** —— 需要时才加。
 
 用仓库自带运行时跑最省事（已含 cryptography）：
     runtime\\python-3.11-embed\\python.exe tools\\license_generator\\license_gen.py <参数>
@@ -184,19 +185,11 @@ def _interactive(private_path: Path, product: str) -> int:
         if not device:
             print("\n[已取消] 未输入设备码。")
             return 2
-        customer = input("  ② 客户编号（如 CUST-0001）: ").strip()
+        customer = input("  ② 客户编号（只给你自己对账，客户界面不显示）: ").strip()
         if not customer:
             print("\n[已取消] 未输入客户编号。")
             return 2
-        mode = (input("  ③ 授权模式 [1=永久 / 2=到期，回车=永久]: ").strip() or "1")
-        expires_at = None
-        if mode == "2":
-            raw = input("     到期日期（YYYY-MM-DD）: ").strip()
-            if not raw:
-                print("\n[已取消] 未输入到期日期。")
-                return 2
-            expires_at = _norm_expires(raw)
-        feat = input("  ④ 功能位（逗号分隔，可留空）: ").strip()
+        feat = input("  ③ 功能位（逗号分隔，可留空）: ").strip()
     except (EOFError, KeyboardInterrupt):
         print("\n[已取消]")
         return 2
@@ -204,8 +197,9 @@ def _interactive(private_path: Path, product: str) -> int:
     features = [x.strip() for x in feat.split(",") if x.strip()]
     priv = load_private_key(private_path)
     print()
+    # 授权模式固定为**永久**（激活后长期可用）；到期授权仅保留在 CLI 的 --expires 进阶用法里。
     return _emit(priv, product=product, device_code=device, customer_id=customer,
-                 features=features, issued_at=None, expires_at=expires_at, out=None)
+                 features=features, issued_at=None, expires_at=None, out=None)
 
 
 def main(argv: list[str]) -> int:
@@ -218,9 +212,10 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--product", default=pubkey_mod.PRODUCT, help="产品标识")
     ap.add_argument("--issued", default=None, help="签发时间（ISO8601，默认当前 UTC）")
     mode = ap.add_mutually_exclusive_group()
-    mode.add_argument("--perpetual", action="store_true", help="永久授权")
+    mode.add_argument("--perpetual", action="store_true",
+                      help="永久授权（**默认**，一般不需要指定）")
     mode.add_argument("--expires", default=None,
-                      help="到期时间：YYYY-MM-DD 或完整 ISO8601")
+                      help="（进阶，通常不用）到期时间：YYYY-MM-DD 或完整 ISO8601")
     ap.add_argument("--private", default=str(DEFAULT_PRIVATE), help="私钥 PEM 路径")
     ap.add_argument("--out", default=None, help="把激活码写入文件（默认打印到屏幕）")
     ap.add_argument("--self-test", action="store_true", help="跑内置自检后退出")
@@ -235,11 +230,10 @@ def main(argv: list[str]) -> int:
 
     if not args.device_code or not args.customer_id:
         ap.error("必须提供 --device-code 与 --customer-id（或直接双击运行进入引导模式）")
-    if not args.perpetual and not args.expires:
-        ap.error("请显式选择授权模式：--perpetual（永久）或 --expires（到期）")
 
+    # 不指定模式即**永久授权**（产品默认：激活后长期可用）。到期授权仅作为进阶选项保留。
     features = [x.strip() for x in str(args.features or "").split(",") if x.strip()]
-    expires_at = None if args.perpetual else _norm_expires(args.expires)
+    expires_at = _norm_expires(args.expires) if args.expires else None
     priv = load_private_key(Path(args.private))
     return _emit(priv, product=args.product, device_code=args.device_code,
                  customer_id=args.customer_id, features=features,

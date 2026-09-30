@@ -2033,12 +2033,7 @@ function renderLicense(st) {
     const cls = st.status === "OK" ? "on" : (st.status === "NO_LICENSE" ? "off" : "warn");
     let html = '<span class="lic-badge ' + cls + '">' + esc(licStatusLabel(st)) + "</span> " +
                esc(st.message || "");
-    if (st.customer_id) {
-      html += '<div class="note-line">客户：' + esc(st.customer_id) +
-              "　功能：" + esc((st.features || []).join("、") || "—") + "</div>";
-    }
-    if (st.expires_at) html += '<div class="note-line">有效期至：' + esc(st.expires_at) + "</div>";
-    else if (st.perpetual) html += '<div class="note-line">永久授权</div>';
+    // 客户界面**只**呈现「是否已激活」—— 客户编号 / 功能位 / 有效期等内部字段一律不显示
     box.innerHTML = html;
   }
   const dc = $("#licDeviceCode");

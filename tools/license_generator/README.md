@@ -38,13 +38,13 @@ KEY_ID = "……"
 2. 你签发：
 
 ```bat
-rem 永久授权
+rem 标准做法：永久授权（激活后长期可用，默认就是它）
 runtime\python-3.11-embed\python.exe tools\license_generator\license_gen.py ^
-    --device-code "C3285E2A-3A90-A661-…" --customer-id CUST-0001 --perpetual
+    --device-code "C3285E2A-3A90-A661-…" --customer-id CUST-0001
 
-rem 到期授权（可加功能位）
+rem 需要功能位时（可选）
 runtime\python-3.11-embed\python.exe tools\license_generator\license_gen.py ^
-    --device-code "C3285E2A-…" --customer-id CUST-0002 --features pro,sync --expires 2027-09-29
+    --device-code "C3285E2A-…" --customer-id CUST-0002 --features pro,sync
 ```
 
 3. 把打印出的**激活码**发给客户，客户粘贴进「设置 → 产品授权 → 输入激活码」即完成激活。
@@ -55,9 +55,9 @@ runtime\python-3.11-embed\python.exe tools\license_generator\license_gen.py ^
 | 参数 | 说明 |
 |---|---|
 | `--device-code` | **必填**，客户提供的设备码（带横线/大小写均可） |
-| `--customer-id` | **必填**，客户标识，写进激活码便于对账 |
-| `--perpetual` | 永久授权（与 `--expires` 二选一） |
-| `--expires` | 到期时间，`YYYY-MM-DD`（当日 23:59:59 到期）或完整 ISO8601 |
+| `--customer-id` | **必填**，客户标识（**只给你自己对账**，客户界面不显示） |
+| `--perpetual` | 永久授权 —— **默认行为，一般不需要写** |
+| `--expires` | ⚠ 进阶选项，产品默认**不使用**（到期时间 `YYYY-MM-DD` 或完整 ISO8601） |
 | `--features` | 功能位，逗号分隔，如 `pro,sync` |
 | `--product` | 产品标识，默认 `USB-WIKI` |
 | `--private` | 私钥路径，默认 `keys/private_ed25519.pem` |
@@ -124,5 +124,5 @@ rem 3) 把打印出的两行覆盖进 app/core/license_pubkey.py，然后重启�
 ```bat
 runtime\python-3.11-embed\python.exe tools\license_generator\license_gen.py ^
     --private "%USERPROFILE%\.usb-wiki-license\keys\private_ed25519.pem" ^
-    --device-code "…" --customer-id CUST-0003 --perpetual
+    --device-code "…" --customer-id CUST-0003
 ```

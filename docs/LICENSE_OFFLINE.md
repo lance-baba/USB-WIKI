@@ -126,7 +126,7 @@ runtime\python-3.11-embed\python.exe tools\license_generator\genkey.py
 
 rem 签发（永久 / 到期）
 runtime\python-3.11-embed\python.exe tools\license_generator\license_gen.py ^
-    --device-code "<客户设备码>" --customer-id CUST-0001 --perpetual
+    --device-code "<客户设备码>" --customer-id CUST-0001
 ```
 
 ---
