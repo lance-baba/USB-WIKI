@@ -1628,7 +1628,7 @@ const CFG_SCHEMA = [
         tip: "选一家常用服务商，或自己填兼容 OpenAI 协议的地址。",
         options: [["https://api.deepseek.com/v1", "DeepSeek"], ["https://dashscope.aliyuncs.com/compatible-mode/v1", "通义千问"], ["https://api.moonshot.cn/v1", "Kimi 月之暗面"], ["https://open.bigmodel.cn/api/paas/v4", "智谱 GLM"], ["https://api.openai.com/v1", "OpenAI"]] },
       { key: "api_key", label: "云端 API Key", type: "password",
-        tip: "留空就不用云端。注意：这文件明文存在 U 盘上，别在借出去的电脑上留高余额 Key。" },
+        tip: "留空就不用云端。请妥善保管，勿泄露给他人。" },
       { key: "api_chat_model", label: "云端对话模型", type: "datalist", placeholder: "deepseek-chat",
         tip: "填服务商文档里的模型名，比如 deepseek-chat。",
         options: ["deepseek-chat", "deepseek-reasoner", "qwen-plus", "qwen-turbo", "moonshot-v1-8k", "glm-4-flash", "gpt-4o-mini"] },

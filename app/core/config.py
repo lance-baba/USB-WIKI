@@ -34,7 +34,7 @@ inject_total_chars = 1800
 provider = auto
 
 # --- 通用 OpenAI 兼容接口配置 (支持 DeepSeek / 阿里百炼 / Kimi 等) ---
-# 注意: 本文件存放于移动存储介质, 请勿在公共借出设备中留存高余额 API Key!
+# 安全提示: 本文件以明文保存 API Key，请勿泄露或随程序一并转发给他人。
 api_base_url = https://api.deepseek.com/v1
 api_key =
 api_chat_model = deepseek-chat

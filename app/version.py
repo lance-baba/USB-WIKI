@@ -33,7 +33,7 @@ APP_VERSION = "1.3.0"
 
 # 便于构建脚本与 User-Agent 复用，避免各处自己拼
 APP_NAME = "Wiki-USB"
-APP_NAME_CN = "随身第二大脑"
+APP_NAME_CN = "随身知识库"
 # HTTP Server 头 / User-Agent 用的紧凑形式
 USER_AGENT_TOKEN = f"WikiUSB/{APP_VERSION}"
 
